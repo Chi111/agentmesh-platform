@@ -1,0 +1,29 @@
+stateDiagram-v2
+  [*] --> Intake
+  Intake --> ProjectScan
+  ProjectScan --> Clarify: missing facts
+  Clarify --> ProjectScan: answered
+  ProjectScan --> SpecBuild
+  SpecBuild --> Plan
+  Plan --> Approval: high risk
+  Approval --> Plan: approved
+  Plan --> Execute
+  Execute --> Review
+  Review --> Execute: fix required
+  Review --> QA: passed
+  QA --> Execute: test failed
+  QA --> Security
+  Security --> Approval: hold
+  Security --> Persist: passed
+  Persist --> ContextReset
+  ContextReset --> Plan: more tasks
+  ContextReset --> Finish: complete
+  Execute --> Interrupted: user pause
+  Review --> Interrupted: user pause
+  QA --> Interrupted: user pause
+  Interrupted --> Resume
+  Resume --> Plan: checkpoint before task
+  Resume --> Review: checkpoint after task
+  Resume --> QA: review passed
+  Resume --> Finish: all tasks complete
+  Finish --> [*]

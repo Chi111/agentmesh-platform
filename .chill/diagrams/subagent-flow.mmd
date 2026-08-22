@@ -1,0 +1,21 @@
+flowchart LR
+  Planner["Planner<br/>reads tasks.md dependencies"] --> Split{"Task type"}
+
+  Split --> FE["Frontend Subagent"]
+  Split --> BE["Backend Subagent"]
+  Split --> DB["Database Subagent"]
+  Split --> SEC["Security Subagent"]
+  Split --> QA["QA Subagent"]
+  Split --> DOC["Docs Subagent"]
+
+  FE --> Merge["Merge Agent"]
+  BE --> Merge
+  DB --> Merge
+  SEC --> Merge
+  QA --> Merge
+  DOC --> Merge
+
+  Merge --> Complete{"Result complete?"}
+  Complete -->|No| Reassign["Reassign missing work"]
+  Reassign --> Split
+  Complete -->|Yes| Review["Review Gate"]

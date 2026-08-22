@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "status": "running",
+  "activeCommand": "internal chill:run",
+  "currentStage": "execute",
+  "currentFeature": "specs/1.feature-name",
+  "currentTaskId": "T-005",
+  "lastSafeCheckpoint": {
+    "stage": "before-task-execution",
+    "completedAt": "2026-06-14T09:00:00.000Z",
+    "summary": "Specs generated and task selected."
+  },
+  "nextSafeCommand": "internal chill:review T-005",
+  "blockedGateId": null,
+  "autoRun": true,
+  "updatedAt": "2026-06-14T09:00:00.000Z"
+}

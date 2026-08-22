@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chill Farm Workflow</title>
+    <link rel="stylesheet" href="/styles.css?v=labels-20260618" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="farm-header">
+        <div>
+          <p class="eyebrow">Chill Workflow</p>
+          <h1>Farm State Map</h1>
+        </div>
+        <div id="sourceBadge" class="source-badge">Loading</div>
+      </header>
+
+      <section class="farm-scene" aria-label="Workflow farm state">
+        <div class="sky">
+          <div class="sun"></div>
+          <div class="cloud cloud-one"></div>
+          <div class="cloud cloud-two"></div>
+        </div>
+        <div id="farmPath" class="farm-path"></div>
+        <section id="deployWorkshop" class="deploy-workshop deploy-idle" aria-label="Deploy workshop"></section>
+        <div class="farmhouse" aria-hidden="true">
+          <div class="roof"></div>
+          <div class="house-body">
+            <span></span>
+            <span></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="status-strip" aria-label="Current workflow status">
+        <div>
+          <span class="label">Status</span>
+          <strong id="statusValue">Loading</strong>
+        </div>
+        <div>
+          <span class="label">Stage</span>
+          <strong id="stageValue">Loading</strong>
+        </div>
+        <div>
+          <span class="label">Task</span>
+          <strong id="taskValue">Loading</strong>
+        </div>
+        <div>
+          <span class="label">Next</span>
+          <strong id="nextValue">Loading</strong>
+        </div>
+      </section>
+
+      <section class="farm-note" aria-live="polite">
+        <p id="farmMessage">Loading workflow state...</p>
+      </section>
+
+      <section class="devtool-panel" aria-label="Visualizer devtool">
+        <div>
+          <span class="label">Devtool</span>
+          <strong id="devtoolValue">Live state</strong>
+        </div>
+        <div class="devtool-buttons">
+          <button type="button" data-devtool-preset="live">Live</button>
+          <button type="button" data-devtool-preset="frontend-active">Frontend</button>
+          <button type="button" data-devtool-preset="deploy-active">Packing</button>
+          <button type="button" data-devtool-preset="deploy-waiting">Waiting</button>
+          <button type="button" data-devtool-preset="deploy-failed">Failed</button>
+          <button type="button" data-devtool-preset="deploy-done">Delivered</button>
+        </div>
+      </section>
+
+      <details class="farm-log">
+        <summary>Farm log</summary>
+        <ol id="farmLog"></ol>
+      </details>
+    </main>
+
+    <script type="module" src="/app.js?v=labels-20260618"></script>
+  </body>
+</html>

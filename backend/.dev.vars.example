@@ -1,0 +1,20 @@
+# Local Worker authentication configuration.
+# Copy to backend/.dev.vars; never commit the real file.
+PRIVY_APP_ID="your-privy-app-id"
+PRIVY_JWKS_URL="https://auth.privy.io/api/v1/apps/your-privy-app-id/jwks.json"
+# Optional fallback when remote JWKS cannot be used:
+PRIVY_VERIFICATION_KEY=""
+
+# Enable Privy identity tokens in the Privy dashboard so signed linked email
+# and wallet accounts can be mapped to one canonical AgentMesh profile.
+CORS_ORIGIN="http://localhost:5173,https://your-production-domain.example"
+AGENT_WEBHOOK_SECRET="replace-with-a-dedicated-random-secret"
+# JSON map stored as a Worker secret. Example: {"agent-id":"credential"}
+AGENT_CREDENTIALS_JSON="{}"
+
+SETTLEMENT_MODE="ledger"
+BASE_CHAIN_ID="84532"
+BASE_RPC_URL=""
+ESCROW_CONTRACT_ADDRESS=""
+USDC_DECIMALS="6"
+MIN_CONFIRMATIONS="1"

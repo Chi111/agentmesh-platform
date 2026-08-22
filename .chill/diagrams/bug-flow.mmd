@@ -1,0 +1,17 @@
+flowchart TD
+  A["Daily 09:00 or /chill-ai bug"] --> B["Bug Collector"]
+  B --> C["Jira API or bugs.json"]
+  C --> D["Bug Triage<br/>priority / module / status"]
+  D --> E["Bug Planner<br/>today's repair order"]
+  E --> F{"Enough information?"}
+  F -->|No| G["Clarify Loop<br/>list missing facts"]
+  F -->|Yes| H["Dispatch Bug Subagents"]
+
+  H --> I["Reproduction analysis"]
+  H --> J["Impact analysis"]
+  H --> K["Fix proposal"]
+
+  I --> L["Merge daily bug digest"]
+  J --> L
+  K --> L
+  L --> M["Notify Agent<br/>codex / claude / opencode"]

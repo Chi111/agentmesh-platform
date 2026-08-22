@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+frontend/pkg/
+
+# Logs
+logs/
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+playwright-report/
+test-results/
+dist-worker/
+dist-contracts/
+
+# PinMe-generated local deployment credentials
+backend/metadata.json
+
+# Local planning docs
+docs/plans/

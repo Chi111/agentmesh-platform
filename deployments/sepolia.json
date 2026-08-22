@@ -1,0 +1,19 @@
+{
+  "network": "sepolia",
+  "chainId": 11155111,
+  "contract": "AgentMeshEscrow",
+  "address": "0x67a44ea66e16d2d8d5d5d4b34ce0088cc9785d3e",
+  "transactionHash": "0x3887831533d67b954c55d280b730eb967a467d0a76744088cbe06e9f52ce8516",
+  "blockNumber": 11513621,
+  "mUSDC": "0x38A28074C414F94024bc56AA52641DdEdDf17df7",
+  "admin": "0x500291C7C3c1A41Abe94c7B9161DaB3882464640",
+  "treasury": "0x500291C7C3c1A41Abe94c7B9161DaB3882464640",
+  "platformFeeBps": 40,
+  "smokeTest": {
+    "mUSDCDeposit": "0x618e3bdd32458904106756d2bde8502224a1253bbf2f19ed82add242de8f4e9b",
+    "mUSDCRelease": "0xd22f7b83c4c0a4c7b4872e8b12346f45fcd127de93e464c782d28e89bcd039cf",
+    "sETHDeposit": "0x7a783a41a980f3598c999fc16302453e103919faad6b9031d4f5e2b73e6ee34e",
+    "sETHRelease": "0x51c0da8e61d907f84b286fc5308c59c66bc087f3b1e32ab86fa087b0c1e0b862",
+    "finalStatus": "released"
+  }
+}

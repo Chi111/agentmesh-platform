@@ -1,0 +1,12 @@
+flowchart TD
+  Phone["Phone<br/>Telegram / Slack / Web"] --> Command["Command Gateway"]
+  Command --> Queue["Job Queue"]
+  Queue --> Runner["Chill Runner"]
+  Runner --> Agent["Codex / Claude Code / API Agent"]
+  Agent --> Repo["Repo + .chill + specs"]
+  Runner --> Audit["Audit Log"]
+  Runner --> Report["Summary / PR / QA result"]
+  Report --> Phone
+  Phone --> Approval{"Approve gate?"}
+  Approval -->|Yes| Runner
+  Approval -->|No| Queue

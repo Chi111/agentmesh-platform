@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "agents": [
+    {
+      "id": "planner",
+      "role": "Planner",
+      "capabilities": ["requirements", "task-graph", "wave-planning"],
+      "allowedTools": ["read-files", "write-specs"],
+      "policyScope": ["low-risk", "planning"],
+      "status": "available"
+    },
+    {
+      "id": "frontend",
+      "role": "Frontend Subagent",
+      "capabilities": ["ui", "state", "routing", "accessibility", "visual-qa"],
+      "allowedTools": ["read-files", "write-frontend", "run-local-tests"],
+      "policyScope": ["low-risk", "ui"],
+      "status": "available"
+    },
+    {
+      "id": "backend",
+      "role": "Backend Subagent",
+      "capabilities": ["api", "validation", "jobs", "integration"],
+      "allowedTools": ["read-files", "write-backend", "run-local-tests"],
+      "policyScope": ["low-risk", "server"],
+      "status": "available"
+    },
+    {
+      "id": "database",
+      "role": "Database Reliability Subagent",
+      "capabilities": ["schema", "migration-plan", "data-integrity"],
+      "allowedTools": ["read-files", "write-migrations", "run-local-tests"],
+      "policyScope": ["data-risk", "approval-required-for-destructive"],
+      "status": "available"
+    },
+    {
+      "id": "security",
+      "role": "Security Reviewer",
+      "capabilities": ["auth", "privacy", "secrets", "threat-model"],
+      "allowedTools": ["read-files", "write-review"],
+      "policyScope": ["security-hold"],
+      "status": "available"
+    },
+    {
+      "id": "qa",
+      "role": "QA Automation Subagent",
+      "capabilities": ["tests", "acceptance", "regression", "visual-checks"],
+      "allowedTools": ["read-files", "write-tests", "run-local-tests"],
+      "policyScope": ["verification"],
+      "status": "available"
+    },
+    {
+      "id": "deploy",
+      "role": "Deploy Subagent",
+      "capabilities": ["release-plan", "smoke-test", "rollback", "aws-mcp"],
+      "allowedTools": ["read-files", "call-aws-read-only", "run-local-tests"],
+      "policyScope": ["deploy-risk", "approval-required-for-mutation"],
+      "status": "available"
+    },
+    {
+      "id": "frontend-engineer",
+      "role": "Global Frontend Engineer",
+      "baseAgent": "frontend-engineer",
+      "capabilities": ["ui", "react", "css", "accessibility", "responsive-layout", "browser-behavior"],
+      "allowedTools": ["read-files", "write-frontend", "run-local-tests", "browser-qa"],
+      "policyScope": ["low-risk", "ui"],
+      "contextRule": "Load ~/.claude/agents or ~/.codex/agents frontend-engineer only when UI work is active.",
+      "status": "available"
+    },
+    {
+      "id": "backend-engineer",
+      "role": "Global Backend Engineer",
+      "baseAgent": "backend-engineer",
+      "capabilities": ["api", "services", "persistence", "jobs", "validation", "integrations"],
+      "allowedTools": ["read-files", "write-backend", "run-local-tests"],
+      "policyScope": ["low-risk", "server"],
+      "contextRule": "Load the global backend-engineer brief only for server-side work or API contracts.",
+      "status": "available"
+    },
+    {
+      "id": "test-engineer",
+      "role": "Global Test Engineer",
+      "baseAgent": "test-engineer",
+      "capabilities": ["tests", "regression", "ci-triage", "fixtures", "flake-analysis"],
+      "allowedTools": ["read-files", "write-tests", "run-local-tests"],
+      "policyScope": ["verification"],
+      "contextRule": "Load the global test-engineer brief for test strategy, CI failure analysis, and regression coverage.",
+      "status": "available"
+    },
+    {
+      "id": "security-reviewer",
+      "role": "Global Security Reviewer",
+      "baseAgent": "security-reviewer",
+      "capabilities": ["auth", "authorization", "privacy", "secrets", "input-validation", "dependency-risk"],
+      "allowedTools": ["read-files", "write-review"],
+      "policyScope": ["security-hold"],
+      "contextRule": "Load the global security-reviewer brief for sensitive data, permissions, or security review.",
+      "status": "available"
+    },
+    {
+      "id": "performance-analyst",
+      "role": "Global Performance Analyst",
+      "baseAgent": "performance-analyst",
+      "capabilities": ["profiling", "bundle-size", "slow-queries", "caching", "memory", "hot-paths"],
+      "allowedTools": ["read-files", "run-local-tests", "write-review"],
+      "policyScope": ["performance"],
+      "contextRule": "Load the global performance-analyst brief when latency, bundle, memory, or query cost is in scope.",
+      "status": "available"
+    },
+    {
+      "id": "docs-writer",
+      "role": "Global Docs Writer",
+      "baseAgent": "docs-writer",
+      "capabilities": ["readme", "migration-notes", "release-notes", "api-docs", "developer-docs"],
+      "allowedTools": ["read-files", "write-docs"],
+      "policyScope": ["documentation"],
+      "contextRule": "Load the global docs-writer brief only when documentation is part of the task.",
+      "status": "available"
+    }
+  ]
+}

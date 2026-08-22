@@ -1,0 +1,42 @@
+{
+  "name": "agentmesh-platform",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "packageManager": "npm@10.9.4",
+  "scripts": {
+    "dev": "wrangler dev --config backend/wrangler.toml",
+    "build:contracts": "solcjs --bin --abi --base-path . --include-path node_modules --output-dir dist-contracts contracts/AgentMeshEscrow.sol",
+    "deploy:contract:sepolia": "node scripts/deployEscrow.mjs",
+    "smoke:contract:sepolia": "node scripts/smokeEscrow.mjs",
+    "build:worker": "cd backend && wrangler deploy --dry-run --outdir ../dist-worker",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build:frontend": "cd frontend && npm run build",
+    "build": "npm run build:contracts && npm run build:worker && npm run build:frontend",
+    "test:e2e": "playwright test"
+  },
+  "overrides": {
+    "uuid": "11.1.1",
+    "tmp": "0.2.7",
+    "@coinbase/cdp-sdk": {
+      "axios": "1.19.0"
+    },
+    "viem@<=2.49.3": {
+      "ws": "8.21.3"
+    }
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.6.1",
+    "@playwright/test": "1.62.1",
+    "@types/react": "18.3.1",
+    "@types/react-dom": "18.3.1",
+    "axios": "1.19.0",
+    "solc": "0.8.36",
+    "wrangler": "4.123.0",
+    "ws": "8.21.3"
+  }
+}

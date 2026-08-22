@@ -1,0 +1,3 @@
+name = "agentmesh-platform-74a3"
+compatibility_date = "2026-03-01"
+main = "src/worker.ts"

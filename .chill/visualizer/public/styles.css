@@ -1,0 +1,963 @@
+:root {
+  color-scheme: light;
+  --ink: #2f271c;
+  --soil-dark: #604026;
+  --soil: #8d5a2f;
+  --soil-light: #b4773f;
+  --leaf: #4f8f45;
+  --leaf-bright: #7fb861;
+  --wheat: #f4cb64;
+  --sky: #8fc8e8;
+  --cream: #fff2c3;
+  --paper: #f7e0ad;
+  --shadow: #3d2b1d;
+  --danger: #b64a35;
+  --waiting: #e2a941;
+  --blue: #4f8fb7;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    linear-gradient(#8fc8e8 0 40%, #7fb861 40% 100%);
+  color: var(--ink);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.app-shell {
+  width: min(1180px, calc(100vw - 28px));
+  margin: 0 auto;
+  padding: 24px 0 32px;
+}
+
+.farm-header,
+.status-strip,
+.farm-note,
+.devtool-panel,
+.farm-log {
+  border: 3px solid var(--shadow);
+  background: var(--cream);
+  box-shadow: 0 5px 0 var(--shadow);
+}
+
+.farm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  margin-bottom: 18px;
+}
+
+.eyebrow,
+.label {
+  margin: 0 0 5px;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  color: #6e5a3f;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(28px, 5vw, 48px);
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.source-badge {
+  min-width: 82px;
+  padding: 9px 12px;
+  border: 3px solid var(--shadow);
+  background: var(--leaf-bright);
+  color: #183714;
+  text-align: center;
+  box-shadow: inset 0 -4px 0 rgba(0, 0, 0, 0.18);
+  animation: badge-breathe 2.2s ease-in-out infinite;
+}
+
+.source-badge[data-mode="demo"] {
+  background: var(--waiting);
+}
+
+.source-badge[data-mode="failed"] {
+  background: var(--danger);
+  color: #fff6df;
+}
+
+.farm-scene {
+  position: relative;
+  min-height: 680px;
+  overflow: hidden;
+  border: 4px solid var(--shadow);
+  background:
+    linear-gradient(var(--sky) 0 34%, transparent 34%),
+    linear-gradient(#7fb861 0 100%);
+  box-shadow: 0 7px 0 var(--shadow);
+}
+
+.sky {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 42%;
+}
+
+.sun {
+  position: absolute;
+  top: 34px;
+  right: 58px;
+  width: 58px;
+  height: 58px;
+  background: #ffd86f;
+  border: 4px solid var(--shadow);
+  box-shadow: 8px 8px 0 rgba(61, 43, 29, 0.18);
+  animation: sun-glow 3.2s ease-in-out infinite;
+}
+
+.cloud {
+  position: absolute;
+  width: 106px;
+  height: 34px;
+  background: #fff7df;
+  border: 3px solid var(--shadow);
+  box-shadow: 5px 5px 0 rgba(61, 43, 29, 0.15);
+}
+
+.cloud::before,
+.cloud::after {
+  content: "";
+  position: absolute;
+  bottom: 14px;
+  width: 34px;
+  height: 34px;
+  background: #fff7df;
+  border: 3px solid var(--shadow);
+}
+
+.cloud::before {
+  left: 18px;
+}
+
+.cloud::after {
+  right: 20px;
+}
+
+.cloud-one {
+  top: 48px;
+  left: 8%;
+  animation: cloud-drift 18s linear infinite;
+}
+
+.cloud-two {
+  top: 104px;
+  left: 34%;
+  transform: scale(0.75);
+  animation: cloud-drift-small 24s linear infinite;
+}
+
+.farm-path {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 22px;
+  padding: 158px 28px 250px;
+}
+
+.plot {
+  position: relative;
+  min-width: 0;
+}
+
+.plot:nth-child(even) {
+  margin-top: 36px;
+}
+
+.soil {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  height: 92px;
+  border: 4px solid var(--shadow);
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.08) 0 8px, transparent 8px 20px),
+    var(--soil);
+  box-shadow: inset 0 -10px 0 var(--soil-dark), 0 5px 0 var(--shadow);
+}
+
+.plot-sign {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 38px;
+  margin-top: 14px;
+  padding: 7px 6px;
+  border: 3px solid var(--shadow);
+  background: var(--paper);
+  box-shadow: 0 4px 0 var(--shadow);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.2;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.crop {
+  position: relative;
+  width: 44px;
+  height: 62px;
+  opacity: 0.4;
+  transform: translateY(10px) scale(0.68);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.crop-stem,
+.crop-top {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.crop-stem {
+  bottom: 0;
+  width: 10px;
+  height: 38px;
+  background: var(--leaf);
+  border: 3px solid var(--shadow);
+}
+
+.crop-top {
+  bottom: 30px;
+  width: 34px;
+  height: 26px;
+  background: var(--wheat);
+  border: 3px solid var(--shadow);
+  box-shadow: -18px 12px 0 -4px var(--leaf-bright), 18px 12px 0 -4px var(--leaf-bright);
+}
+
+.plot-done .crop {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  animation: crop-sway 2.6s ease-in-out infinite;
+  animation-delay: calc(var(--plot-index) * 120ms);
+}
+
+.plot-active .soil {
+  animation: active-soil 1.2s infinite;
+  outline: 4px solid #ffe28a;
+}
+
+.plot-active .crop {
+  opacity: 1;
+  animation: growing 1.1s infinite;
+}
+
+.plot-waiting .soil {
+  background: var(--waiting);
+}
+
+.plot-failed .soil {
+  background:
+    linear-gradient(135deg, transparent 0 45%, var(--danger) 45% 55%, transparent 55%),
+    var(--soil-light);
+}
+
+.plot-interrupted .soil {
+  background: var(--blue);
+}
+
+.plot-waiting .plot-sign::before,
+.plot-interrupted .plot-sign::before {
+  content: "!";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 5px;
+  border: 2px solid var(--shadow);
+  background: #ffe28a;
+}
+
+.worker {
+  position: absolute;
+  right: 12px;
+  bottom: 24px;
+  width: 48px;
+  height: 70px;
+  transform-origin: bottom center;
+  animation: worker-bob 680ms steps(2, end) infinite;
+}
+
+.worker-head,
+.worker-body,
+.worker-arm,
+.worker-tool,
+.worker-leg,
+.ui-frame {
+  position: absolute;
+  border: 3px solid var(--shadow);
+}
+
+.worker-head {
+  top: 0;
+  left: 14px;
+  width: 22px;
+  height: 22px;
+  background: #f0b37b;
+  box-shadow: 0 -8px 0 #466240;
+}
+
+.worker-body {
+  top: 25px;
+  left: 11px;
+  width: 27px;
+  height: 26px;
+  background: #376f9d;
+}
+
+.worker-arm {
+  top: 30px;
+  left: 31px;
+  width: 24px;
+  height: 9px;
+  background: #f0b37b;
+  transform-origin: left center;
+  animation: hammer-arm 520ms steps(2, end) infinite;
+}
+
+.worker-tool {
+  top: 18px;
+  right: -10px;
+  width: 8px;
+  height: 26px;
+  background: #6e5a3f;
+  transform-origin: bottom center;
+  animation: hammer-tool 520ms steps(2, end) infinite;
+}
+
+.worker-leg {
+  top: 50px;
+  width: 9px;
+  height: 17px;
+  background: #36505f;
+}
+
+.worker-leg-a {
+  left: 13px;
+}
+
+.worker-leg-b {
+  left: 28px;
+}
+
+.ui-frame {
+  right: -24px;
+  bottom: 2px;
+  width: 28px;
+  height: 22px;
+  background: #f9f2d0;
+  box-shadow: inset 0 7px 0 #8fc8e8;
+}
+
+.worker-general .worker-body {
+  background: #8055a2;
+}
+
+.worker-frontend .worker-body {
+  background: #376f9d;
+}
+
+.worker-frontend .ui-frame {
+  background: #fff8dc;
+}
+
+.worker-deploy .worker-body {
+  background: #9c5f38;
+}
+
+.worker-deploy .ui-frame {
+  width: 32px;
+  height: 22px;
+  right: -28px;
+  background: #d99a4e;
+  box-shadow: inset 0 8px 0 #f0c06a;
+  animation: crate-load 900ms steps(2, end) infinite;
+}
+
+.deploy-workshop {
+  position: absolute;
+  z-index: 2;
+  right: 190px;
+  bottom: 24px;
+  width: min(520px, calc(100% - 240px));
+  min-height: 158px;
+  border: 4px solid var(--shadow);
+  background: #d4b071;
+  box-shadow: inset 0 -12px 0 #9d7145, 0 6px 0 var(--shadow);
+}
+
+.workshop-sign {
+  position: absolute;
+  top: -38px;
+  left: 16px;
+  min-width: 170px;
+  padding: 7px 10px;
+  border: 3px solid var(--shadow);
+  background: var(--paper);
+  box-shadow: 0 4px 0 var(--shadow);
+  font-size: 13px;
+}
+
+.shipping-road {
+  position: absolute;
+  left: -120px;
+  top: 72px;
+  width: 118px;
+  height: 34px;
+  border-block: 4px solid var(--shadow);
+  background: #77583b;
+}
+
+.shipping-road span {
+  display: inline-block;
+  width: 20px;
+  height: 6px;
+  margin: 10px 4px;
+  background: #f7e0ad;
+}
+
+.release-cart {
+  position: absolute;
+  left: 22px;
+  bottom: 28px;
+  width: 58px;
+  height: 42px;
+  border: 3px solid var(--shadow);
+  background: #7b4b32;
+}
+
+.cart-crate {
+  position: absolute;
+  left: 11px;
+  top: -18px;
+  width: 32px;
+  height: 26px;
+  border: 3px solid var(--shadow);
+  background: #d99a4e;
+}
+
+.cart-wheel {
+  position: absolute;
+  bottom: -11px;
+  width: 16px;
+  height: 16px;
+  border: 3px solid var(--shadow);
+  background: #2f271c;
+}
+
+.cart-wheel-a {
+  left: 5px;
+}
+
+.cart-wheel-b {
+  right: 5px;
+}
+
+.packing-line {
+  position: absolute;
+  left: 110px;
+  right: 126px;
+  bottom: 36px;
+  height: 42px;
+}
+
+.belt {
+  position: absolute;
+  inset: 18px 0 0;
+  border: 3px solid var(--shadow);
+  background:
+    repeating-linear-gradient(90deg, #3d5d68 0 14px, #517887 14px 28px);
+}
+
+.package {
+  position: absolute;
+  bottom: 22px;
+  width: 30px;
+  height: 24px;
+  border: 3px solid var(--shadow);
+  background: #f0c06a;
+}
+
+.package-a {
+  left: 16px;
+}
+
+.package-b {
+  right: 30px;
+}
+
+.stamp {
+  position: absolute;
+  top: -12px;
+  left: 52%;
+  width: 20px;
+  height: 34px;
+  border: 3px solid var(--shadow);
+  background: #9c3f30;
+}
+
+.server-room {
+  position: absolute;
+  right: 22px;
+  bottom: 22px;
+  width: 76px;
+  height: 100px;
+  border: 4px solid var(--shadow);
+  background: #385063;
+  box-shadow: inset -10px 0 0 #263947;
+}
+
+.server-light {
+  width: 18px;
+  height: 18px;
+  margin: 10px;
+  border: 3px solid var(--shadow);
+  background: #7fb861;
+}
+
+.server-slot {
+  width: 46px;
+  height: 10px;
+  margin: 9px auto;
+  border: 2px solid var(--shadow);
+  background: #8fc8e8;
+}
+
+.workshop-status {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 8px;
+  min-height: 24px;
+  padding: 5px 8px;
+  border: 3px solid var(--shadow);
+  background: var(--cream);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.deploy-workshop .worker {
+  right: auto;
+  left: 82px;
+  bottom: 70px;
+}
+
+.deploy-active .release-cart {
+  animation: cart-roll 2.4s steps(6, end) infinite;
+}
+
+.deploy-active .package-a {
+  animation: package-move-a 1.6s steps(5, end) infinite;
+}
+
+.deploy-active .package-b {
+  animation: package-move-b 1.6s steps(5, end) infinite;
+}
+
+.deploy-active .stamp {
+  animation: stamp-press 800ms steps(2, end) infinite;
+}
+
+.deploy-active .server-light,
+.deploy-done .server-light {
+  animation: server-blink 900ms steps(2, end) infinite;
+}
+
+.deploy-waiting {
+  background: #d6a947;
+}
+
+.deploy-failed {
+  background:
+    linear-gradient(135deg, transparent 0 45%, #b64a35 45% 55%, transparent 55%),
+    #c28a55;
+}
+
+.farmhouse {
+  position: absolute;
+  right: 38px;
+  bottom: 28px;
+  width: 116px;
+  height: 112px;
+}
+
+.roof {
+  width: 120px;
+  height: 42px;
+  background: #9c3f30;
+  border: 4px solid var(--shadow);
+  transform: skewX(-18deg);
+  box-shadow: 5px 5px 0 var(--shadow);
+}
+
+.house-body {
+  width: 100px;
+  height: 68px;
+  margin-left: 8px;
+  border: 4px solid var(--shadow);
+  background: #e9bd74;
+  box-shadow: inset 0 -10px 0 #bf7f48, 5px 5px 0 var(--shadow);
+}
+
+.house-body span {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  margin: 18px 0 0 18px;
+  border: 3px solid var(--shadow);
+  background: #ffe28a;
+  animation: window-glow 2.8s ease-in-out infinite;
+}
+
+.status-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+  padding: 14px;
+}
+
+.status-strip > div {
+  min-width: 0;
+  padding: 10px;
+  border: 3px solid var(--shadow);
+  background: var(--paper);
+}
+
+.status-strip strong {
+  display: block;
+  min-height: 22px;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.farm-note {
+  margin-top: 18px;
+  padding: 14px 18px;
+}
+
+.farm-note p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.devtool-panel {
+  display: grid;
+  grid-template-columns: 170px 1fr;
+  gap: 14px;
+  align-items: center;
+  margin-top: 18px;
+  padding: 14px;
+}
+
+.devtool-panel strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.devtool-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.devtool-buttons button {
+  min-height: 36px;
+  border: 3px solid var(--shadow);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  box-shadow: 0 3px 0 var(--shadow);
+}
+
+.devtool-buttons button.active {
+  background: var(--leaf-bright);
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 var(--shadow);
+}
+
+.farm-log {
+  margin-top: 18px;
+  padding: 12px 16px;
+}
+
+.farm-log summary {
+  cursor: pointer;
+}
+
+.farm-log ol {
+  margin: 12px 0 0;
+  padding-left: 24px;
+}
+
+.farm-log li {
+  margin: 8px 0;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+@keyframes active-soil {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.12);
+  }
+}
+
+@keyframes badge-breathe {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes sun-glow {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.1);
+  }
+}
+
+@keyframes cloud-drift {
+  0% {
+    transform: translateX(-10px);
+  }
+  50% {
+    transform: translateX(18px);
+  }
+  100% {
+    transform: translateX(-10px);
+  }
+}
+
+@keyframes cloud-drift-small {
+  0% {
+    transform: translateX(14px) scale(0.75);
+  }
+  50% {
+    transform: translateX(-18px) scale(0.75);
+  }
+  100% {
+    transform: translateX(14px) scale(0.75);
+  }
+}
+
+@keyframes crop-sway {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-1deg) scale(1);
+  }
+  50% {
+    transform: translateY(-2px) rotate(1deg) scale(1);
+  }
+}
+
+@keyframes crate-load {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes cart-roll {
+  0% {
+    transform: translateX(-90px);
+  }
+  100% {
+    transform: translateX(76px);
+  }
+}
+
+@keyframes package-move-a {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(84px);
+  }
+}
+
+@keyframes package-move-b {
+  0% {
+    transform: translateX(-80px);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+@keyframes stamp-press {
+  0%,
+  100% {
+    transform: translateY(-5px);
+  }
+  50% {
+    transform: translateY(12px);
+  }
+}
+
+@keyframes server-blink {
+  0%,
+  100% {
+    background: #7fb861;
+  }
+  50% {
+    background: #fff17a;
+  }
+}
+
+@keyframes window-glow {
+  0%,
+  100% {
+    background: #ffe28a;
+  }
+  50% {
+    background: #fff6bd;
+  }
+}
+
+@keyframes growing {
+  0%,
+  100% {
+    transform: translateY(2px) scale(0.92);
+  }
+  50% {
+    transform: translateY(-3px) scale(1);
+  }
+}
+
+@keyframes worker-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+@keyframes hammer-arm {
+  0%,
+  100% {
+    transform: rotate(-18deg);
+  }
+  50% {
+    transform: rotate(20deg);
+  }
+}
+
+@keyframes hammer-tool {
+  0%,
+  100% {
+    transform: rotate(-28deg);
+  }
+  50% {
+    transform: rotate(18deg);
+  }
+}
+
+@media (max-width: 860px) {
+  .farm-path {
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+    padding-top: 136px;
+  }
+
+  .farm-scene {
+    min-height: 940px;
+  }
+
+  .status-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .devtool-panel {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .app-shell {
+    width: min(100vw - 18px, 1180px);
+    padding-top: 12px;
+  }
+
+  .farm-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .farm-scene {
+    min-height: 1340px;
+  }
+
+  .farm-path,
+  .status-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .farm-path {
+    gap: 18px;
+    padding-inline: 16px;
+  }
+
+  .plot:nth-child(even) {
+    margin-top: 0;
+  }
+
+  .farmhouse {
+    right: 18px;
+    bottom: 18px;
+    transform: scale(0.82);
+    transform-origin: bottom right;
+  }
+
+  .deploy-workshop {
+    left: 16px;
+    right: 16px;
+    bottom: 126px;
+    width: auto;
+  }
+
+  .shipping-road {
+    display: none;
+  }
+
+  .packing-line {
+    left: 96px;
+    right: 96px;
+  }
+}

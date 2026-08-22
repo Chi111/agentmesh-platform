@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "interruptedAt": "2026-06-14T09:00:00.000Z",
+  "reason": "User requested pause.",
+  "activeCommand": "internal chill:run",
+  "currentFeature": "specs/1.feature-name",
+  "currentTaskId": "T-005",
+  "completedSteps": [
+    "project-scan",
+    "spec-generate",
+    "task-plan"
+  ],
+  "nextSafeCommand": "/chill-ai continue",
+  "notes": "Resume should rebuild context from workflow-state.json and continue automatically unless a gate is blocked."
+}

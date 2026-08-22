@@ -1,0 +1,43 @@
+flowchart TD
+  A["/chill-ai"] --> B["internal project scan"]
+  B --> C["Detect stack, structure, commands, rules"]
+  C --> D["Generate Chill Workflow profile"]
+
+  D --> E["internal requirement analysis"]
+  E --> F{"Requirement clear?"}
+  F -->|No| G["Clarify Loop<br/>business boundary, permissions, acceptance"]
+  G --> E
+  F -->|Yes| H["Generate Specs<br/>requirements / design / tasks"]
+
+  H --> I["internal map validation"]
+  H --> J["internal task execution"]
+
+  J --> K["Planner<br/>split Feature / Task"]
+  K --> L{"Can run in parallel?"}
+  L -->|Yes| M["Subagent Dispatch"]
+  L -->|No| N["Serial Execution"]
+
+  M --> O["Frontend / Backend / DB / QA / Security / Docs"]
+  N --> O
+
+  O --> P["Merge Result"]
+  P --> Q["Review Gate"]
+  Q --> R{"Review passed?"}
+  R -->|No| S["Fix Loop<br/>return to responsible subagent"]
+  S --> O
+
+  R -->|Yes| T["QA Gate"]
+  T --> U{"Acceptance passed?"}
+  U -->|No| V["Test Fix Loop"]
+  V --> O
+
+  U -->|Yes| W["Mark Done"]
+  W --> X["Write LESSONS.md"]
+  X --> Y["Context Reset"]
+  Y --> Z{"More tasks?"}
+  Z -->|Yes| J
+  Z -->|No| END["internal finish summary + docs sync"]
+  END --> DEPLOY{"Deploy requested?"}
+  DEPLOY -->|Yes| DEPLOYFLOW["Deploy Workshop<br/>/chill-ai deploy / approve / smoke"]
+  DEPLOY -->|No| DONE["Workflow complete"]
+  DEPLOYFLOW --> DEPLOYDONE["Package release<br/>ship to server + persist lessons"]

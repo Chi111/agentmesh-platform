@@ -1,0 +1,20 @@
+flowchart TD
+  A["/chill-ai deploy"] --> B["Detect deployment target"]
+  B --> AWS{"AWS target?"}
+  AWS -->|Yes| AM["AWS MCP discovery<br/>account / region / resources"]
+  AWS -->|No| C["Build deploy plan"]
+  AM --> C
+  C --> D["Preflight checks"]
+  D --> E{"Ready?"}
+  E -->|No| F["Stop with missing items"]
+  E -->|Yes| G["Build + tests"]
+  G --> H{"Approval required?"}
+  H -->|Yes| I["Approval Gate"]
+  I --> J{"Approved?"}
+  J -->|No| K["Pause"]
+  J -->|Yes| L["Deploy"]
+  H -->|No| L
+  L --> M["Smoke test"]
+  M --> N{"Smoke passed?"}
+  N -->|No| O["Rollback plan"]
+  N -->|Yes| P["Persist summary + lessons"]

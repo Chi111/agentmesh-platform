@@ -1,0 +1,5 @@
+# Pinme config file
+# Project name (required)
+project_name = "agentmesh-platform-74a3"
+frontend_url = "https://agentmesh.pinit.eth.limo"
+api_url = "https://agentmesh-platform-74a3.api.pinme.pro"

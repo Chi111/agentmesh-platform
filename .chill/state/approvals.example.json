@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "blocked": [
+    {
+      "gateId": "deploy-production-001",
+      "status": "pending",
+      "reason": "Production AWS mutation requires approval.",
+      "requestedAction": "Deploy Lambda alias production to version 12.",
+      "riskLevel": "high",
+      "rollbackPlan": "Move production alias back to version 11.",
+      "resumeCommand": "/chill-ai continue",
+      "createdAt": "2026-06-14T09:00:00.000Z"
+    }
+  ]
+}

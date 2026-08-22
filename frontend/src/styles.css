@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-line;
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  body {
+    @apply m-0 min-w-[320px] bg-canvas font-sans text-ink antialiased;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    @apply outline-none ring-2 ring-cyan ring-offset-2 ring-offset-canvas;
+  }
+
+  ::selection {
+    @apply bg-cyan/20 text-ink;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-2xl border border-line bg-panel shadow-card;
+  }
+
+  .btn-primary {
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-ink px-4 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-45;
+  }
+
+  .btn-secondary {
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-line bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/30 hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-45;
+  }
+
+  .btn-signal {
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-cyan px-4 py-2 text-sm font-semibold text-ink transition hover:bg-cyan/85 disabled:cursor-not-allowed disabled:opacity-45;
+  }
+
+  .field {
+    @apply w-full rounded-xl border border-line bg-white px-3.5 py-2.5 text-sm text-ink placeholder:text-muted/60 transition focus:border-cyan;
+  }
+
+  .field-label {
+    @apply mb-2 block text-sm font-semibold text-ink;
+  }
+
+  .eyebrow {
+    @apply font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-muted;
+  }
+
+  .metric-value {
+    @apply mt-2 text-2xl font-semibold tracking-tight text-ink;
+  }
+
+  .mono-chip {
+    @apply inline-flex items-center rounded-md border border-line bg-canvas px-2 py-1 font-mono text-[10px] font-medium text-muted;
+  }
+
+  .mesh-grid {
+    background-image: radial-gradient(circle, rgba(102, 112, 120, 0.22) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+}

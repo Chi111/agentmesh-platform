@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "status": "completed",
+  "route": "prd",
+  "reason": "Agent Market foundation crosses API contracts, D1 migrations, frontend flows, reputation and payment start guards.",
+  "activeCommand": "internal chill:finish",
+  "currentStage": "finish",
+  "currentFeature": "specs/002-market-foundation",
+  "currentTaskId": null,
+  "lastSafeCheckpoint": {
+    "stage": "finish",
+    "completedAt": "2026-08-20T21:44:00+08:00",
+    "summary": "Agent Market foundation completed; final review ALLOW, QA passed with 43 backend/D1 tests, 7 browser E2E tests, frontend build and Worker dry-run."
+  },
+  "nextSafeCommand": "",
+  "blockedGateId": null,
+  "autoRun": true,
+  "updatedAt": "2026-08-20T21:44:00+08:00"
+}
