@@ -135,6 +135,7 @@ export interface Escrow {
   depositTxHash: string | null;
   releaseTxHash: string | null;
   payoutHash: string | null;
+  requesterWalletAddress: string | null;
   freezeTxHash: string | null;
   resolutionTxHash: string | null;
   releasedAt: string | null;
@@ -348,7 +349,14 @@ export interface PlatformStore {
   createMission(mission: Mission, stages: WorkflowStage[]): Promise<Mission>;
   saveCompilation(id: string, spec: Record<string, unknown>, stages: WorkflowStage[]): Promise<Mission | null>;
   confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[]): Promise<Mission | null>;
-  startMission(id: string, requesterId: string, depositTxHash: string | null, payoutHash?: string | null, startedAt?: string): Promise<MissionStartResult | null>;
+  startMission(
+    id: string,
+    requesterId: string,
+    depositTxHash: string | null,
+    payoutHash?: string | null,
+    startedAt?: string,
+    requesterWalletAddress?: string | null,
+  ): Promise<MissionStartResult | null>;
   submitMissionForReview(id: string, reviewDueAt: string): Promise<Mission | null>;
   acceptMission(id: string, actorId: string, releaseTxHash: string | null): Promise<AcceptanceResult | null>;
   listStages(missionId: string): Promise<WorkflowStage[]>;

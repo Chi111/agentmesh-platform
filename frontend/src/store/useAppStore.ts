@@ -182,13 +182,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     developerSummary: null,
     selectedAgents: {},
   }),
-  applyMissionDetail: (detail) => set((state) => ({
-    missions: state.missions.some((mission) => mission.id === detail.mission.id)
-      ? state.missions.map((mission) => mission.id === detail.mission.id ? detail.mission : mission)
-      : [detail.mission, ...state.missions],
-    missionStages: { ...state.missionStages, [detail.mission.id]: detail.stages },
-    missionDetails: { ...state.missionDetails, [detail.mission.id]: detail },
-  })),
+  applyMissionDetail: (detail) => set((state) => {
+    const assignedAgents = Object.fromEntries(detail.stages.flatMap((stage) => (
+      stage.agentId ? [[stage.id, stage.agentId]] : []
+    )));
+    return {
+      missions: state.missions.some((mission) => mission.id === detail.mission.id)
+        ? state.missions.map((mission) => mission.id === detail.mission.id ? detail.mission : mission)
+        : [detail.mission, ...state.missions],
+      missionStages: { ...state.missionStages, [detail.mission.id]: detail.stages },
+      missionDetails: { ...state.missionDetails, [detail.mission.id]: detail },
+      selectedAgents: { ...state.selectedAgents, ...assignedAgents },
+    };
+  }),
   loadMissionDetail: async (missionId) => {
     requireApiSession();
     const detail = await api.getMission(missionId);
@@ -197,18 +203,22 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadCandidates: async (missionId) => {
     requireApiSession();
     const matches = await api.getCandidates(missionId);
-    const selections: Record<string, string> = {};
-    for (const match of matches) {
-      const first = match.candidates[0]?.agent.id;
-      if (first && !get().selectedAgents[match.stageId]) selections[match.stageId] = first;
-    }
-    set((state) => ({
-      candidateMatches: { ...state.candidateMatches, [missionId]: matches.map((match) => ({
-        ...match,
-        candidates: match.candidates.map((candidate) => ({ ...candidate, agent: normalizeAgent(candidate.agent) })),
-      })) },
-      selectedAgents: { ...state.selectedAgents, ...selections },
-    }));
+    set((state) => {
+      const stages = state.missionStages[missionId] ?? [];
+      const selections: Record<string, string> = {};
+      for (const match of matches) {
+        const first = match.candidates[0]?.agent.id;
+        const assignedAgent = stages.find((stage) => stage.id === match.stageId)?.agentId;
+        if (first && !state.selectedAgents[match.stageId] && !assignedAgent) selections[match.stageId] = first;
+      }
+      return {
+        candidateMatches: { ...state.candidateMatches, [missionId]: matches.map((match) => ({
+          ...match,
+          candidates: match.candidates.map((candidate) => ({ ...candidate, agent: normalizeAgent(candidate.agent) })),
+        })) },
+        selectedAgents: { ...state.selectedAgents, ...selections },
+      };
+    });
   },
   markNotificationsRead: async () => {
     if (!hasApiSession()) return;

@@ -71,6 +71,7 @@ interface AppDependencies {
   emailSender?: typeof sendPinmeEmail;
   llmCaller?: typeof callPinmeLlm;
   endpointValidator?: (endpoint: string, env: Env) => Promise<void>;
+  depositVerifier?: typeof verifyDepositTransaction;
 }
 
 const BUILTIN_AGENT_PROFILES = {
@@ -124,6 +125,7 @@ class ApiError extends Error {
 const MAX_JSON_BYTES = 1_000_000;
 const DEFAULT_CORS_ORIGINS = [
   'https://agentmesh.pinit.eth.limo',
+  'https://agentmesh.pinme.dev',
   'http://localhost:5173',
   'http://127.0.0.1:4173',
 ];
@@ -281,6 +283,10 @@ function recordValue(body: Record<string, unknown>, key: string): Record<string,
     throw new ApiError(400, 'VALIDATION_ERROR', `${key} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function hasStructuredStageOutput(stage: WorkflowStage): boolean {
+  return stage.status === 'done' && Boolean(stage.output && Object.keys(stage.output).length > 0);
 }
 
 function safeUrl(value: string, field: string, protocols = ['https:', 'ipfs:']): string {
@@ -1094,7 +1100,8 @@ export function createApp(dependencies: AppDependencies = {}) {
           const latestStages = await store.listStages(missionId);
           const deliverables = await store.listDeliverables(missionId);
           let latestMission = await store.getMission(missionId);
-          if (latestStages.length > 0 && latestStages.every((item) => item.status === 'done') && deliverables.length > 0) {
+          const workflowHasSignedOutputs = latestStages.length > 0 && latestStages.every(hasStructuredStageOutput);
+          if (latestStages.length > 0 && latestStages.every((item) => item.status === 'done') && (deliverables.length > 0 || workflowHasSignedOutputs)) {
             latestMission = await store.submitMissionForReview(missionId, reviewDueAt(now));
           }
           await deliverNotification(store, env, dependencies, {
@@ -1424,15 +1431,13 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (!offersAccepted) throw new ApiError(409, 'OFFERS_NOT_ACCEPTED', 'Every assigned Agent must accept a valid stage offer before funding starts');
             let chainVerification = null;
             let payoutHash: string | null = null;
+            let requesterWalletAddress: string | null = null;
             if (isWeb3Payment(context.mission.paymentMethod)) {
               if (!isOnchainSettlementConfigured(env)) {
                 throw new ApiError(503, 'CHAIN_NOT_CONFIGURED', 'Sepolia mUSDC / sETH 托管尚未配置');
               }
               if (context.mission.requesterId !== user.id) {
                 throw new ApiError(403, 'ONCHAIN_REQUESTER_REQUIRED', 'Only the mission requester can authorize an on-chain escrow deposit');
-              }
-              if (!user.walletAddress) {
-                throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', 'Link a wallet to the verified account before using on-chain settlement');
               }
               if (!depositTxHash) throw new ApiError(400, 'DEPOSIT_TX_REQUIRED', 'A verified escrow deposit transaction is required');
               let settlementPlan;
@@ -1442,7 +1447,7 @@ export function createApp(dependencies: AppDependencies = {}) {
                 throw new ApiError(409, 'INVALID_SETTLEMENT_PLAN', error instanceof Error ? error.message : 'The settlement plan is invalid');
               }
               payoutHash = settlementPlan.payoutHash;
-              chainVerification = await verifyDepositTransaction(
+              chainVerification = await (dependencies.depositVerifier ?? verifyDepositTransaction)(
                 env,
                 depositTxHash,
                 missionId,
@@ -1452,12 +1457,23 @@ export function createApp(dependencies: AppDependencies = {}) {
                 user.walletAddress,
               );
               if (!chainVerification.ok) throw new ApiError(chainVerification.status, chainVerification.code, chainVerification.message);
+              requesterWalletAddress = chainVerification.requester?.toLocaleLowerCase() ?? null;
+              if (!requesterWalletAddress) {
+                throw new ApiError(409, 'SETTLEMENT_REQUESTER_MISSING', 'The verified escrow event does not identify its requester');
+              }
             } else if (depositTxHash) {
               throw new ApiError(400, 'UNEXPECTED_CHAIN_TRANSACTION', 'Web2 余额支付不接受链上交易哈希');
             }
             let startResult;
             try {
-              startResult = await store.startMission(missionId, context.mission.requesterId, depositTxHash, payoutHash, now.toISOString());
+              startResult = await store.startMission(
+                missionId,
+                context.mission.requesterId,
+                depositTxHash,
+                payoutHash,
+                now.toISOString(),
+                requesterWalletAddress,
+              );
             } catch (paymentError) {
               if (paymentError instanceof Error && paymentError.message.includes('INSUFFICIENT_BALANCE')) {
                 throw new ApiError(409, 'INSUFFICIENT_BALANCE', 'Web2 余额不足，请先到测试充值页领取体验余额');
@@ -1476,7 +1492,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             await store.addEvent({
               id: makeId('EVT'), missionId, stageId: null, type: 'mission.started', message: '执行网络已启动',
               actorType: 'requester', actorId: user.id,
-              payload: { depositTxHash, payoutHash, paymentMethod: context.mission.paymentMethod, settlementMode: settlementDescriptor(env).mode, chainVerification },
+              payload: { depositTxHash, payoutHash, requesterWalletAddress, paymentMethod: context.mission.paymentMethod, settlementMode: settlementDescriptor(env).mode, chainVerification },
               createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
             }, 1, '执行网络已启动');
             return success(request, env, requestId, { mission: saved, escrow: await store.getEscrow(missionId), pollAfterMs: 3000 });
@@ -1488,7 +1504,10 @@ export function createApp(dependencies: AppDependencies = {}) {
             if ((await store.getEscrow(missionId))?.status !== 'held') throw new ApiError(409, 'ESCROW_NOT_HELD', 'Mission escrow must be held before dispatch');
             const callbackSecret = env.AGENT_WEBHOOK_SECRET?.trim() || env.API_KEY?.trim();
             if (!callbackSecret) throw new ApiError(503, 'CALLBACK_SIGNING_UNAVAILABLE', 'Agent callback signing is not configured');
-            const nextStage = context.stages.find((stage, index) => stage.status === 'queued' && context.stages.slice(0, index).every((previous) => previous.status === 'done'));
+            const nextStage = context.stages.find((stage, index) => (
+              (stage.status === 'queued' || stage.status === 'failed')
+              && context.stages.slice(0, index).every((previous) => previous.status === 'done')
+            ));
             if (!nextStage) throw new ApiError(409, 'NO_RUNNABLE_STAGE', 'No workflow stage is ready to dispatch');
             if (!nextStage.agentId) throw new ApiError(409, 'WORKFLOW_INCOMPLETE', 'Runnable stage has no assigned Agent');
             const agent = context.agents.find((candidate) => candidate.id === nextStage.agentId);
@@ -1547,6 +1566,14 @@ export function createApp(dependencies: AppDependencies = {}) {
               }
             }
             const callbackUrl = `${url.origin}/api/hooks/agents/${encodeURIComponent(agent.id)}/events`;
+            const upstream = context.stages
+              .filter((stage) => stage.position < nextStage.position && stage.status === 'done')
+              .map((stage) => ({
+                id: stage.id,
+                name: stage.name,
+                purpose: stage.purpose,
+                output: stage.output,
+              }));
             const dispatchBody = JSON.stringify({
               task: {
                 mission: {
@@ -1561,12 +1588,15 @@ export function createApp(dependencies: AppDependencies = {}) {
                 },
                 stage: {
                   id: nextStage.id,
+                  position: nextStage.position,
+                  totalStages: context.stages.length,
                   name: nextStage.name,
                   purpose: nextStage.purpose,
                   category: nextStage.category,
                   budget: nextStage.budget,
                   input: nextStage.input,
                 },
+                upstream,
               },
               callback: { url: callbackUrl, signature: token, runId, expiresAt, callbackIdRequired: true },
             });
@@ -1591,7 +1621,11 @@ export function createApp(dependencies: AppDependencies = {}) {
               await sleep(250 * attempt);
             }
             if (!dispatchResponse) {
-              const failedStage = await store.transitionRunningStage(missionId, nextStage.id, 'failed');
+              const failedAt = (dependencies.now?.() ?? new Date()).toISOString();
+              const failedStage = await store.transitionRunningStage(missionId, nextStage.id, 'failed', {
+                error: 'Agent endpoint could not be reached after two attempts',
+                retryable: true,
+              });
               await store.completeAgentDispatch(runId, now.toISOString());
               if (!failedStage) {
                 const callbackStage = (await store.listStages(missionId)).find((stage) => stage.id === nextStage.id);
@@ -1601,13 +1635,23 @@ export function createApp(dependencies: AppDependencies = {}) {
               }
               await store.addEvent({
                 id: makeId('EVT'), missionId, stageId: nextStage.id, type: 'dispatch.failed',
-                message: `${agent.name} 端点重试后仍不可用`, actorType: 'platform', actorId: null, payload: { attempts: 2 },
-                createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
-              });
-              throw new ApiError(502, 'AGENT_UNAVAILABLE', 'Agent endpoint could not be reached');
+                message: `${agent.name} 端点重试后仍不可用，可重新派发`, actorType: 'platform', actorId: null,
+                payload: { attempts: 2, retryable: true }, createdAt: failedAt,
+              }, undefined, `${nextStage.name} 派发失败，可重试`, 'failed');
+              throw new ApiError(502, 'AGENT_UNAVAILABLE', 'Agent endpoint could not be reached. The failed stage can be retried.');
             }
             if (!dispatchResponse.ok) {
-              const failedStage = await store.transitionRunningStage(missionId, nextStage.id, 'failed');
+              const failedAt = (dependencies.now?.() ?? new Date()).toISOString();
+              const authenticationRejected = dispatchResponse.status === 401 || dispatchResponse.status === 403;
+              const authenticationMisconfigured = authenticationRejected && agent.authType === 'none';
+              const failedStage = await store.transitionRunningStage(missionId, nextStage.id, 'failed', {
+                error: authenticationMisconfigured
+                  ? 'Agent endpoint requires authentication but the Agent is registered without credentials'
+                  : `Agent endpoint returned HTTP ${dispatchResponse.status}`,
+                httpStatus: dispatchResponse.status,
+                authType: agent.authType,
+                retryable: true,
+              });
               await store.completeAgentDispatch(runId, now.toISOString());
               if (!failedStage) {
                 const callbackStage = (await store.listStages(missionId)).find((stage) => stage.id === nextStage.id);
@@ -1615,7 +1659,23 @@ export function createApp(dependencies: AppDependencies = {}) {
                   return success(request, env, requestId, { stage: callbackStage, agent: { id: agent.id, name: agent.name }, acknowledgement: null }, 202, { callbackWon: true });
                 }
               }
-              throw new ApiError(502, 'AGENT_REJECTED_TASK', `Agent endpoint returned HTTP ${dispatchResponse.status}`);
+              await store.addEvent({
+                id: makeId('EVT'), missionId, stageId: nextStage.id,
+                type: authenticationRejected ? 'dispatch.authentication_failed' : 'dispatch.failed',
+                message: authenticationMisconfigured
+                  ? `${agent.name} 端点要求鉴权，但平台登记为无鉴权`
+                  : `${agent.name} 拒绝了阶段任务，可重新派发`,
+                actorType: 'platform', actorId: null,
+                payload: { httpStatus: dispatchResponse.status, authType: agent.authType, retryable: true },
+                createdAt: failedAt,
+              }, undefined, `${nextStage.name} 派发失败，可重试`, 'failed');
+              if (authenticationMisconfigured) {
+                throw new ApiError(409, 'AGENT_AUTH_CONFIGURATION_REQUIRED', 'Agent endpoint requires a Bearer credential, but this Agent is registered with no authentication. Configure the Agent credential before retrying.');
+              }
+              if (authenticationRejected) {
+                throw new ApiError(502, 'AGENT_AUTH_REJECTED', `Agent endpoint rejected the configured ${agent.authType} credential. The failed stage can be retried after the credential is corrected.`);
+              }
+              throw new ApiError(502, 'AGENT_REJECTED_TASK', `Agent endpoint returned HTTP ${dispatchResponse.status}. The failed stage can be retried.`);
             }
             const responseText = await readLimitedResponse(dispatchResponse);
             let acknowledgement: unknown = responseText;
@@ -1727,8 +1787,10 @@ export function createApp(dependencies: AppDependencies = {}) {
             const escrow = await store.getEscrow(missionId);
             if (escrow?.status !== 'held') throw new ApiError(409, 'ESCROW_NOT_HELD', 'Mission escrow must be held before review');
             const deliverables = await store.listDeliverables(missionId);
-            if (deliverables.length === 0) throw new ApiError(409, 'DELIVERABLE_REQUIRED', 'At least one deliverable is required before review');
             if (context.stages.some((stage) => stage.status !== 'done')) throw new ApiError(409, 'WORKFLOW_INCOMPLETE', 'Every workflow stage must be completed before review');
+            if (deliverables.length === 0 && !context.stages.every(hasStructuredStageOutput)) {
+              throw new ApiError(409, 'DELIVERABLE_REQUIRED', 'A submitted deliverable or signed structured output from every stage is required before review');
+            }
             const saved = await store.submitMissionForReview(missionId, reviewDueAt(now));
             await deliverNotification(store, env, dependencies, {
               userId: context.mission.requesterId,
@@ -1745,7 +1807,9 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (context.mission.status === 'completed') return success(request, env, requestId, await missionDetail(store, context.mission, now.toISOString()), 200, { replayed: true });
             if (context.mission.status !== 'review') throw new ApiError(409, 'MISSION_NOT_REVIEWABLE', 'Mission must be in review before acceptance');
             const deliverables = await store.listDeliverables(missionId);
-            if (deliverables.length === 0) throw new ApiError(409, 'DELIVERABLE_REQUIRED', 'No deliverables are available for acceptance');
+            if (deliverables.length === 0 && !context.stages.every(hasStructuredStageOutput)) {
+              throw new ApiError(409, 'DELIVERABLE_REQUIRED', 'No submitted deliverable or complete signed Agent output is available for acceptance');
+            }
             const escrow = await store.getEscrow(missionId);
             if (!escrow) throw new ApiError(404, 'ESCROW_NOT_FOUND', 'Mission escrow not found');
             if (escrow.status === 'frozen') throw new ApiError(409, 'ESCROW_FROZEN', 'Resolve the active dispute before accepting this mission');
@@ -1759,7 +1823,8 @@ export function createApp(dependencies: AppDependencies = {}) {
               if (context.mission.requesterId !== user.id) {
                 throw new ApiError(403, 'ONCHAIN_REQUESTER_REQUIRED', 'Only the mission requester can authorize an on-chain escrow release');
               }
-              if (!user.walletAddress) {
+              const settlementRequester = escrow.requesterWalletAddress ?? user.walletAddress;
+              if (!settlementRequester) {
                 throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', 'Link a wallet to the verified account before using on-chain settlement');
               }
               if (!releaseTxHash) throw new ApiError(400, 'RELEASE_TX_REQUIRED', 'A verified escrow release transaction is required');
@@ -1779,7 +1844,7 @@ export function createApp(dependencies: AppDependencies = {}) {
                 context.mission.budget,
                 context.mission.paymentMethod,
                 settlementPlan.payoutHash,
-                user.walletAddress,
+                settlementRequester,
               );
               if (!verification.ok) throw new ApiError(verification.status, verification.code, verification.message);
             } else if (releaseTxHash) {
@@ -1830,9 +1895,12 @@ export function createApp(dependencies: AppDependencies = {}) {
               };
             });
             if (isWeb3Payment(context.mission.paymentMethod)) {
-              if (!user.walletAddress) throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', 'Link the wallet that will freeze the on-chain escrow');
+              const chainActor = context.mission.requesterId === user.id
+                ? escrow.requesterWalletAddress ?? user.walletAddress
+                : user.walletAddress;
+              if (!chainActor) throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', 'Link the wallet that will freeze the on-chain escrow');
               if (!freezeTxHash) throw new ApiError(400, 'FREEZE_TX_REQUIRED', 'A verified on-chain freeze transaction is required');
-              const verification = await verifyFreezeTransaction(env, freezeTxHash, missionId, user.walletAddress);
+              const verification = await verifyFreezeTransaction(env, freezeTxHash, missionId, chainActor);
               if (!verification.ok) throw new ApiError(verification.status, verification.code, verification.message);
             } else if (freezeTxHash) {
               throw new ApiError(400, 'UNEXPECTED_CHAIN_TRANSACTION', 'Web2 balance disputes do not accept a chain transaction hash');
@@ -2031,7 +2099,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (isWeb3Payment(mission.paymentMethod)) {
               if (!user.walletAddress) throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', 'Link an arbiter wallet before submitting an on-chain ruling');
               if (!resolutionTxHash) throw new ApiError(400, 'RESOLUTION_TX_REQUIRED', 'A verified on-chain ruling transaction is required');
-              const requesterWallet = (await store.getProfile(mission.requesterId))?.walletAddress;
+              const requesterWallet = escrow.requesterWalletAddress ?? (await store.getProfile(mission.requesterId))?.walletAddress;
               if (!requesterWallet) throw new ApiError(409, 'REQUESTER_WALLET_MISSING', 'The verified requester wallet is unavailable for refund verification');
               const verification = status === 'resolved'
                 ? await verifyRefundTransaction(env, resolutionTxHash, mission.id, mission.budget, mission.paymentMethod, user.walletAddress, requesterWallet)

@@ -64,7 +64,7 @@ export function TeamAssemblyPage() {
         {stages.map((stage, stageIndex) => {
           const liveMatch = matches.find((match) => match.stageId === stage.id);
           const visibleCandidates = liveMatch?.candidates.map((candidate) => candidate.agent) ?? [];
-          const selectedId = selectedAgents[stage.id] ?? visibleCandidates[0]?.id;
+          const selectedId = selectedAgents[stage.id] ?? stage.agentId ?? visibleCandidates[0]?.id;
 
           return (
             <section className="panel overflow-hidden" key={stage.id}>

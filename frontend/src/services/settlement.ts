@@ -7,9 +7,11 @@ import {
   isAddress,
   keccak256,
   parseAbi,
+  parseAbiItem,
   parseAbiParameters,
   parseUnits,
   stringToHex,
+  zeroAddress,
   type Address,
   type Hex,
 } from 'viem';
@@ -27,14 +29,22 @@ const escrowAbi = parseAbi([
   'function freeze(bytes32 missionKey)',
   'function unfreeze(bytes32 missionKey)',
   'function refund(bytes32 missionKey)',
+  'function escrows(bytes32 missionKey) view returns (address requester, uint128 amount, uint8 status, uint8 assetKind, bytes32 payoutHash)',
 ]);
 
-type SendTransaction = (input: {
+const escrowDepositedEvent = parseAbiItem(
+  'event EscrowDeposited(bytes32 indexed missionKey, address indexed requester, address indexed asset, uint256 amount, bytes32 payoutHash)',
+);
+
+export interface SettlementTransaction {
   to: string;
   data: Hex;
   chainId: number;
   value?: bigint;
-}) => Promise<{ hash: Hex }>;
+  gasLimit?: bigint;
+}
+
+type SendTransaction = (input: SettlementTransaction) => Promise<{ hash: Hex }>;
 
 export interface SettlementRecipient {
   address: string;
@@ -71,6 +81,7 @@ const rpcUrl = import.meta.env.VITE_BASE_RPC_URL?.trim();
 const escrowAddress = import.meta.env.VITE_ESCROW_CONTRACT_ADDRESS?.trim();
 const musdcAddress = (import.meta.env.VITE_MUSDC_ADDRESS ?? import.meta.env.VITE_USDC_ADDRESS)?.trim();
 const musdcDecimals = Math.max(0, Number(import.meta.env.VITE_USDC_DECIMALS ?? 6));
+const escrowDeploymentBlock = BigInt(import.meta.env.VITE_ESCROW_DEPLOYMENT_BLOCK ?? 11_541_034);
 const configured = import.meta.env.VITE_SETTLEMENT_MODE === 'contract'
   && Boolean(rpcUrl && isAddress(escrowAddress ?? '') && isAddress(musdcAddress ?? ''));
 
@@ -82,6 +93,46 @@ const chain = defineChain({
 });
 
 const publicClient = createPublicClient({ chain, transport: http(rpcUrl || chain.rpcUrls.default.http[0]) });
+
+// EIP-7825 is active on Sepolia and rejects transactions above 2^24 gas.
+const transactionGasCap = 16_777_216n;
+const gasBufferPercent = 20n;
+
+function shortRpcError(error: unknown) {
+  if (error && typeof error === 'object' && 'shortMessage' in error && typeof error.shortMessage === 'string') {
+    return error.shortMessage;
+  }
+  if (error instanceof Error) return error.message.split('\n')[0];
+  return 'RPC 未返回可识别的错误信息';
+}
+
+export async function prepareSettlementTransaction(
+  walletAddress: string,
+  input: SettlementTransaction,
+): Promise<SettlementTransaction> {
+  if (!isAddress(walletAddress, { strict: false }) || !isAddress(input.to, { strict: false })) {
+    throw new Error('无法为无效的钱包或合约地址估算 Gas。');
+  }
+  if (input.chainId !== chainId) throw new Error('交易网络与当前托管网络不一致。');
+
+  let estimatedGas: bigint;
+  try {
+    estimatedGas = await publicClient.estimateGas({
+      account: walletAddress as Address,
+      to: input.to as Address,
+      data: input.data,
+      value: input.value,
+    });
+  } catch (error) {
+    throw new Error(`交易模拟失败，未发起钱包签名：${shortRpcError(error)}`);
+  }
+
+  if (estimatedGas > transactionGasCap) {
+    throw new Error(`交易预计需要 ${estimatedGas.toString()} Gas，超过 Sepolia 单笔交易上限 ${transactionGasCap.toString()}。`);
+  }
+  const bufferedGas = estimatedGas + (estimatedGas * gasBufferPercent + 99n) / 100n;
+  return { ...input, gasLimit: bufferedGas > transactionGasCap ? transactionGasCap : bufferedGas };
+}
 
 export function onchainSettlementConfigured() {
   return configured;
@@ -97,6 +148,59 @@ async function waitForSuccess(hash: Hex) {
   if (receipt.status !== 'success') throw new Error('链上交易执行失败。');
 }
 
+async function recoverExistingDeposit(
+  walletAddress: Address,
+  missionId: string,
+  units: bigint,
+  paymentMethod: Web3PaymentMethod,
+  payoutHash: Hex,
+): Promise<Hex | null> {
+  const { escrow, musdc } = requireConfig();
+  const missionKey = keccak256(stringToHex(missionId));
+  const [requester, storedAmount, status, assetKind, storedPayoutHash] = await publicClient.readContract({
+    address: escrow,
+    abi: escrowAbi,
+    functionName: 'escrows',
+    args: [missionKey],
+  });
+  if (Number(status) === 0) return null;
+
+  const expectedAssetKind = paymentMethod === 'web3_musdc' ? 0 : 1;
+  if (
+    requester.toLocaleLowerCase() !== walletAddress.toLocaleLowerCase()
+    || storedAmount !== units
+    || Number(assetKind) !== expectedAssetKind
+    || storedPayoutHash !== payoutHash
+  ) {
+    throw new Error('该任务已有另一笔链上托管记录，参数或付款钱包不一致，已阻止重复支付。');
+  }
+  if (Number(status) !== 1) {
+    throw new Error('该任务的链上托管已不处于待执行状态，不能再次支付。');
+  }
+
+  try {
+    const logs = await publicClient.getLogs({
+      address: escrow,
+      event: escrowDepositedEvent,
+      args: { missionKey, requester: walletAddress },
+      fromBlock: escrowDeploymentBlock,
+      toBlock: 'latest',
+      strict: true,
+    });
+    const expectedAsset = paymentMethod === 'web3_musdc' ? musdc.toLocaleLowerCase() : zeroAddress;
+    const recovered = logs.find((log) => (
+      log.args.amount === units
+      && log.args.payoutHash === payoutHash
+      && log.args.asset?.toLocaleLowerCase() === expectedAsset
+    ));
+    if (recovered?.transactionHash) return recovered.transactionHash;
+  } catch {
+    // The on-chain state above is authoritative. Refuse another deposit when the
+    // RPC cannot currently return the historical transaction needed by the API.
+  }
+  throw new Error('检测到链上已有托管，但暂时无法恢复交易记录。请稍后重试，切勿重复支付。');
+}
+
 export async function depositEscrow(
   sendTransaction: SendTransaction,
   walletAddress: string,
@@ -109,6 +213,14 @@ export async function depositEscrow(
   if (!isAddress(walletAddress)) throw new Error('请先连接有效的 EVM 钱包。');
   const plan = normalizedPlan(recipients);
   const units = parseUnits(String(amount), paymentMethod === 'web3_musdc' ? musdcDecimals : 18);
+  const recoveredDeposit = await recoverExistingDeposit(
+    walletAddress as Address,
+    missionId,
+    units,
+    paymentMethod,
+    plan.payoutHash,
+  );
+  if (recoveredDeposit) return recoveredDeposit;
   if (paymentMethod === 'web3_seth') {
     const deposit = await sendTransaction({
       to: escrow,

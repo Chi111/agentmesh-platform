@@ -8,6 +8,32 @@ import { useMission } from '../hooks/useMission';
 import { useAppStore } from '../store/useAppStore';
 import { formatPaymentAmount, isWeb3Payment, paymentToken } from '../utils/payments';
 
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function deliverableText(value: unknown, depth = 0): string | null {
+  if (typeof value === 'string' && value.trim()) {
+    const text = value.trim();
+    if (depth === 0 && text.startsWith('{') && text.endsWith('}')) {
+      try {
+        const extracted = deliverableText(JSON.parse(text) as unknown, depth + 1);
+        if (extracted) return extracted;
+      } catch {
+        // A normal artifact may contain braces; keep it as plain text.
+      }
+    }
+    return text;
+  }
+  const nested = objectValue(value);
+  if (!nested) return null;
+  for (const key of ['narrative', 'content', 'text', 'copy', 'script', 'body', 'markdown']) {
+    const candidate = deliverableText(nested[key], depth + 1);
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
 export function AcceptancePage() {
   const mission = useMission();
   const missionId = mission?.id ?? '';
@@ -36,8 +62,14 @@ export function AcceptancePage() {
 
   const deliverables = detail?.deliverables ?? [];
   const selectedDeliverable = deliverables.find((item) => item.id === selectedDeliverableId) ?? deliverables[0] ?? null;
+  const completedStageOutputs = stages.filter((stage) => stage.status === 'done' && stage.output && Object.keys(stage.output).length > 0);
+  const finalStageOutput = completedStageOutputs[completedStageOutputs.length - 1]?.output ?? null;
+  const finalStageResult = objectValue(finalStageOutput)?.result;
+  const finalDeliverable = objectValue(finalStageResult)?.deliverable ?? finalStageOutput;
+  const finalDeliverableText = deliverableText(finalDeliverable);
+  const hasAcceptableOutput = deliverables.length > 0 || completedStageOutputs.length === stages.length;
   const evidenceCount = detail?.events.length ?? 0;
-  const canAccept = role === 'requester' && mission?.status === 'review' && deliverables.length > 0;
+  const canAccept = role === 'requester' && mission?.status === 'review' && hasAcceptableOutput;
   const isImage = selectedDeliverable?.mimeType.startsWith('image/');
   const isVideo = selectedDeliverable?.mimeType.startsWith('video/');
 
@@ -95,15 +127,15 @@ export function AcceptancePage() {
     <div className="space-y-5">
       <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="flex items-start gap-3"><Link to="/missions" className="mt-1 rounded-lg p-2 text-muted hover:bg-white hover:text-ink" aria-label="返回任务列表"><ArrowLeft size={18} /></Link><div><div className="flex flex-wrap items-center gap-2"><span className="mono-chip">{mission.id}</span><StatusBadge tone={mission.status === 'completed' ? 'success' : mission.status === 'cancelled' ? 'neutral' : 'warning'}>{mission.status === 'completed' ? '已结算' : mission.status === 'cancelled' ? '已退款终止' : '待验收'}</StatusBadge></div><h1 className="mt-2 text-2xl font-semibold tracking-tight">{mission.title}</h1><p className="mt-2 text-sm text-muted">核对交付物、执行证据和分账计划后完成结算。</p></div></div>
-        <div className="flex gap-3"><button type="button" className="btn-primary" onClick={() => setReleaseOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled' || !canAccept}><Check size={16} />{mission.status === 'completed' ? '已完成结算' : mission.status === 'cancelled' ? '任务已退款终止' : role !== 'requester' ? '仅任务方可确认验收' : mission.status !== 'review' ? '等待开发者提交验收' : deliverables.length === 0 ? '等待真实交付物' : `确认交付并释放 ${formatPaymentAmount(mission.budget, mission.paymentMethod)}`}</button></div>
+        <div className="flex gap-3"><button type="button" className="btn-primary" onClick={() => setReleaseOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled' || !canAccept}><Check size={16} />{mission.status === 'completed' ? '已完成结算' : mission.status === 'cancelled' ? '任务已退款终止' : role !== 'requester' ? '仅任务方可确认验收' : mission.status !== 'review' ? '等待 Agent 完成执行' : !hasAcceptableOutput ? '等待可验收输出' : `确认交付并释放 ${formatPaymentAmount(mission.budget, mission.paymentMethod)}`}</button></div>
       </header>
 
       <section className="panel overflow-hidden">
         <div className="grid gap-0 lg:grid-cols-[minmax(0,1fr)_390px]">
           <div className="border-b border-line bg-ink p-5 text-white lg:border-b-0 lg:border-r lg:border-line">
             <div className="flex items-center justify-between"><div className="flex items-center gap-2"><FileCheck2 size={18} className="text-cyan" /><h2 className="font-semibold">Proof of Work / 最终交付物</h2></div>{selectedDeliverable ? <span className="rounded-md bg-white/10 px-2 py-1 font-mono text-[9px]">{selectedDeliverable.mimeType.toUpperCase()}</span> : null}</div>
-            {selectedDeliverable ? <div className="mesh-grid mt-5 flex min-h-[460px] items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-black/25">{isImage ? <img className="max-h-[520px] w-full object-contain" src={selectedDeliverable.uri} alt={selectedDeliverable.name} /> : isVideo ? <video className="max-h-[520px] w-full" src={selectedDeliverable.uri} controls preload="metadata" /> : <a className="flex max-w-sm flex-col items-center rounded-2xl border border-white/15 bg-white/[0.06] p-8 text-center transition hover:bg-white/10" href={selectedDeliverable.uri} target="_blank" rel="noreferrer"><FileQuestion size={34} className="text-cyan" /><span className="mt-4 text-sm font-semibold">{selectedDeliverable.name}</span><span className="mt-2 text-xs text-white/40">浏览器无法内嵌预览此格式，点击打开交付 URI</span><ExternalLink size={15} className="mt-4" /></a>}</div> : <div className="mesh-grid mt-5 flex min-h-[460px] flex-col items-center justify-center rounded-xl border border-dashed border-white/15 bg-black/25 text-center"><FileQuestion size={34} className="text-white/25" /><p className="mt-4 text-sm font-semibold">尚无真实交付物</p><p className="mt-2 max-w-sm text-xs leading-5 text-white/40">开发者提交 URI、内容哈希与 MIME 类型后，这里会显示实际资产。</p></div>}
-            <div className="mt-4 flex flex-wrap gap-3 font-mono text-[9px] text-white/35">{selectedDeliverable ? <><span>HASH {selectedDeliverable.contentHash}</span><span>STATUS {selectedDeliverable.status.toUpperCase()}</span><span>{selectedDeliverable.createdAt ? `SUBMITTED ${new Date(selectedDeliverable.createdAt).toLocaleString('zh-CN', { hour12: false })}` : null}</span></> : <span>WAITING FOR DEVELOPER SUBMISSION</span>}</div>
+            {selectedDeliverable ? <div className="mesh-grid mt-5 flex min-h-[460px] items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-black/25">{isImage ? <img className="max-h-[520px] w-full object-contain" src={selectedDeliverable.uri} alt={selectedDeliverable.name} /> : isVideo ? <video className="max-h-[520px] w-full" src={selectedDeliverable.uri} controls preload="metadata" /> : <a className="flex max-w-sm flex-col items-center rounded-2xl border border-white/15 bg-white/[0.06] p-8 text-center transition hover:bg-white/10" href={selectedDeliverable.uri} target="_blank" rel="noreferrer"><FileQuestion size={34} className="text-cyan" /><span className="mt-4 text-sm font-semibold">{selectedDeliverable.name}</span><span className="mt-2 text-xs text-white/40">浏览器无法内嵌预览此格式，点击打开交付 URI</span><ExternalLink size={15} className="mt-4" /></a>}</div> : finalStageOutput ? <div className="mesh-grid mt-5 min-h-[460px] overflow-auto rounded-xl border border-white/10 bg-black/25 p-5"><div className="flex items-center gap-2 text-sm font-semibold"><ShieldCheck size={17} className="text-lime" />Agent 最终交付</div>{finalDeliverableText ? <div className="mt-5 whitespace-pre-wrap break-words text-sm leading-7 text-white/80">{finalDeliverableText}</div> : <pre className="mt-4 whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-white/70">{JSON.stringify(finalDeliverable, null, 2)}</pre>}</div> : <div className="mesh-grid mt-5 flex min-h-[460px] flex-col items-center justify-center rounded-xl border border-dashed border-white/15 bg-black/25 text-center"><FileQuestion size={34} className="text-white/25" /><p className="mt-4 text-sm font-semibold">尚无可验收输出</p><p className="mt-2 max-w-sm text-xs leading-5 text-white/40">等待 Agent 签名回调或开发者提交 URI 交付物。</p></div>}
+            <div className="mt-4 flex flex-wrap gap-3 font-mono text-[9px] text-white/35">{selectedDeliverable ? <><span>HASH {selectedDeliverable.contentHash}</span><span>STATUS {selectedDeliverable.status.toUpperCase()}</span><span>{selectedDeliverable.createdAt ? `SUBMITTED ${new Date(selectedDeliverable.createdAt).toLocaleString('zh-CN', { hour12: false })}` : null}</span></> : finalStageOutput ? <><span>SIGNED AGENT OUTPUT</span><span>{completedStageOutputs.length}/{stages.length} STAGES VERIFIED</span></> : <span>WAITING FOR AGENT OUTPUT</span>}</div>
             {deliverables.length > 1 ? <div className="mt-4 flex flex-wrap gap-2">{deliverables.map((item) => <button type="button" className={`rounded-lg border px-3 py-2 text-xs transition ${selectedDeliverable?.id === item.id ? 'border-cyan bg-cyan/10 text-white' : 'border-white/10 text-white/45 hover:text-white'}`} onClick={() => setSelectedDeliverableId(item.id)} key={item.id}>{item.name}</button>)}</div> : null}
           </div>
 
@@ -124,7 +156,7 @@ export function AcceptancePage() {
       </section>
 
       <Modal open={releaseOpen} onClose={() => setReleaseOpen(false)} title="确认交付并释放资金" description={usesWeb3 ? `钱包将调用 Sepolia 托管合约完成 ${token} 分账；Worker 验证释放事件后更新任务状态。` : '确认后会从 Web2 托管余额结算给开发者，并生成平台费账目。'}>
-        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {deliverables.length} 个真实交付物</div></div>
+        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {deliverables.length} 个 URI 交付物 · {completedStageOutputs.length} 个签名阶段输出</div></div>
         <div className="mt-5 flex justify-end gap-3"><button type="button" className="btn-secondary" onClick={() => setReleaseOpen(false)}>取消</button><button type="button" className="btn-primary" onClick={() => void confirmRelease()} disabled={busy || (usesWeb3 && !onchainSettlement)}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : null}{usesWeb3 ? `链上释放 ${token}` : '余额结算并验收'}</button></div>
         {error ? <p className="mt-3 rounded-xl border border-danger/25 bg-danger/10 p-3 text-sm text-danger" role="alert">{error}</p> : null}
       </Modal>

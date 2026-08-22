@@ -199,7 +199,7 @@ export class MemoryPlatformStore implements PlatformStore {
       id: `ESC-${mission.id}`, missionId: mission.id, amount: mission.budget, token: payment.token, network: payment.network,
       paymentMethod: mission.paymentMethod,
       yieldEnabled: mission.yieldEnabled, platformFeeRate: 0.004, status: 'pending', depositTxHash: null,
-      releaseTxHash: null, payoutHash: null, freezeTxHash: null, resolutionTxHash: null,
+      releaseTxHash: null, payoutHash: null, requesterWalletAddress: null, freezeTxHash: null, resolutionTxHash: null,
       releasedAt: null, createdAt: now, updatedAt: now,
     });
     return copy(mission);
@@ -227,7 +227,14 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(updated);
   }
 
-  async startMission(id: string, requesterId: string, depositTxHash: string | null, payoutHash: string | null = null, startedAt = new Date().toISOString()) {
+  async startMission(
+    id: string,
+    requesterId: string,
+    depositTxHash: string | null,
+    payoutHash: string | null = null,
+    startedAt = new Date().toISOString(),
+    requesterWalletAddress: string | null = null,
+  ) {
     const mission = this.missions.get(id);
     if (!mission) return null;
     const currentEscrow = this.escrows.get(id);
@@ -259,6 +266,7 @@ export class MemoryPlatformStore implements PlatformStore {
       status: 'held',
       depositTxHash: depositTxHash ?? escrow.depositTxHash,
       payoutHash: payoutHash ?? escrow.payoutHash,
+      requesterWalletAddress: requesterWalletAddress?.toLocaleLowerCase() ?? escrow.requesterWalletAddress,
     });
     return { mission: copy(updated), applied: true };
   }
@@ -366,6 +374,20 @@ export class MemoryPlatformStore implements PlatformStore {
       const next = [...offers];
       next[index] = updated;
       this.stageOffers.set(missionId, next);
+      const mission = this.missions.get(missionId);
+      if (mission?.status === 'matching') {
+        if (decision === 'declined') {
+          this.missions.set(missionId, { ...mission, currentStage: 'Agent 已拒绝接单，等待重新选择', updatedAt: respondedAt });
+        } else {
+          const stages = this.stages.get(missionId) ?? [];
+          const allAccepted = stages.length > 0 && stages.every((stage) => stage.agentId && next.some((candidate) => (
+            candidate.stageId === stage.id
+            && candidate.agentId === stage.agentId
+            && candidate.status === 'accepted'
+          )));
+          if (allAccepted) this.missions.set(missionId, { ...mission, currentStage: 'Agent 已全部接单，等待托管支付', updatedAt: respondedAt });
+        }
+      }
       return copy(updated);
     }
     return null;
@@ -376,7 +398,7 @@ export class MemoryPlatformStore implements PlatformStore {
     const mission = this.missions.get(missionId);
     const escrow = this.escrows.get(missionId);
     if (mission?.status !== 'running' || escrow?.status !== 'held') return null;
-    const index = stages.findIndex((stage) => stage.id === stageId && stage.status === 'queued');
+    const index = stages.findIndex((stage) => stage.id === stageId && (stage.status === 'queued' || stage.status === 'failed'));
     if (index < 0) return null;
     const updated = { ...stages[index], status: 'running' as const };
     const next = [...stages];

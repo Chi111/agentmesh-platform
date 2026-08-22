@@ -10,6 +10,7 @@ export interface AuthContextValue {
   profile: UserProfile | null;
   error: string | null;
   provider: AuthProviderName;
+  linkedWalletAddress: string | null;
   walletAddress: string | null;
   onchainSettlement: boolean;
   loginWithEmail: (email: string, password: string) => Promise<void>;

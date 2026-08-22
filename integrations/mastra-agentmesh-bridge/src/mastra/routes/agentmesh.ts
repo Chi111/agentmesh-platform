@@ -16,10 +16,25 @@ function nonEmptyString(value: unknown, maxLength = 10_000): string | null {
   return text && text.length <= maxLength ? text : null;
 }
 
+function deliverableText(value: unknown): string | null {
+  const direct = nonEmptyString(value, 50_000);
+  if (direct) return direct;
+  const nested = objectValue(value);
+  if (!nested) return null;
+  for (const key of ['narrative', 'content', 'text', 'copy', 'script', 'body', 'markdown']) {
+    const candidate = nonEmptyString(nested[key], 50_000);
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
 function parseAgentJson(content: string): JsonObject | null {
   try {
-    const parsed = JSON.parse(content) as unknown;
-    return objectValue(parsed);
+    const normalized = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    const parsed = objectValue(JSON.parse(normalized) as unknown);
+    if (!parsed || !nonEmptyString(parsed.summary, 20_000)) return null;
+    const deliverable = deliverableText(parsed.deliverable);
+    return deliverable ? { ...parsed, deliverable } : null;
   } catch {
     return null;
   }
@@ -44,7 +59,8 @@ export const agentmeshEndpointInfo = registerApiRoute('/agentmesh/invoke', {
     runtime: 'mastra',
     protocol: 'agentmesh.dispatch.v2',
     method: 'POST',
-    status: 'ready',
+    status: isPinmeLlmConfigured ? 'ready' : 'configuration-required',
+    llmConfigured: isPinmeLlmConfigured,
   }),
 });
 
@@ -110,35 +126,41 @@ export const agentmeshEndpoint = registerApiRoute('/agentmesh/invoke', {
     const agentId = callbackAgentId(callbackUrl);
     if (!agentId) return c.json({ error: 'Callback URL is not an approved AgentMesh endpoint' }, 400);
 
-    const missionTitle = nonEmptyString(mission.title, 500) ?? missionId;
     const stageName = nonEmptyString(stage.name, 300) ?? stageId;
-    const stagePurpose = nonEmptyString(stage.purpose, 4_000) ?? 'Complete the assigned workflow stage.';
-    const fallback: JsonObject = {
-      summary: `Mastra 已完成“${stageName}”的结构化处理。`,
-      findings: [`任务：${missionTitle}`, `阶段目标：${stagePurpose}`],
-      risks: [isPinmeLlmConfigured
-        ? 'PinMe LLM 本次调用不可用，当前结果来自 Mastra 确定性降级运行时。'
-        : '未配置 PinMe LLM，当前结果来自 Mastra 确定性降级运行时。'],
-      recommendation: isPinmeLlmConfigured
-        ? '可安全重试本阶段；若问题持续，请检查 PinMe LLM 服务状态与项目余额。'
-        : '配置 PINME_API_KEY 与 PINME_PROJECT_NAME 后重新派发，可获得模型生成的深度结果。',
-    };
-
-    let result = fallback;
-    let source = 'deterministic-fallback';
-    if (isPinmeLlmConfigured) {
+    const stagePosition = Number(stage.position);
+    const totalStages = Number(stage.totalStages);
+    const completedProgress = Number.isInteger(stagePosition) && Number.isInteger(totalStages) && stagePosition > 0 && totalStages >= stagePosition
+      ? Math.round((stagePosition / totalStages) * 100)
+      : undefined;
+    let result: JsonObject | null = null;
+    let failureCode: 'LLM_NOT_CONFIGURED' | 'LLM_GENERATION_FAILED' | 'INVALID_AGENT_OUTPUT' | null = null;
+    if (!isPinmeLlmConfigured) {
+      failureCode = 'LLM_NOT_CONFIGURED';
+    } else {
       try {
         const mastraAgent = c.get('mastra').getAgent('agentmeshBridgeAgent');
-        const generated = await mastraAgent.generate(JSON.stringify({ mission, stage }));
-        const parsed = parseAgentJson(generated.text);
-        if (parsed) {
-          result = parsed;
-          source = 'mastra-agent';
-        }
+        const generated = await mastraAgent.generate([
+          'Execute the following complete AgentMesh task.',
+          'Match the language of the mission title and description unless they explicitly request another language.',
+          'Return the requested artifact as a plain string in the deliverable field, not as a nested object.',
+          JSON.stringify(task),
+        ].join('\n'));
+        result = parseAgentJson(generated.text);
+        if (!result) failureCode = 'INVALID_AGENT_OUTPUT';
       } catch {
-        // Preserve a usable, explicitly labeled fallback when the provider is unavailable.
+        failureCode = 'LLM_GENERATION_FAILED';
       }
     }
+
+    const failed = failureCode !== null;
+    const source = failed ? 'mastra-error' : 'mastra-agent';
+    const failureMessage = failureCode === 'LLM_NOT_CONFIGURED'
+      ? 'Mastra 运行时未配置 PinMe LLM，本阶段未生成交付内容，请配置后重试。'
+      : failureCode === 'INVALID_AGENT_OUTPUT'
+        ? 'Mastra 返回了无效的结构化内容，本阶段未完成，请重试。'
+        : failureCode === 'LLM_GENERATION_FAILED'
+          ? 'PinMe LLM 调用失败，本阶段未完成，请检查项目配置或余额后重试。'
+          : `${stageName} 已由 Mastra 完成`;
 
     const callbackResponse = await fetch(callbackUrl, {
       method: 'POST',
@@ -153,11 +175,13 @@ export const agentmeshEndpoint = registerApiRoute('/agentmesh/invoke', {
         runId,
         expiresAt,
         callbackId: `mastra-${runId}`,
-        status: 'done',
-        progress: 100,
-        message: `${stageName} 已由 Mastra 完成`,
-        output: { runtime: 'mastra', source, result },
-        payload: { runtime: 'mastra', source },
+        status: failed ? 'failed' : 'done',
+        progress: failed ? undefined : completedProgress,
+        message: failureMessage,
+        output: failed
+          ? { runtime: 'mastra', source, error: { code: failureCode, retryable: true } }
+          : { runtime: 'mastra', source, result },
+        payload: { runtime: 'mastra', source, failureCode },
       }),
       signal: AbortSignal.timeout(10_000),
     });
@@ -165,6 +189,6 @@ export const agentmeshEndpoint = registerApiRoute('/agentmesh/invoke', {
       return c.json({ error: 'AgentMesh callback was rejected', status: callbackResponse.status }, 502);
     }
 
-    return c.json({ accepted: true, runId, runtime: 'mastra', source }, 202);
+    return c.json({ accepted: true, runId, runtime: 'mastra', source, status: failed ? 'failed' : 'done' }, 202);
   },
 });

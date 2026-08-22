@@ -154,6 +154,7 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect(database.db.prepare('SELECT stage_id FROM execution_events WHERE id = ?').get('EVT-OFFER-DECLINED')).toEqual({ stage_id: stage.id });
     await store.respondStageOffer(reissuedOffer.id, 'demo-developer', 'accepted', '2026-08-18T00:05:00.000Z');
     expect((await store.getStageOffer(reissuedOffer.id, '2026-08-18T01:00:00.000Z'))?.status).toBe('accepted');
+    expect((await store.getMission('TASK-OFFER-GATE'))?.currentStage).toBe('Agent 已全部接单，等待托管支付');
     const started = await store.startMission('TASK-OFFER-GATE', 'demo-requester', null, null, '2026-08-18T01:00:00.000Z');
 
     expect(started?.applied).toBe(true);
@@ -225,6 +226,44 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM agent_performance_events WHERE stage_id = ?').get(update.stageId)).toEqual({ count: 1 });
     expect(database.db.prepare('SELECT success_rate FROM agents WHERE id = ?').get(update.agentId)).toEqual({ success_rate: 83.3 });
     expect(database.db.prepare('SELECT processing_token, applied_at FROM agent_callback_events WHERE run_id = ? AND callback_id = ?').get(runId, callbackId)).toEqual(expect.objectContaining({ applied_at: update.now }));
+  });
+
+  it('atomically reclaims a failed stage for dispatch', async () => {
+    const failed = await store.transitionRunningStage('TASK-2026-0815', 'stage-visual', 'failed', {
+      error: 'Bearer token required',
+      retryable: true,
+    });
+    expect(failed?.status).toBe('failed');
+
+    const reclaimed = await store.claimStageForDispatch('TASK-2026-0815', 'stage-visual');
+    const duplicate = await store.claimStageForDispatch('TASK-2026-0815', 'stage-visual');
+
+    expect(reclaimed?.status).toBe('running');
+    expect(duplicate).toBeNull();
+  });
+
+  it('reconciles a legacy running mission when every stage has signed output', async () => {
+    database.db.exec(`
+      INSERT INTO missions
+        (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json)
+      VALUES
+        ('TASK-2026-F3BF6E', 'demo-requester', 'Legacy signed mission', 'Reconciles one affected production mission.', '商业分析', 80, '2026-09-01', 'running', 100, 'Legacy running state', '["analyst"]');
+      INSERT INTO workflow_stages
+        (id, mission_id, position, name, purpose, category, budget_usdc, status, agent_id, output_json)
+      VALUES
+        ('stage-legacy-signed', 'TASK-2026-F3BF6E', 1, 'Signed stage', 'Verify output', '商业分析', 80, 'done', 'analyst', '{"verified":true}');
+      INSERT INTO escrows (id, mission_id, amount, token, network, payment_method, status)
+      VALUES ('ESC-LEGACY-SIGNED', 'TASK-2026-F3BF6E', 80, 'CREDIT', 'agentmesh', 'web2_balance', 'held');
+    `);
+    const migration = readFileSync(join(import.meta.dirname, '../../db/013_reconcile_signed_output_reviews.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+
+    expect(await store.getMission('TASK-2026-F3BF6E')).toMatchObject({
+      status: 'review',
+      progress: 100,
+      currentStage: 'Agent 已全部完成，等待任务方验收',
+    });
   });
 
   it('enforces one active dispute and applies only the first ruling', async () => {

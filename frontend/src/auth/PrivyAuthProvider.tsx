@@ -1,20 +1,24 @@
 import {
-  getIdentityToken,
   PrivyProvider,
+  useConnectWallet,
+  useIdentityToken,
   usePrivy,
-  useSendTransaction,
+  useWallets,
   type User as PrivyUser,
 } from '@privy-io/react-auth';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { numberToHex, type Hex } from 'viem';
 import { sepolia } from 'viem/chains';
 import { api, setApiTokenProvider } from '../services/api';
 import {
   depositEscrow as submitEscrowDeposit,
   freezeEscrow as submitEscrowFreeze,
   onchainSettlementConfigured,
+  prepareSettlementTransaction,
   refundEscrow as submitEscrowRefund,
   releaseEscrow as submitEscrowRelease,
   unfreezeEscrow as submitEscrowUnfreeze,
+  type SettlementTransaction,
 } from '../services/settlement';
 import type { UserProfile } from '../types/domain';
 import { privyAppId, privyClientId, privyLoginMethods } from './config';
@@ -31,20 +35,68 @@ function privyIdentity(user: PrivyUser) {
   return { walletAddress, email, displayName };
 }
 
+function connectedWalletError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (
+    message.includes('Disconnected from MetaMask background')
+    || message.includes('ExtensionPortStream')
+    || message.includes('Provider disconnected')
+  ) {
+    return new Error('MetaMask 扩展连接已中断，请刷新页面后重试。钱包身份仍然保留，无需重新绑定。');
+  }
+  return error instanceof Error ? error : new Error('钱包交易请求失败，请检查钱包扩展后重试。');
+}
+
 function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => void }) {
   const { ready, authenticated, user, error: privyError, getAccessToken, login, logout, linkWallet: openLinkWallet } = usePrivy();
-  const { sendTransaction } = useSendTransaction();
+  const { connectWallet } = useConnectWallet();
+  const { identityToken } = useIdentityToken();
+  const { ready: walletsReady, wallets } = useWallets();
   const [status, setStatus] = useState<AuthStatus>('loading');
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [error, setError] = useState<string | null>(null);
   const identity = user ? privyIdentity(user) : null;
+  const connectedWallet = useMemo(() => {
+    const verifiedAddress = identity?.walletAddress?.toLocaleLowerCase();
+    if (!walletsReady || !verifiedAddress) return null;
+    return wallets.find((wallet) => wallet.address.toLocaleLowerCase() === verifiedAddress) ?? null;
+  }, [identity?.walletAddress, wallets, walletsReady]);
   const chainEnabled = onchainSettlementConfigured();
+
+  const sendConnectedTransaction = useCallback(async (input: SettlementTransaction) => {
+    if (!walletsReady) throw new Error('正在读取钱包连接状态，请稍后重试。');
+    if (!connectedWallet) {
+      throw new Error('已绑定的钱包当前未连接，请刷新页面或重新连接钱包后再提交交易。');
+    }
+    try {
+      if (!await connectedWallet.isConnected()) throw new Error('Provider disconnected');
+      const chainParts = connectedWallet.chainId.split(':');
+      const currentChainId = Number(chainParts[chainParts.length - 1]);
+      if (currentChainId !== input.chainId) await connectedWallet.switchChain(input.chainId);
+      const preparedInput = await prepareSettlementTransaction(connectedWallet.address, input);
+      const provider = await connectedWallet.getEthereumProvider();
+      const hash = await provider.request({
+        method: 'eth_sendTransaction',
+        params: [{
+          from: connectedWallet.address,
+          to: preparedInput.to,
+          data: preparedInput.data,
+          ...(preparedInput.value === undefined ? {} : { value: numberToHex(preparedInput.value) }),
+          ...(preparedInput.gasLimit === undefined ? {} : { gas: numberToHex(preparedInput.gasLimit) }),
+        }],
+      });
+      if (typeof hash !== 'string' || !hash.startsWith('0x')) throw new Error('钱包未返回有效的交易哈希。');
+      return { hash: hash as Hex };
+    } catch (transactionError) {
+      throw connectedWalletError(transactionError);
+    }
+  }, [connectedWallet, walletsReady]);
 
   const tokenBundle = useCallback(async () => {
     const accessToken = await getAccessToken();
     if (!accessToken) throw new Error('Privy access token is unavailable');
-    return { accessToken, identityToken: await getIdentityToken() };
-  }, [getAccessToken]);
+    return { accessToken, identityToken };
+  }, [getAccessToken, identityToken]);
 
   const verifySession = useCallback(async () => {
     if (!user) return null;
@@ -99,21 +151,33 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     profile,
     error,
     provider: 'privy',
-    walletAddress: identity?.walletAddress ?? null,
+    linkedWalletAddress: identity?.walletAddress ?? profile?.walletAddress ?? null,
+    walletAddress: connectedWallet?.address ?? null,
     onchainSettlement: chainEnabled,
     loginWithEmail: openLogin,
     loginWithGoogle: openLogin,
     loginWithPrivy: openLogin,
     register: openLogin,
-    linkWallet: async () => { openLinkWallet({ walletChainType: 'ethereum-only' }); },
-    depositEscrow: async (missionId, amount, paymentMethod, recipients) => {
-      if (!identity?.walletAddress) throw new Error('请先关联钱包后再提交链上托管。');
-      return submitEscrowDeposit(sendTransaction, identity.walletAddress, missionId, amount, paymentMethod, recipients);
+    linkWallet: async () => {
+      if (identity?.walletAddress) {
+        connectWallet({
+          walletChainType: 'ethereum-only',
+          suggestedAddress: identity.walletAddress,
+          description: '重新连接已绑定的钱包，以继续 Sepolia 链上支付。',
+        });
+        return;
+      }
+      openLinkWallet({ walletChainType: 'ethereum-only' });
     },
-    releaseEscrow: async (missionId, recipients) => submitEscrowRelease(sendTransaction, missionId, recipients),
-    freezeEscrow: async (missionId) => submitEscrowFreeze(sendTransaction, missionId),
-    unfreezeEscrow: async (missionId) => submitEscrowUnfreeze(sendTransaction, missionId),
-    refundEscrow: async (missionId) => submitEscrowRefund(sendTransaction, missionId),
+    depositEscrow: async (missionId, amount, paymentMethod, recipients) => {
+      const settlementWalletAddress = connectedWallet?.address ?? identity?.walletAddress;
+      if (!settlementWalletAddress) throw new Error('请先连接已验证的钱包后再提交链上托管。');
+      return submitEscrowDeposit(sendConnectedTransaction, settlementWalletAddress, missionId, amount, paymentMethod, recipients);
+    },
+    releaseEscrow: async (missionId, recipients) => submitEscrowRelease(sendConnectedTransaction, missionId, recipients),
+    freezeEscrow: async (missionId) => submitEscrowFreeze(sendConnectedTransaction, missionId),
+    unfreezeEscrow: async (missionId) => submitEscrowUnfreeze(sendConnectedTransaction, missionId),
+    refundEscrow: async (missionId) => submitEscrowRefund(sendConnectedTransaction, missionId),
     signOut: async () => {
       await logout();
       setApiTokenProvider(null);
@@ -121,7 +185,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
       setStatus('anonymous');
     },
     refreshProfile: verifySession,
-  }), [chainEnabled, error, identity?.walletAddress, logout, openLinkWallet, openLogin, profile, sendTransaction, status, verifySession]);
+  }), [chainEnabled, connectWallet, connectedWallet, error, identity?.walletAddress, logout, openLinkWallet, openLogin, profile, sendConnectedTransaction, status, verifySession]);
 
   useEffect(() => onChange(value), [onChange, value]);
 

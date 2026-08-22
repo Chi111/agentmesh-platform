@@ -224,6 +224,7 @@ function mapEscrow(row: Row): Escrow {
     depositTxHash: text(row.deposit_tx_hash) || null,
     releaseTxHash: text(row.release_tx_hash) || null,
     payoutHash: text(row.payout_hash) || null,
+    requesterWalletAddress: text(row.requester_wallet_address) || null,
     freezeTxHash: text(row.freeze_tx_hash) || null,
     resolutionTxHash: text(row.resolution_tx_hash) || null,
     releasedAt: text(row.released_at) || null,
@@ -609,7 +610,14 @@ export class D1PlatformStore implements PlatformStore {
     return this.getMission(id);
   }
 
-  async startMission(id: string, requesterId: string, depositTxHash: string | null, payoutHash: string | null = null, startedAt = new Date().toISOString()) {
+  async startMission(
+    id: string,
+    requesterId: string,
+    depositTxHash: string | null,
+    payoutHash: string | null = null,
+    startedAt = new Date().toISOString(),
+    requesterWalletAddress: string | null = null,
+  ) {
     const mission = await this.getMission(id);
     if (!mission) return null;
     const statements: D1Statement[] = [
@@ -640,10 +648,11 @@ export class D1PlatformStore implements PlatformStore {
     statements.push(
       this.db.prepare(`
         UPDATE escrows SET status = 'held', deposit_tx_hash = COALESCE(?, deposit_tx_hash),
-          payout_hash = COALESCE(?, payout_hash), updated_at = ?
+          payout_hash = COALESCE(?, payout_hash),
+          requester_wallet_address = COALESCE(?, requester_wallet_address), updated_at = ?
         WHERE mission_id = ? AND status = 'pending'
           AND EXISTS (SELECT 1 FROM missions WHERE id = escrows.mission_id AND status = 'running' AND updated_at = ?)
-      `).bind(depositTxHash, payoutHash, startedAt, id, startedAt),
+      `).bind(depositTxHash, payoutHash, requesterWalletAddress?.toLocaleLowerCase() ?? null, startedAt, id, startedAt),
     );
     const results = await this.db.batch(statements);
     const saved = await this.getMission(id);
@@ -762,13 +771,37 @@ export class D1PlatformStore implements PlatformStore {
         AND EXISTS (SELECT 1 FROM escrows WHERE mission_id = stage_offers.mission_id AND status = 'pending')
       RETURNING *
     `).bind(decision, respondedAt, respondedAt, id, respondedAt, ownerId).first<Row>();
-    return row ? mapStageOffer(row, respondedAt) : null;
+    if (!row) return null;
+    const offer = mapStageOffer(row, respondedAt);
+    if (decision === 'declined') {
+      await this.db.prepare(`
+        UPDATE missions SET current_stage = 'Agent 已拒绝接单，等待重新选择', updated_at = ?
+        WHERE id = ? AND status = 'matching'
+      `).bind(respondedAt, offer.missionId).run();
+    } else {
+      await this.db.prepare(`
+        UPDATE missions SET current_stage = 'Agent 已全部接单，等待托管支付', updated_at = ?
+        WHERE id = ? AND status = 'matching'
+          AND EXISTS (SELECT 1 FROM workflow_stages WHERE mission_id = missions.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_stages s
+            WHERE s.mission_id = missions.id AND (
+              s.agent_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM stage_offers o
+                WHERE o.mission_id = s.mission_id AND o.stage_id = s.id
+                  AND o.agent_id = s.agent_id AND o.status = 'accepted'
+              )
+            )
+          )
+      `).bind(respondedAt, offer.missionId).run();
+    }
+    return offer;
   }
 
   async claimStageForDispatch(missionId: string, stageId: string): Promise<WorkflowStage | null> {
     const row = await this.db.prepare(`
       UPDATE workflow_stages SET status = 'running', updated_at = datetime('now')
-      WHERE id = ? AND mission_id = ? AND status = 'queued'
+      WHERE id = ? AND mission_id = ? AND status IN ('queued', 'failed')
         AND EXISTS (
           SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
           WHERE m.id = workflow_stages.mission_id AND m.status = 'running'

@@ -12,6 +12,7 @@ let store: MemoryPlatformStore;
 let app: ReturnType<typeof createApp>;
 let dispatchedBody: JsonBody | null;
 let dispatchCalls: number;
+let dispatchResponder: (() => Response | Promise<Response>) | null;
 let deliveredEmails: Array<{ to: string; subject: string; html: string }>;
 
 const testEnv = { API_KEY: 'test-project-secret', PROJECT_NAME: 'agentmesh-test', TEST_TOPUP_ENABLED: 'true' };
@@ -119,6 +120,7 @@ async function acceptAllStageOffers(missionId: string) {
 beforeEach(() => {
   dispatchedBody = null;
   dispatchCalls = 0;
+  dispatchResponder = null;
   deliveredEmails = [];
   store = new MemoryPlatformStore();
   store.profiles.set(requester.id, requester);
@@ -143,6 +145,7 @@ beforeEach(() => {
       const challenge = new Headers(init?.headers).get('X-AgentMesh-Trial');
       if (challenge) return Response.json({ challenge, status: 'accepted', output: { schema: 'ok' } }, { status: 200 });
       dispatchCalls += 1;
+      if (dispatchResponder) return dispatchResponder();
       return Response.json({ accepted: true, runId: 'run-test-1' }, { status: 202 });
     },
     emailSender: async (_env, input) => {
@@ -157,6 +160,12 @@ beforeEach(() => {
       }),
     }),
     endpointValidator: async () => undefined,
+    depositVerifier: async () => ({
+      ok: true,
+      confirmations: 1,
+      blockNumber: '123',
+      requester: '0x7100000000000000000000000000000000008F2C',
+    }),
   });
 });
 
@@ -167,7 +176,7 @@ describe('AgentMesh Worker', () => {
       mode: 'verified_contract',
       assets: ['mUSDC', 'sETH'],
       network: 'eip155:11155111',
-      contractAddress: '0x67a44ea66e16d2d8d5d5d4b34ce0088cc9785d3e',
+      contractAddress: '0xe05a5e46139294402393e5601d771e6c7564a573',
     });
   });
 
@@ -284,17 +293,22 @@ describe('AgentMesh Worker', () => {
     expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });
 
-  it('defaults CORS to the bound production domain instead of a wildcard', async () => {
-    const allowed = await app.fetch(new Request('http://local.test/api/health', {
+  it('defaults CORS to the production domains instead of a wildcard', async () => {
+    const primaryDomain = await app.fetch(new Request('http://local.test/api/health', {
       headers: { Origin: 'https://agentmesh.pinit.eth.limo' },
+    }), testEnv);
+    const pinmeDomain = await app.fetch(new Request('http://local.test/api/health', {
+      headers: { Origin: 'https://agentmesh.pinme.dev' },
     }), testEnv);
     const rejected = await app.fetch(new Request('http://local.test/api/health', {
       headers: { Origin: 'https://evil.example' },
     }), testEnv);
 
-    expect(allowed.status).toBe(200);
-    expect(allowed.headers.get('Access-Control-Allow-Origin')).toBe('https://agentmesh.pinit.eth.limo');
-    expect(allowed.headers.get('Strict-Transport-Security')).toContain('max-age=31536000');
+    expect(primaryDomain.status).toBe(200);
+    expect(primaryDomain.headers.get('Access-Control-Allow-Origin')).toBe('https://agentmesh.pinit.eth.limo');
+    expect(primaryDomain.headers.get('Strict-Transport-Security')).toContain('max-age=31536000');
+    expect(pinmeDomain.status).toBe(200);
+    expect(pinmeDomain.headers.get('Access-Control-Allow-Origin')).toBe('https://agentmesh.pinme.dev');
     expect(rejected.status).toBe(403);
     expect(rejected.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });
@@ -615,6 +629,9 @@ describe('AgentMesh Worker', () => {
     expect(workflow.body.data.mission.team.length).toBeGreaterThan(0);
     expect(workflow.body.data.offers).toHaveLength(stages.length);
     await acceptAllStageOffers(mission.id);
+    const readyForPayment = await api(`/api/missions/${mission.id}`, {}, requester.id);
+    expect(readyForPayment.body.data.mission.status).toBe('matching');
+    expect(readyForPayment.body.data.mission.currentStage).toBe('Agent 已全部接单，等待托管支付');
 
     const started = await api(`/api/missions/${mission.id}/start`, {
       method: 'POST',
@@ -764,7 +781,7 @@ describe('AgentMesh Worker', () => {
     expect((await store.getWalletAccount(requester.id)).balance).toBe(20);
   });
 
-  it('requires a verified requester wallet before accepting an on-chain deposit', async () => {
+  it('uses the verified on-chain depositor when profile identity has no wallet', async () => {
     const { mission } = await createMission(undefined, 'web3_musdc');
     const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
     const matches = candidates.body.data as CandidateMatch[];
@@ -786,8 +803,9 @@ describe('AgentMesh Worker', () => {
     });
     const body = await response.json() as JsonBody;
 
-    expect(response.status).toBe(409);
-    expect(body.error.code).toBe('WALLET_IDENTITY_REQUIRED');
+    expect(response.status).toBe(200);
+    expect(body.data.mission.status).toBe('running');
+    expect(body.data.escrow.requesterWalletAddress).toBe('0x7100000000000000000000000000000000008f2c');
   });
 
   it('streams an authenticated mission snapshot over SSE', async () => {
@@ -817,6 +835,8 @@ describe('AgentMesh Worker', () => {
     expect(dispatched.body.data.stage.status).toBe('running');
     expect(dispatchedBody?.callback.signature).toHaveLength(64);
     expect(dispatchedBody?.callback.runId).toBeTruthy();
+    expect(dispatchedBody?.task.upstream).toEqual([]);
+    expect(dispatchedBody?.task.stage).toMatchObject({ position: 1, totalStages: 3 });
 
     const unsigned = await api(`/api/hooks/agents/${dispatched.body.data.agent.id}/events`, {
       method: 'POST',
@@ -881,6 +901,79 @@ describe('AgentMesh Worker', () => {
     ]);
     expect(responses.map((result) => result.response.status).sort()).toEqual([202, 409]);
     expect(dispatchCalls).toBe(1);
+  });
+
+  it('reports missing Agent authentication and retries the same failed stage', async () => {
+    const { mission } = await createMission();
+    const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    const matches = candidates.body.data as CandidateMatch[];
+    const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
+    await api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id);
+    await acceptAllStageOffers(mission.id);
+    await api(`/api/missions/${mission.id}/start`, { method: 'POST', body: '{}' }, requester.id);
+
+    let shouldRejectAuthentication = true;
+    dispatchResponder = () => shouldRejectAuthentication
+      ? Response.json({ error: 'Bearer token required' }, { status: 401 })
+      : Response.json({ accepted: true, runId: 'run-test-retry' }, { status: 202 });
+
+    const rejected = await api(`/api/missions/${mission.id}/dispatch`, { method: 'POST', body: '{}' }, requester.id);
+    expect(rejected.response.status).toBe(409);
+    expect(rejected.body.error.code).toBe('AGENT_AUTH_CONFIGURATION_REQUIRED');
+    const failedStage = (await store.listStages(mission.id))[0];
+    expect(failedStage.status).toBe('failed');
+    expect(failedStage.output).toMatchObject({ httpStatus: 401, authType: 'none', retryable: true });
+    expect((await store.listEvents(mission.id)).some((event) => event.type === 'dispatch.authentication_failed')).toBe(true);
+
+    shouldRejectAuthentication = false;
+    const retried = await api(`/api/missions/${mission.id}/dispatch`, { method: 'POST', body: '{}' }, requester.id);
+    expect(retried.response.status).toBe(202);
+    expect(retried.body.data.stage).toMatchObject({ id: failedStage.id, status: 'running' });
+    expect(dispatchCalls).toBe(2);
+  });
+
+  it('accepts a completed workflow backed by signed Agent outputs without a separate URI deliverable', async () => {
+    const { mission } = await createMission();
+    const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    const matches = candidates.body.data as CandidateMatch[];
+    const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
+    await api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id);
+    await acceptAllStageOffers(mission.id);
+    await api(`/api/missions/${mission.id}/start`, { method: 'POST', body: '{}' }, requester.id);
+
+    for (let index = 0; index < matches.length; index += 1) {
+      const dispatched = await api(`/api/missions/${mission.id}/dispatch`, { method: 'POST', body: '{}' }, requester.id);
+      expect(dispatched.response.status).toBe(202);
+      expect(dispatchedBody?.task.upstream).toHaveLength(index);
+      if (index > 0) {
+        expect(dispatchedBody?.task.upstream[index - 1].output).toMatchObject({
+          summary: `Signed output ${index}`,
+          verified: true,
+        });
+      }
+      const callback = dispatchedBody?.callback as JsonBody;
+      const completed = await api(`/api/hooks/agents/${dispatched.body.data.agent.id}/events`, {
+        method: 'POST',
+        headers: { 'X-AgentMesh-Signature': callback.signature },
+        body: JSON.stringify({
+          missionId: mission.id,
+          stageId: dispatched.body.data.stage.id,
+          runId: callback.runId,
+          callbackId: `callback-output-${index}`,
+          expiresAt: callback.expiresAt,
+          status: 'done',
+          progress: Math.round(((index + 1) / matches.length) * 100),
+          output: { summary: `Signed output ${index + 1}`, verified: true },
+        }),
+      });
+      expect(completed.response.status).toBe(202);
+    }
+
+    expect(await store.listDeliverables(mission.id)).toHaveLength(0);
+    expect((await store.getMission(mission.id))?.status).toBe('review');
+    const accepted = await api(`/api/missions/${mission.id}/accept`, { method: 'POST', body: '{}' }, requester.id);
+    expect(accepted.response.status).toBe(200);
+    expect(accepted.body.data.mission.status).toBe('completed');
   });
 
   it('publishes and executes authenticated HTTP endpoints for official built-in Agents', async () => {

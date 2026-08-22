@@ -147,6 +147,7 @@ export interface Escrow {
   depositTxHash?: string | null;
   releaseTxHash?: string | null;
   payoutHash?: string | null;
+  requesterWalletAddress?: string | null;
   freezeTxHash?: string | null;
   resolutionTxHash?: string | null;
 }

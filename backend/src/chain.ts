@@ -36,7 +36,7 @@ const escrowEvents = parseAbi([
 ]);
 
 export type ChainVerification =
-  | { ok: true; confirmations: number; blockNumber: string }
+  | { ok: true; confirmations: number; blockNumber: string; requester?: Address }
   | { ok: false; status: number; code: string; message: string };
 
 function isAddress(value: string | undefined): value is Address {
@@ -164,7 +164,12 @@ async function verifyEscrowEvent(
         if (args.missionKey !== missionKey || args.amount !== expectedAmount || args.asset?.toLocaleLowerCase() !== expectedAsset) continue;
         if (args.payoutHash !== expectedPayoutHash) continue;
         if (expectedRequester && args.requester?.toLocaleLowerCase() !== expectedRequester.toLocaleLowerCase()) continue;
-        return { ok: true, confirmations, blockNumber: receipt.blockNumber.toString() };
+        return {
+          ok: true,
+          confirmations,
+          blockNumber: receipt.blockNumber.toString(),
+          ...(args.requester ? { requester: args.requester } : {}),
+        };
       } catch {
         // Ignore unrelated logs from the same transaction.
       }

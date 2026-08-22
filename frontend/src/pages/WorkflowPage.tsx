@@ -1,5 +1,6 @@
 import { ArrowLeft, ArrowRight, CheckCircle2, CircleDollarSign, Clock3, Database, GitBranch, LoaderCircle, LockKeyhole, RefreshCw, Send, Sparkles, WalletCards } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
 import { AgentAvatar } from '../components/ui/AgentCard';
@@ -14,7 +15,7 @@ export function WorkflowPage() {
   const navigate = useNavigate();
   const mission = useMission();
   const missionId = mission?.id ?? '';
-  const { onchainSettlement, depositEscrow, walletAddress, linkWallet } = useAuth();
+  const { onchainSettlement, depositEscrow, linkedWalletAddress, walletAddress, linkWallet } = useAuth();
   const agents = useAppStore((state) => state.agents);
   const storedStages = useAppStore((state) => state.missionStages[missionId]);
   const stages = storedStages ?? [];
@@ -111,6 +112,14 @@ export function WorkflowPage() {
     }
   };
 
+  const openWalletLink = () => {
+    setError('');
+    flushSync(() => setConfirmOpen(false));
+    void linkWallet().catch((linkError) => {
+      setError(linkError instanceof Error ? linkError.message : '钱包连接失败，请稍后重试。');
+    });
+  };
+
   return (
     <div className="space-y-7">
       <PageHeader
@@ -177,11 +186,11 @@ export function WorkflowPage() {
       <Modal open={confirmOpen} onClose={() => setConfirmOpen(false)} title={allAccepted ? '确认托管并启动执行' : '发送阶段接单邀请'} description={allAccepted ? usesWeb3 ? `钱包将把 ${token} 存入 Sepolia 托管合约，Worker 验证事件后启动执行。` : '将从 Web2 充值余额中锁定任务预算；余额不足时可前往测试充值页领取。' : '每个阶段的 Agent 将收到独立邀请，并在 24 小时内接受或拒绝；全部接受前不会锁定资金。'}>
         {!allAccepted ? <div className="space-y-2 rounded-xl border border-line bg-canvas p-4">{stages.map((stage) => { const agent = agentForStage(stage.id, stage.agentId); return <div className="flex items-center justify-between gap-3 text-sm" key={stage.id}><span>{stage.name}</span><span className="font-semibold">{agent?.name ?? '未选择 Agent'}</span></div>; })}</div> : null}
         {allAccepted ? <>
-        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="inline-flex items-center gap-2 text-sm font-semibold">{usesWeb3 ? <WalletCards size={17} /> : <Database size={17} />}{usesWeb3 ? walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : '需要关联 EVM 钱包' : 'Web2 充值余额'}</span><span className="mono-chip">{usesWeb3 ? 'SEPOLIA' : 'BALANCE'}</span></div><p className="mt-3 font-mono text-xl font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</p>{!usesWeb3 ? <Link className="mt-3 inline-flex text-xs font-semibold text-cyan" to="/wallet/test-funds">余额不足？领取测试充值</Link> : null}</div>
+        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="inline-flex items-center gap-2 text-sm font-semibold">{usesWeb3 ? <WalletCards size={17} /> : <Database size={17} />}{usesWeb3 ? walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : linkedWalletAddress ? '钱包连接已中断' : '需要关联 EVM 钱包' : 'Web2 充值余额'}</span><span className="mono-chip">{usesWeb3 ? 'SEPOLIA' : 'BALANCE'}</span></div><p className="mt-3 font-mono text-xl font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</p>{usesWeb3 && !walletAddress && linkedWalletAddress ? <p className="mt-3 text-xs leading-5 text-warning">已绑定 {linkedWalletAddress.slice(0, 6)}…{linkedWalletAddress.slice(-4)}，请刷新页面或重新连接 MetaMask。</p> : null}{!usesWeb3 ? <Link className="mt-3 inline-flex text-xs font-semibold text-cyan" to="/wallet/test-funds">余额不足？领取测试充值</Link> : null}</div>
         </> : null}
         <div className="mt-5 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={() => setConfirmOpen(false)}>取消</button>
-          {!allAccepted ? <button type="button" className="btn-primary" onClick={() => void sendOffers()} disabled={submitting}>{submitting ? <LoaderCircle size={16} className="animate-spin" /> : <Send size={16} />}确认并发送</button> : usesWeb3 && !walletAddress ? <button type="button" className="btn-signal" onClick={() => void linkWallet()}>关联钱包</button> : <button type="button" className="btn-primary" onClick={() => void confirmEscrow()} disabled={submitting || (usesWeb3 && !onchainSettlement)}>{submitting ? <LoaderCircle size={16} className="animate-spin" /> : null}{usesWeb3 ? `托管 ${token} 并启动` : '余额扣款并启动'}</button>}
+          {!allAccepted ? <button type="button" className="btn-primary" onClick={() => void sendOffers()} disabled={submitting}>{submitting ? <LoaderCircle size={16} className="animate-spin" /> : <Send size={16} />}确认并发送</button> : usesWeb3 && !walletAddress && !linkedWalletAddress ? <button type="button" className="btn-signal" onClick={openWalletLink}>关联钱包</button> : <button type="button" className="btn-primary" onClick={() => void confirmEscrow()} disabled={submitting || (usesWeb3 && !onchainSettlement)}>{submitting ? <LoaderCircle size={16} className="animate-spin" /> : null}{usesWeb3 && !walletAddress ? '验证已有托管并启动' : usesWeb3 ? `托管 ${token} 并启动` : '余额扣款并启动'}</button>}
         </div>
         {error ? <p className="mt-3 rounded-xl border border-danger/25 bg-danger/10 p-3 text-sm text-danger" role="alert">{error}</p> : null}
       </Modal>

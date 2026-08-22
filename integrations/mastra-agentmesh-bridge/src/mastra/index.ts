@@ -6,5 +6,11 @@ export const mastra = new Mastra({
   agents: { agentmeshBridgeAgent },
   server: {
     apiRoutes: [agentmeshEndpointInfo, agentmeshEndpoint],
+    middleware: {
+      path: '/api/agents/*',
+      handler: async c => c.json({
+        error: 'Direct Mastra agent access is disabled; use the AgentMesh dispatch endpoint.',
+      }, 404),
+    },
   },
 });

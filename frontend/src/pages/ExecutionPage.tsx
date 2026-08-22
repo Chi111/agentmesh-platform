@@ -69,12 +69,13 @@ export function ExecutionPage() {
   }, [applyMissionDetail, loadMissionDetail, missionId, showToast]);
 
   const events = detail?.events ?? [];
-  const currentStage = stages.find((stage) => stage.status === 'running') ?? stages.find((stage) => stage.status === 'queued') ?? stages[stages.length - 1];
+  const currentStage = stages.find((stage) => stage.status === 'running') ?? stages.find((stage) => stage.status === 'failed') ?? stages.find((stage) => stage.status === 'queued') ?? stages[stages.length - 1];
   const currentAgent = agents.find((agent) => agent.id === currentStage?.agentId);
   const evidenceCount = events.length;
   const deliverables = detail?.deliverables ?? [];
   const hasRunningStage = stages.some((stage) => stage.status === 'running');
-  const hasRunnableStage = stages.some((stage, index) => stage.status === 'queued' && stages.slice(0, index).every((previous) => previous.status === 'done'));
+  const failedRunnableStage = stages.find((stage, index) => stage.status === 'failed' && stages.slice(0, index).every((previous) => previous.status === 'done'));
+  const hasRunnableStage = stages.some((stage, index) => (stage.status === 'queued' || stage.status === 'failed') && stages.slice(0, index).every((previous) => previous.status === 'done'));
   const allStagesDone = stages.length > 0 && stages.every((stage) => stage.status === 'done');
   const deliverableStages = stages.filter((stage) => {
     const agent = agents.find((item) => item.id === stage.agentId);
@@ -132,7 +133,7 @@ export function ExecutionPage() {
           <div><div className="flex flex-wrap items-center gap-2"><span className="mono-chip">{mission.id}</span><StatusBadge tone={mission.status === 'completed' ? 'success' : mission.status === 'cancelled' ? 'neutral' : mission.status === 'review' ? 'warning' : 'info'}>{mission.status === 'completed' ? '已完成' : mission.status === 'cancelled' ? '已退款终止' : mission.status === 'review' ? '待验收' : '执行中'}</StatusBadge>{refreshing ? <span className="inline-flex items-center gap-1 text-[10px] text-muted"><LoaderCircle size={11} className="animate-spin" />同步中</span> : null}</div><h1 className="mt-2 text-2xl font-semibold tracking-tight">{mission.title}</h1><p className="mt-1 text-sm text-muted">{mission.currentStage}</p></div>
         </div>
         <div className="flex flex-wrap gap-3">
-          {role === 'requester' ? <button type="button" className="btn-primary" onClick={() => void runDispatch()} disabled={busy || mission.status !== 'running' || !hasRunnableStage}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <Play size={16} />}{hasRunningStage ? '等待 Agent 回调' : '派发下一阶段'}</button> : <button type="button" className="btn-primary" onClick={() => setDeliveryOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled'}><UploadCloud size={16} />提交交付物</button>}
+          {role === 'requester' ? <button type="button" className="btn-primary" onClick={() => void runDispatch()} disabled={busy || mission.status !== 'running' || !hasRunnableStage}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <Play size={16} />}{hasRunningStage ? '等待 Agent 回调' : failedRunnableStage ? '重试失败阶段' : '派发下一阶段'}</button> : <button type="button" className="btn-primary" onClick={() => setDeliveryOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled'}><UploadCloud size={16} />提交交付物</button>}
           <button type="button" className="btn-secondary" onClick={() => void requestAssistance(mission.id)}><Bot size={16} />申请人工协助</button>
         </div>
       </header>

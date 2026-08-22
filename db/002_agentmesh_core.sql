@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS escrows (
   deposit_tx_hash   TEXT,
   release_tx_hash   TEXT,
   payout_hash       TEXT,
+  requester_wallet_address TEXT,
   freeze_tx_hash    TEXT,
   resolution_tx_hash TEXT,
   released_at       TEXT,

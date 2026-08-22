@@ -5,16 +5,8 @@ import { MetricCard } from '../components/ui/MetricCard';
 import { PageHeader } from '../components/ui/PageHeader';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { useAppStore } from '../store/useAppStore';
+import { missionStatusMeta, routeForMission } from '../utils/missionState';
 import { formatPaymentAmount, paymentToken } from '../utils/payments';
-
-const statusMeta = {
-  draft: { label: '草稿', tone: 'neutral' as const },
-  matching: { label: '匹配中', tone: 'info' as const },
-  running: { label: '执行中', tone: 'info' as const },
-  review: { label: '待验收', tone: 'warning' as const },
-  completed: { label: '已完成', tone: 'success' as const },
-  cancelled: { label: '已退款终止', tone: 'neutral' as const },
-};
 
 export function DashboardPage() {
   const missions = useAppStore((state) => state.missions);
@@ -35,9 +27,8 @@ export function DashboardPage() {
     void loadMissionDetail(activeMission.id).catch(() => undefined);
   }, [activeMission, detail, loadMissionDetail]);
 
-  const activeRoute = activeMission
-    ? activeMission.status === 'matching' ? `/missions/${activeMission.id}/team` : activeMission.status === 'review' || activeMission.status === 'completed' || activeMission.status === 'cancelled' ? `/missions/${activeMission.id}/acceptance` : `/missions/${activeMission.id}/execution`
-    : '/missions';
+  const activeRoute = activeMission ? routeForMission(activeMission) : '/missions';
+  const activeStatus = activeMission ? missionStatusMeta(activeMission) : null;
   const trustItems = [
     ['工作流状态', stages.length ? `${stages.filter((stage) => stage.status === 'done').length} / ${stages.length} 阶段完成` : '等待任务编排', stages.some((stage) => stage.status === 'done') ? 'lime' : 'muted'],
     ['执行证据', `${evidenceCount} 个真实事件`, evidenceCount ? 'cyan' : 'muted'],
@@ -72,7 +63,7 @@ export function DashboardPage() {
             <div>
               <div className="flex flex-wrap items-center gap-2">
                 <span className="rounded-md border border-cyan/25 bg-cyan/10 px-2 py-1 font-mono text-[10px] text-cyan">{activeMission.id}</span>
-                <span className="inline-flex items-center gap-2 text-xs text-white/65"><span className="size-1.5 rounded-full bg-cyan shadow-[0_0_10px_rgba(0,184,217,.8)]" />{statusMeta[activeMission.status].label}</span>
+                <span className="inline-flex items-center gap-2 text-xs text-white/65"><span className="size-1.5 rounded-full bg-cyan shadow-[0_0_10px_rgba(0,184,217,.8)]" />{activeStatus?.label}</span>
               </div>
               <h2 className="mt-3 max-w-3xl text-xl font-semibold tracking-tight md:text-2xl">{activeMission.title}</h2>
               <p className="mt-2 max-w-2xl text-sm leading-6 text-white/50">{activeMission.currentStage}</p>
@@ -120,16 +111,17 @@ export function DashboardPage() {
             <Link to="/missions" className="text-xs font-semibold text-cyan">查看全部</Link>
           </div>
           <div className="divide-y divide-line">
-            {missions.slice(0, 3).map((mission) => (
-              <Link to={mission.status === 'review' ? `/missions/${mission.id}/acceptance` : `/missions/${mission.id}/execution`} className="grid gap-3 px-5 py-4 transition hover:bg-canvas/60 md:grid-cols-[1fr_auto_auto] md:items-center" key={mission.id}>
+            {missions.slice(0, 3).map((mission) => {
+              const statusDisplay = missionStatusMeta(mission);
+              return <Link to={routeForMission(mission)} className="grid gap-3 px-5 py-4 transition hover:bg-canvas/60 md:grid-cols-[1fr_auto_auto] md:items-center" key={mission.id}>
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold">{mission.title}</p>
                   <p className="mt-1 font-mono text-[10px] text-muted">{mission.id} · {mission.team.length} AGENTS</p>
                 </div>
-                <StatusBadge tone={statusMeta[mission.status].tone}>{statusMeta[mission.status].label}</StatusBadge>
+                <StatusBadge tone={statusDisplay.tone}>{statusDisplay.label}</StatusBadge>
                 <span className="font-mono text-xs font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</span>
-              </Link>
-            ))}
+              </Link>;
+            })}
           </div>
         </section>
 

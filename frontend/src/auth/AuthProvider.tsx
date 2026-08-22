@@ -13,6 +13,7 @@ function initialAuthValue(provider: AuthProviderName): AuthContextValue {
     profile: null,
     error: null,
     provider,
+    linkedWalletAddress: null,
     walletAddress: null,
     onchainSettlement: false,
     loginWithEmail: initializing,

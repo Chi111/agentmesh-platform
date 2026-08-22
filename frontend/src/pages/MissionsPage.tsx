@@ -5,6 +5,7 @@ import { PageHeader } from '../components/ui/PageHeader';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { useAppStore } from '../store/useAppStore';
 import type { MissionStatus } from '../types/domain';
+import { missionStatusMeta, routeForMission } from '../utils/missionState';
 import { formatPaymentAmount, paymentToken } from '../utils/payments';
 
 const statusOptions: Array<{ value: 'all' | MissionStatus; label: string }> = [
@@ -14,21 +15,6 @@ const statusOptions: Array<{ value: 'all' | MissionStatus; label: string }> = [
   { value: 'completed', label: '已完成' },
   { value: 'cancelled', label: '已退款终止' },
 ];
-
-const statusMeta = {
-  draft: { label: '草稿', tone: 'neutral' as const },
-  matching: { label: '匹配中', tone: 'info' as const },
-  running: { label: '执行中', tone: 'info' as const },
-  review: { label: '待验收', tone: 'warning' as const },
-  completed: { label: '已完成', tone: 'success' as const },
-  cancelled: { label: '已退款终止', tone: 'neutral' as const },
-};
-
-function routeForMission(id: string, status: MissionStatus) {
-  if (status === 'matching') return `/missions/${id}/team`;
-  if (status === 'review' || status === 'completed' || status === 'cancelled') return `/missions/${id}/acceptance`;
-  return `/missions/${id}/execution`;
-}
 
 export function MissionsPage() {
   const missions = useAppStore((state) => state.missions);
@@ -62,13 +48,14 @@ export function MissionsPage() {
       </section>
 
       <section className="grid gap-4">
-        {filtered.map((mission) => (
-          <article className="panel p-5" key={mission.id}>
+        {filtered.map((mission) => {
+          const statusDisplay = missionStatusMeta(mission);
+          return <article className="panel p-5" key={mission.id}>
             <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_180px_auto] lg:items-center">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="mono-chip">{mission.id}</span>
-                  <StatusBadge tone={statusMeta[mission.status].tone}>{statusMeta[mission.status].label}</StatusBadge>
+                  <StatusBadge tone={statusDisplay.tone}>{statusDisplay.label}</StatusBadge>
                   {mission.yieldEnabled ? <StatusBadge tone="success">收益计划意向</StatusBadge> : null}
                 </div>
                 <h2 className="mt-3 text-lg font-semibold tracking-tight">{mission.title}</h2>
@@ -94,13 +81,13 @@ export function MissionsPage() {
                   <p className="font-mono text-base font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</p>
                   <p className="mt-1 text-[10px] text-muted">{paymentToken(mission.paymentMethod)} 托管</p>
                 </div>
-                <Link to={routeForMission(mission.id, mission.status)} className="flex size-10 items-center justify-center rounded-xl border border-line transition hover:border-cyan/40 hover:bg-cyan/10" aria-label={`打开 ${mission.title}`}>
+                <Link to={routeForMission(mission)} className="flex size-10 items-center justify-center rounded-xl border border-line transition hover:border-cyan/40 hover:bg-cyan/10" aria-label={`打开 ${mission.title}`}>
                   <ArrowRight size={17} />
                 </Link>
               </div>
             </div>
-          </article>
-        ))}
+          </article>;
+        })}
         {filtered.length === 0 ? <div className="panel py-16 text-center"><p className="text-sm font-semibold">没有匹配的任务</p><p className="mt-2 text-xs text-muted">调整搜索条件或发布一个新任务。</p></div> : null}
       </section>
     </div>

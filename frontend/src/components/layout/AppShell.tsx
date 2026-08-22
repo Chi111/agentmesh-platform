@@ -29,6 +29,7 @@ import { AuthDialog } from '../../auth/AuthDialog';
 import { useAuth } from '../../auth/AuthProvider';
 import { useAppStore } from '../../store/useAppStore';
 import type { UserRole } from '../../types/domain';
+import { routeForMission } from '../../utils/missionState';
 
 interface NavItem {
   label: string;
@@ -90,10 +91,11 @@ function Sidebar({
   const storedRole = useAppStore((state) => state.role);
   const syncStatus = useAppStore((state) => state.syncStatus);
   const setRole = useAppStore((state) => state.setRole);
-  const { profile, status, signOut, walletAddress, provider } = useAuth();
+  const { profile, status, signOut, linkedWalletAddress, walletAddress, provider } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   const role = location.pathname.startsWith('/developer') ? 'developer' : storedRole;
+  const identityWallet = walletAddress ?? linkedWalletAddress;
   const items = role === 'requester' ? requesterNav : developerNav;
   const label = role === 'requester' ? '任务方门户' : '开发者控制台';
   const switchRole = async (nextRole: UserRole) => {
@@ -188,7 +190,7 @@ function Sidebar({
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-xs font-semibold">{profile?.displayName ?? (status === 'loading' ? '正在恢复会话…' : '连接真实工作区')}</span>
                 <span className="block truncate text-[10px] text-white/35 [@media(max-height:420px)]:hidden">
-                  {profile?.email ?? (walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : provider === 'privy' ? 'Web2 / Web3 identity' : '尚未登录')}
+                  {profile?.email ?? (identityWallet ? `${identityWallet.slice(0, 6)}…${identityWallet.slice(-4)}` : provider === 'privy' ? 'Web2 / Web3 identity' : '尚未登录')}
                 </span>
               </span>
               {profile ? <LogOut size={14} className="text-white/30" /> : null}
@@ -209,7 +211,7 @@ function Topbar({
   menuButtonRef: RefObject<HTMLButtonElement>;
   onOpenMenu: () => void;
 }) {
-  const { profile, provider, walletAddress, linkWallet } = useAuth();
+  const { profile, provider, linkedWalletAddress, walletAddress, linkWallet } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const storedRole = useAppStore((state) => state.role);
@@ -225,7 +227,8 @@ function Topbar({
   const panelRegionRef = useRef<HTMLDivElement>(null);
   const searchCloseTimerRef = useRef<number | null>(null);
   const unread = notifications.filter((item) => item.unread).length;
-  const shortWallet = walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : null;
+  const identityWallet = walletAddress ?? linkedWalletAddress;
+  const shortWallet = identityWallet ? `${identityWallet.slice(0, 6)}…${identityWallet.slice(-4)}` : null;
   const searchResults = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     if (normalized.length < 2) return [];
@@ -236,7 +239,7 @@ function Topbar({
         id: mission.id,
         label: mission.title,
         meta: `任务 · ${mission.id}`,
-        to: mission.status === 'matching' ? `/missions/${mission.id}/team` : mission.status === 'review' || mission.status === 'completed' || mission.status === 'cancelled' ? `/missions/${mission.id}/acceptance` : `/missions/${mission.id}/execution`,
+        to: routeForMission(mission),
       }));
     const agentResults = agents
       .filter((agent) => `${agent.id} ${agent.name} ${agent.category} ${agent.tags.join(' ')}`.toLocaleLowerCase().includes(normalized))
@@ -346,12 +349,12 @@ function Topbar({
             {unread ? <span className="absolute right-1.5 top-1.5 size-2 rounded-full bg-cyan ring-2 ring-white" /> : null}
           </button>
           {panel === 'notifications' ? (
-            <div className="absolute right-0 top-12 w-[min(360px,calc(100vw-2rem))] rounded-2xl border border-line bg-white p-3 shadow-float">
-              <div className="flex items-center justify-between px-2 py-1">
+            <div className="absolute right-0 top-12 flex max-h-[calc(100dvh-5rem)] w-[min(360px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-line bg-white p-3 shadow-float">
+              <div className="flex shrink-0 items-center justify-between px-2 py-1">
                 <p className="text-sm font-semibold">通知中心</p>
                 <button type="button" className="text-xs font-medium text-cyan" onClick={() => void markNotificationsRead()}>全部已读</button>
               </div>
-              <div className="mt-2 space-y-1">
+              <div className="mt-2 min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain pr-1">
                 {notifications.map((item) => (
                   <div className={`rounded-xl p-3 ${item.unread ? 'bg-cyan/[0.07]' : 'bg-white'}`} key={item.id}>
                     <div className="flex items-start gap-3">
@@ -378,14 +381,14 @@ function Topbar({
             <div className="absolute right-0 top-12 w-72 rounded-2xl border border-line bg-white p-4 shadow-float">
               {profile ? <>
                 <div className="flex items-center justify-between">
-                  <span className="inline-flex items-center gap-2 text-xs font-semibold"><span className={`size-2 rounded-full ${walletAddress ? 'bg-lime' : 'bg-warning'}`} />{walletAddress ? '身份钱包已验证' : 'Web2 身份已验证'}</span>
+                  <span className="inline-flex items-center gap-2 text-xs font-semibold"><span className={`size-2 rounded-full ${walletAddress ? 'bg-lime' : 'bg-warning'}`} />{walletAddress ? '身份钱包已连接' : linkedWalletAddress ? '钱包连接已中断' : 'Web2 身份已验证'}</span>
                   <span className="mono-chip">{provider === 'privy' ? 'PRIVY' : 'PINME'}</span>
                 </div>
-                {walletAddress ? <div className="mt-4 rounded-xl border border-line bg-canvas p-3">
-                  <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted">Ethereum identity</p>
-                  <p className="mt-2 break-all font-mono text-xs font-semibold text-ink">{walletAddress}</p>
+                {identityWallet ? <div className="mt-4 rounded-xl border border-line bg-canvas p-3">
+                  <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted">{walletAddress ? 'Current signer' : 'Linked identity'}</p>
+                  <p className="mt-2 break-all font-mono text-xs font-semibold text-ink">{identityWallet}</p>
                 </div> : <p className="mt-4 text-sm leading-6 text-muted">当前账户使用 Web2 身份。关联钱包后可以用同一账户进行签名登录，无需创建第二套资料。</p>}
-                {provider === 'privy' && profile && !walletAddress ? <button type="button" className="btn-signal mt-4 w-full" onClick={() => void linkWallet()}>关联现有钱包</button> : null}
+                {provider === 'privy' && profile && !walletAddress ? <button type="button" className="btn-signal mt-4 w-full" onClick={() => void linkWallet()}>{linkedWalletAddress ? '重新连接钱包' : '关联现有钱包'}</button> : null}
                 <p className="mt-4 text-xs leading-5 text-muted">Web2 任务使用充值余额；Web3 任务可选择 Sepolia mUSDC 或 sETH，平台不会保管私钥。</p>
                 <Link to="/wallet/test-funds" className="btn-secondary mt-4 w-full" onClick={() => setPanel(null)}>查看与领取测试资金</Link>
               </> : <p className="text-sm leading-6 text-muted">登录后可关联身份钱包，并进入经过 Worker 鉴权的任务托管与结算流程。</p>}
