@@ -11,6 +11,7 @@ export interface UserProfile {
 export interface AdminUser extends UserProfile {
   createdAt: string;
   updatedAt: string;
+  arbitration: { status: 'active' | 'inactive'; power: number } | null;
 }
 
 export interface AdminAction {
@@ -77,6 +78,14 @@ export interface Mission {
   currentStage: string;
   team: string[];
   reviewDueAt: string | null;
+  workflowVersion: number;
+  workflowViewport: WorkflowViewport;
+}
+
+export interface WorkflowViewport {
+  x: number;
+  y: number;
+  zoom: number;
 }
 
 export interface WorkflowStage {
@@ -89,8 +98,20 @@ export interface WorkflowStage {
   agentId: string | null;
   missionId?: string;
   position?: number;
+  nodeType: 'task' | 'approval';
+  positionX: number;
+  positionY: number;
+  progress: number;
   input?: Record<string, unknown>;
   output?: Record<string, unknown> | null;
+}
+
+export interface WorkflowEdge {
+  id: string;
+  missionId: string;
+  sourceStageId: string;
+  targetStageId: string;
+  createdAt?: string;
 }
 
 export interface StageOffer {
@@ -166,6 +187,72 @@ export interface Dispute {
   resolvedAt: string | null;
 }
 
+export type DisputeVoteChoice = 'support_refund' | 'oppose_refund' | 'abstain';
+export type ArbitrationProposalStatus = 'active' | 'succeeded' | 'defeated' | 'inconclusive' | 'quorum_failed' | 'executed';
+
+export interface ArbitrationMember {
+  userId: string;
+  displayName: string;
+  email?: string;
+  role: UserProfile['role'];
+  status: 'active' | 'inactive';
+  power: number;
+  appointedBy: string;
+  appointedAt: string;
+  updatedAt: string;
+}
+
+export interface ArbitrationProposal {
+  id: string;
+  disputeId: string;
+  proposerId: string;
+  status: ArbitrationProposalStatus;
+  weightMode: 'one_person_one_vote' | 'power';
+  votingStartsAt: string;
+  votingEndsAt: string;
+  quorumRequired: number;
+  eligibleWeight: number;
+  supportVotes: number;
+  opposeVotes: number;
+  abstainVotes: number;
+  outcome: 'refund_requester' | 'reject_dispute' | null;
+  finalizedAt: string | null;
+  finalizedBy: string | null;
+  executedAt: string | null;
+  executedBy: string | null;
+  createdAt: string;
+}
+
+export interface ArbitrationElector {
+  userId: string;
+  displayName: string;
+  powerSnapshot: number;
+  voteWeight: number;
+}
+
+export interface DisputeVote {
+  id: string;
+  proposalId: string;
+  voterId: string;
+  voterDisplayName: string;
+  choice: DisputeVoteChoice;
+  reason: string;
+  voteWeight: number;
+  createdAt: string;
+}
+
+export interface DisputeGovernance {
+  proposal: ArbitrationProposal | null;
+  electorate: ArbitrationElector[];
+  votes: DisputeVote[];
+  currentUser: {
+    eligible: boolean;
+    canVote: boolean;
+    hasVoted: boolean;
+    choice: DisputeVoteChoice | null;
+  };
+}
+
 export interface DisputeAction {
   id: string;
   disputeId: string;
@@ -188,6 +275,7 @@ export interface UserPreferences {
 export interface MissionDetail {
   mission: Mission;
   stages: WorkflowStage[];
+  edges: WorkflowEdge[];
   offers: StageOffer[];
   events: ExecutionEvent[];
   deliverables: Deliverable[];

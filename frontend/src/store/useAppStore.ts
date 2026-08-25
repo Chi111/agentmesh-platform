@@ -15,6 +15,8 @@ import type {
   UserProfile,
   UserRole,
   WorkflowStage,
+  WorkflowEdge,
+  WorkflowViewport,
 } from '../types/domain';
 
 const accents: Agent['accent'][] = ['cyan', 'lime', 'amber'];
@@ -75,10 +77,14 @@ interface AppState {
   markNotificationsRead: () => Promise<void>;
   selectAgent: (stageId: string, agentId: string) => void;
   createMission: (input: NewMissionInput) => Promise<string>;
+  compileWorkflow: (missionId: string) => Promise<void>;
+  saveWorkflowDraft: (missionId: string, nodes: WorkflowStage[], edges: WorkflowEdge[], viewport: WorkflowViewport) => Promise<void>;
   confirmWorkflow: (missionId: string) => Promise<void>;
   startMission: (missionId: string, depositTxHash?: string | null) => Promise<void>;
   respondStageOffer: (missionId: string, offerId: string, decision: 'accepted' | 'declined') => Promise<void>;
   dispatchMission: (missionId: string) => Promise<void>;
+  decideGate: (missionId: string, nodeId: string, decision: 'approved' | 'rejected', feedback?: string, reworkNodeIds?: string[]) => Promise<void>;
+  retryNode: (missionId: string, nodeId: string) => Promise<void>;
   submitDeliverable: (missionId: string, input: NewDeliverableInput) => Promise<void>;
   submitForReview: (missionId: string) => Promise<void>;
   requestAssistance: (missionId: string) => Promise<void>;
@@ -204,19 +210,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     requireApiSession();
     const matches = await api.getCandidates(missionId);
     set((state) => {
-      const stages = state.missionStages[missionId] ?? [];
-      const selections: Record<string, string> = {};
-      for (const match of matches) {
-        const first = match.candidates[0]?.agent.id;
-        const assignedAgent = stages.find((stage) => stage.id === match.stageId)?.agentId;
-        if (first && !state.selectedAgents[match.stageId] && !assignedAgent) selections[match.stageId] = first;
-      }
       return {
         candidateMatches: { ...state.candidateMatches, [missionId]: matches.map((match) => ({
           ...match,
           candidates: match.candidates.map((candidate) => ({ ...candidate, agent: normalizeAgent(candidate.agent) })),
         })) },
-        selectedAgents: { ...state.selectedAgents, ...selections },
       };
     });
   },
@@ -238,11 +236,43 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
     return mission.id;
   },
+  compileWorkflow: async (missionId) => {
+    requireApiSession();
+    const result = await api.compileWorkflow(missionId);
+    set((state) => ({
+      missions: state.missions.map((mission) => mission.id === missionId ? result.mission : mission),
+      missionStages: { ...state.missionStages, [missionId]: result.stages },
+      missionDetails: state.missionDetails[missionId]
+        ? { ...state.missionDetails, [missionId]: { ...state.missionDetails[missionId], mission: result.mission, stages: result.stages, edges: result.edges, offers: [] } }
+        : state.missionDetails,
+      toast: notice('AI 已按任务复杂度生成并校验 DAG 草稿，Agent 仍由你手动选择。'),
+    }));
+    await get().loadCandidates(missionId);
+  },
+  saveWorkflowDraft: async (missionId, nodes, edges, viewport) => {
+    requireApiSession();
+    const mission = get().missionDetails[missionId]?.mission ?? get().missions.find((item) => item.id === missionId);
+    if (!mission) throw new Error('任务尚未加载。');
+    const result = await api.saveWorkflowDraft(missionId, { workflowVersion: mission.workflowVersion, nodes, edges, viewport });
+    set((state) => ({
+      missions: state.missions.map((item) => item.id === missionId ? result.mission : item),
+      missionStages: { ...state.missionStages, [missionId]: result.stages },
+      missionDetails: state.missionDetails[missionId]
+        ? { ...state.missionDetails, [missionId]: { ...state.missionDetails[missionId], mission: result.mission, stages: result.stages, edges: result.edges, offers: [] } }
+        : state.missionDetails,
+      selectedAgents: {
+        ...state.selectedAgents,
+        ...Object.fromEntries(result.stages.filter((stage) => stage.agentId).map((stage) => [stage.id, stage.agentId!])),
+      },
+      toast: notice(`DAG v${result.mission.workflowVersion} 已保存。`),
+    }));
+    await get().loadCandidates(missionId);
+  },
   confirmWorkflow: async (missionId) => {
     requireApiSession();
     const stages = get().missionStages[missionId];
     if (!stages?.length) throw new Error('工作流阶段尚未加载。');
-    const assignments = Object.fromEntries(stages.map((stage) => {
+    const assignments = Object.fromEntries(stages.filter((stage) => stage.nodeType === 'task').map((stage) => {
       const agentId = get().selectedAgents[stage.id] ?? stage.agentId;
       if (!agentId) throw new Error(`请为“${stage.name}”选择 Agent。`);
       return [stage.id, agentId];
@@ -252,7 +282,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       missions: state.missions.map((mission) => mission.id === missionId ? result.mission : mission),
       missionStages: { ...state.missionStages, [missionId]: result.stages },
       missionDetails: state.missionDetails[missionId]
-        ? { ...state.missionDetails, [missionId]: { ...state.missionDetails[missionId], mission: result.mission, stages: result.stages, offers: result.offers } }
+        ? { ...state.missionDetails, [missionId]: { ...state.missionDetails[missionId], mission: result.mission, stages: result.stages, edges: result.edges, offers: result.offers } }
         : state.missionDetails,
       toast: notice('阶段邀请已发送，等待所有 Agent 接单。'),
     }));
@@ -276,7 +306,21 @@ export const useAppStore = create<AppState>((set, get) => ({
     requireApiSession();
     const result = await api.dispatchMission(missionId);
     await get().loadMissionDetail(missionId);
-    set({ toast: notice(`${result.agent.name} 已接收“${result.stage.name}”，回调状态会自动同步。`) });
+    set({ toast: notice(result.agent && result.stage
+      ? `${result.agent.name} 已接收“${result.stage.name}”，本轮共派发 ${result.dispatches.length} 个节点。`
+      : `本轮已处理 ${result.dispatches.length} 个派发请求。`) });
+  },
+  decideGate: async (missionId, nodeId, decision, feedback, reworkNodeIds) => {
+    requireApiSession();
+    await api.decideGate(missionId, nodeId, { decision, feedback, reworkNodeIds });
+    await get().loadMissionDetail(missionId);
+    set({ toast: notice(decision === 'approved' ? '审批已通过，后继节点将自动调度。' : '审批已驳回，所选上游节点已进入返工。', decision === 'approved' ? 'success' : 'info') });
+  },
+  retryNode: async (missionId, nodeId) => {
+    requireApiSession();
+    await api.retryNode(missionId, nodeId);
+    await get().loadMissionDetail(missionId);
+    set({ toast: notice('失败节点已进入显式重试队列。') });
   },
   submitDeliverable: async (missionId, input) => {
     requireApiSession();
@@ -357,7 +401,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const dispute = await api.startDisputeReview(disputeId);
     set((state) => ({
       disputes: state.disputes.map((item) => item.id === disputeId ? dispute : item),
-      toast: notice('案件已由当前管理员接手，审计轨迹已写入 D1。'),
+      toast: notice('仲裁提案已创建，委员会快照已写入 D1。'),
     }));
   },
   resolveDispute: async (disputeId, resolution, status, resolutionTxHash = null) => {

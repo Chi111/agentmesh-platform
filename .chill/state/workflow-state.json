@@ -1,19 +1,19 @@
 {
   "version": 1,
-  "status": "completed",
-  "route": "prd",
-  "reason": "Agent Market foundation crosses API contracts, D1 migrations, frontend flows, reputation and payment start guards.",
-  "activeCommand": "internal chill:finish",
-  "currentStage": "finish",
-  "currentFeature": "specs/002-market-foundation",
-  "currentTaskId": null,
+  "status": "running",
+  "route": "dynamic",
+  "reason": "DAO-style arbitration crosses D1 migrations, authorization, dispute governance, payment execution guards and the user-facing arbitration workflow.",
+  "activeCommand": "internal chill:run",
+  "currentStage": "implementation",
+  "currentFeature": "specs/004-dao-arbitration",
+  "currentTaskId": "T2",
   "lastSafeCheckpoint": {
-    "stage": "finish",
-    "completedAt": "2026-08-20T21:44:00+08:00",
-    "summary": "Agent Market foundation completed; final review ALLOW, QA passed with 43 backend/D1 tests, 7 browser E2E tests, frontend build and Worker dry-run."
+    "stage": "specs",
+    "completedAt": "2026-08-23T15:05:44+08:00",
+    "summary": "DAO arbitration requirements and design baselined: committee snapshot, one-person-one-vote, Power-compatible schema, 60% quorum and settlement execution separation."
   },
-  "nextSafeCommand": "",
+  "nextSafeCommand": "/chill-ai continue",
   "blockedGateId": null,
   "autoRun": true,
-  "updatedAt": "2026-08-20T21:44:00+08:00"
+  "updatedAt": "2026-08-23T15:05:44+08:00"
 }

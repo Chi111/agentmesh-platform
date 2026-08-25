@@ -1,1 +1,0 @@
-import{lt as e}from"./localBatchGatewayRequest-paFw5XKK.js";function t(t,n=`wei`){return e(t,n)}export{t};

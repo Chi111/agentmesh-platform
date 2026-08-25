@@ -61,7 +61,14 @@ function migratedDatabase(): SqliteD1 {
   db.exec(`
     INSERT INTO profiles (id, email, display_name, role) VALUES
       ('demo-requester', 'requester@test.invalid', 'Test Requester', 'requester'),
-      ('demo-developer', 'developer@test.invalid', 'Test Developer', 'developer');
+      ('demo-developer', 'developer@test.invalid', 'Test Developer', 'developer'),
+      ('demo-arbitrator', 'arbitrator@test.invalid', 'Test Arbitrator', 'requester'),
+      ('demo-arbitrator-2', 'arbitrator-2@test.invalid', 'Test Arbitrator Two', 'requester');
+
+    INSERT INTO arbitration_members (user_id, status, power, appointed_by, appointed_at, updated_at)
+    VALUES
+      ('demo-arbitrator', 'active', 1, 'demo-arbitrator', '2026-08-18T00:00:00.000Z', '2026-08-18T00:00:00.000Z'),
+      ('demo-arbitrator-2', 'active', 1, 'demo-arbitrator', '2026-08-18T00:00:00.000Z', '2026-08-18T00:00:00.000Z');
 
     INSERT INTO agents
       (id, owner_id, name, category, summary, endpoint_url, price_usdc, wallet_address, status, author_name)
@@ -112,6 +119,77 @@ describe('D1PlatformStore concurrency invariants', () => {
     ]);
     expect(official.every((agent) => agent.official && agent.status === 'active')).toBe(true);
     expect(official.every((agent) => agent.endpoint.startsWith('agentmesh://builtin/'))).toBe(true);
+  });
+
+  it('persists a DAG draft with optimistic locking and enforces graph locks after funding', async () => {
+    database.db.exec(`
+      INSERT INTO missions
+        (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json)
+      VALUES
+        ('TASK-D1-DAG', 'demo-requester', 'D1 DAG mission', 'Exercises graph persistence and locking.', '软件开发', 200, '2026-09-01', 'matching', 0, 'Draft', '[]');
+      INSERT INTO workflow_stages
+        (id, mission_id, position, name, purpose, category, budget_usdc, status, agent_id, input_json)
+      VALUES
+        ('stage-dag-a', 'TASK-D1-DAG', 1, 'Architecture', 'Analyze the implementation boundary.', '软件开发', 80, 'queued', 'visionboard', '{"executionMode":"analyze"}'),
+        ('stage-dag-b', 'TASK-D1-DAG', 2, 'Implementation', 'Implement and verify the change.', '软件开发', 120, 'queued', 'motioncraft', '{"executionMode":"implement"}');
+      INSERT INTO escrows (id, mission_id, amount, token, network, payment_method, status)
+      VALUES ('ESC-D1-DAG', 'TASK-D1-DAG', 200, 'CREDIT', 'agentmesh', 'web2_balance', 'pending');
+    `);
+    const mission = (await store.getMission('TASK-D1-DAG'))!;
+    const stages = (await store.listStages(mission.id)).map((stage, index) => ({
+      ...stage,
+      positionX: 80 + index * 360,
+      positionY: 120,
+    }));
+    const edges = [{
+      id: 'EDGE-D1-DAG-A-B',
+      missionId: mission.id,
+      sourceStageId: stages[0].id,
+      targetStageId: stages[1].id,
+      createdAt: '2026-08-22T00:00:00.000Z',
+    }];
+
+    const saved = await store.saveWorkflowDraft(mission.id, stages, edges, { x: 12, y: 24, zoom: 0.8 }, mission.workflowVersion);
+    expect(saved.state).toBe('saved');
+    expect((await store.getMission(mission.id))?.workflowVersion).toBe(2);
+    expect(await store.listEdges(mission.id)).toEqual(edges);
+
+    const stale = await store.saveWorkflowDraft(mission.id, stages, [], { x: 0, y: 0, zoom: 1 }, mission.workflowVersion);
+    expect(stale.state).toBe('version_conflict');
+    expect(await store.listEdges(mission.id)).toEqual(edges);
+
+    database.db.prepare("UPDATE escrows SET status = 'held' WHERE mission_id = ?").run(mission.id);
+    expect(() => database.db.prepare('UPDATE workflow_stages SET budget_usdc = 100 WHERE id = ?').run(stages[0].id)).toThrow('WORKFLOW_LOCKED');
+    expect(() => database.db.prepare(`
+      INSERT INTO workflow_edges (id, mission_id, source_stage_id, target_stage_id, created_at)
+      VALUES ('EDGE-D1-LOCKED', 'TASK-D1-DAG', 'stage-dag-b', 'stage-dag-a', datetime('now'))
+    `).run()).toThrow('WORKFLOW_LOCKED');
+  });
+
+  it('keeps one outbox run ID during recovery and rotates it only for an explicit rerun', async () => {
+    database.db.exec(`
+      INSERT INTO missions
+        (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json)
+      VALUES
+        ('TASK-D1-OUTBOX', 'demo-requester', 'D1 outbox mission', 'Exercises durable DAG dispatch identity.', '软件开发', 100, '2026-09-01', 'running', 1, 'Ready', '["visionboard"]');
+      INSERT INTO workflow_stages
+        (id, mission_id, position, name, purpose, category, budget_usdc, status, agent_id, input_json)
+      VALUES
+        ('stage-d1-outbox', 'TASK-D1-OUTBOX', 1, 'Dispatch task', 'Dispatch exactly once per run.', '软件开发', 100, 'queued', 'visionboard', '{"executionMode":"implement"}');
+      INSERT INTO escrows (id, mission_id, amount, token, network, payment_method, status)
+      VALUES ('ESC-D1-OUTBOX', 'TASK-D1-OUTBOX', 100, 'CREDIT', 'agentmesh', 'web2_balance', 'held');
+    `);
+    const startedAt = '2026-08-22T00:00:00.000Z';
+    const [first] = await store.enqueueDispatches('TASK-D1-OUTBOX', ['stage-d1-outbox'], startedAt);
+    const [duplicate] = await store.enqueueDispatches('TASK-D1-OUTBOX', ['stage-d1-outbox'], '2026-08-22T00:00:30.000Z');
+    expect(duplicate.runId).toBe(first.runId);
+    expect(duplicate.expiresAt).toBe(first.expiresAt);
+
+    expect(await store.claimDispatch(first.id, '2026-08-22T00:00:30.000Z')).toBe(true);
+    await store.completeDispatch(first.id, 'done', '2026-08-22T00:01:00.000Z');
+    const [rerun] = await store.enqueueDispatches('TASK-D1-OUTBOX', ['stage-d1-outbox'], '2026-08-22T00:02:00.000Z');
+    expect(rerun.runId).not.toBe(first.runId);
+    expect(rerun.expiresAt).not.toBe(first.expiresAt);
   });
 
   it('binds an idempotency key to the request hash', async () => {
@@ -184,6 +262,7 @@ describe('D1PlatformStore concurrency invariants', () => {
     const runId = 'run-d1-atomic-callback';
     const callbackId = 'callback-d1-atomic';
     const expiresAt = '2026-08-19T00:00:00.000Z';
+    const updateNow = '2026-08-18T12:00:00.000Z';
     await store.createAgentDispatch({
       runId,
       missionId: 'TASK-2026-0815',
@@ -191,6 +270,11 @@ describe('D1PlatformStore concurrency invariants', () => {
       agentId: 'visionboard',
       expiresAt,
     });
+    database.db.prepare(`
+      INSERT INTO workflow_dispatch_outbox
+        (id, mission_id, stage_id, run_id, expires_at, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'processing', 1, ?, ?, ?)
+    `).run('OUTBOX-D1-ATOMIC', 'TASK-2026-0815', 'stage-visual', runId, expiresAt, updateNow, updateNow, updateNow);
     const update = {
       runId,
       callbackId,
@@ -198,9 +282,15 @@ describe('D1PlatformStore concurrency invariants', () => {
       stageId: 'stage-visual',
       agentId: 'visionboard',
       expiresAt,
-      now: '2026-08-18T12:00:00.000Z',
+      now: updateNow,
       status: 'done' as const,
       output: { contentHash: 'sha256:d1-atomic-callback' },
+      artifacts: [{
+        id: 'DEL-D1-ATOMIC', missionId: 'TASK-2026-0815', stageId: 'stage-visual', agentId: 'visionboard',
+        name: 'Atomic callback artifact', uri: 'ipfs://bafyd1atomicartifact',
+        contentHash: `sha256:${'a'.repeat(64)}`, mimeType: 'application/json', status: 'submitted' as const,
+        createdAt: updateNow,
+      }],
       progress: 80,
       currentStage: '视觉设定与分镜 已完成',
       event: {
@@ -224,6 +314,8 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect((await store.listStages(update.missionId)).find((stage) => stage.id === update.stageId)?.status).toBe('done');
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE id = ?').get(update.event.id)).toEqual({ count: 1 });
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM agent_performance_events WHERE stage_id = ?').get(update.stageId)).toEqual({ count: 1 });
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM deliverables WHERE id = ?').get('DEL-D1-ATOMIC')).toEqual({ count: 1 });
+    expect(database.db.prepare('SELECT status FROM workflow_dispatch_outbox WHERE id = ?').get('OUTBOX-D1-ATOMIC')).toEqual({ status: 'done' });
     expect(database.db.prepare('SELECT success_rate FROM agents WHERE id = ?').get(update.agentId)).toEqual({ success_rate: 83.3 });
     expect(database.db.prepare('SELECT processing_token, applied_at FROM agent_callback_events WHERE run_id = ? AND callback_id = ?').get(runId, callbackId)).toEqual(expect.objectContaining({ applied_at: update.now }));
   });
@@ -266,6 +358,48 @@ describe('D1PlatformStore concurrency invariants', () => {
     });
   });
 
+  it('reopens the affected review mission without releasing escrow when its engineering artifact is missing', async () => {
+    database.db.exec(`
+      INSERT INTO missions
+        (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json, review_due_at)
+      VALUES
+        ('TASK-2026-795E53', 'demo-requester', 'Missing artifact mission', 'Preserves text evidence while revoking false delivery.', '软件开发', 100, '2026-09-01', 'review', 100, '等待验收', '["visionboard","motioncraft"]', '2026-08-30T00:00:00.000Z');
+      INSERT INTO workflow_stages
+        (id, mission_id, position, name, purpose, category, budget_usdc, status, agent_id, input_json, output_json)
+      VALUES
+        ('stage-artifact-analysis', 'TASK-2026-795E53', 1, 'Analysis', 'Analyze', '软件开发', 20, 'done', 'visionboard', '{"dependsOn":[]}', '{"result":{"summary":"analysis","verified":true}}'),
+        ('stage-artifact-implement', 'TASK-2026-795E53', 2, 'Implementation', 'Implement', '软件开发', 35, 'done', 'motioncraft', '{"dependsOn":[1]}', '{"result":{"summary":"claimed implementation","deliverable":"fake archive"}}'),
+        ('stage-artifact-review', 'TASK-2026-795E53', 3, 'Review', 'Review', '软件开发', 45, 'done', 'visionboard', '{"dependsOn":[2]}', '{"result":{"summary":"cannot package","deliverable":"missing artifacts"}}');
+      INSERT INTO workflow_edges (id, mission_id, source_stage_id, target_stage_id, created_at) VALUES
+        ('edge-artifact-a-i', 'TASK-2026-795E53', 'stage-artifact-analysis', 'stage-artifact-implement', datetime('now')),
+        ('edge-artifact-i-r', 'TASK-2026-795E53', 'stage-artifact-implement', 'stage-artifact-review', datetime('now'));
+      INSERT INTO escrows (id, mission_id, amount, token, network, payment_method, status)
+      VALUES ('ESC-MISSING-ARTIFACT', 'TASK-2026-795E53', 100, 'CREDIT', 'agentmesh', 'web2_balance', 'pending');
+      UPDATE escrows SET status = 'frozen' WHERE mission_id = 'TASK-2026-795E53';
+      INSERT INTO workflow_dispatch_outbox
+        (id, mission_id, stage_id, run_id, expires_at, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES
+        ('OUTBOX-MISSING-ARTIFACT', 'TASK-2026-795E53', 'stage-artifact-implement', 'run-missing-artifact', '2026-09-01T00:00:00.000Z', 'processing', 1, datetime('now'), datetime('now'), datetime('now'));
+    `);
+    const migration = readFileSync(join(import.meta.dirname, '../../db/017_reopen_missing_engineering_artifact.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+
+    expect(await store.getMission('TASK-2026-795E53')).toMatchObject({
+      status: 'running',
+      progress: 20,
+      reviewDueAt: null,
+    });
+    expect((await store.getEscrow('TASK-2026-795E53'))?.status).toBe('frozen');
+    expect((await store.listStages('TASK-2026-795E53')).map((stage) => stage.status)).toEqual(['done', 'failed', 'failed']);
+    expect((await store.listStages('TASK-2026-795E53'))[1].output).toMatchObject({
+      invalidated: true,
+      result: { deliverable: 'fake archive' },
+    });
+    expect(database.db.prepare('SELECT status FROM workflow_dispatch_outbox WHERE id = ?').get('OUTBOX-MISSING-ARTIFACT')).toEqual({ status: 'done' });
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE id = ?').get('EVT-REOPEN-MISSING-ENGINEERING-ARTIFACT')).toEqual({ count: 1 });
+  });
+
   it('enforces one active dispute and applies only the first ruling', async () => {
     const dispute: Dispute = {
       id: 'DSP-D1-CONCURRENCY',
@@ -297,7 +431,41 @@ describe('D1PlatformStore concurrency invariants', () => {
     })).state).toBe('invalid');
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE id = ?').get('EVT-AFTER-FREEZE')).toEqual({ count: 0 });
     await expect(store.createDispute({ ...dispute, id: 'DSP-D1-DUPLICATE' })).rejects.toThrow('ACTIVE_DISPUTE_EXISTS');
-    await store.startDisputeReview(dispute.id, 'demo-requester');
+    await store.setArbitrationMember('demo-requester', true, 'demo-arbitrator', '2026-08-18T00:00:00.000Z');
+    await store.setArbitrationMember('demo-developer', true, 'demo-arbitrator', '2026-08-18T00:00:00.000Z');
+    await store.startDisputeReview(dispute.id, 'demo-requester', '2026-08-18T00:00:00.000Z');
+    const governance = await store.getDisputeGovernance(dispute.id, 'demo-arbitrator', '2026-08-18T00:00:30.000Z');
+    expect(governance?.electorate.map((item) => item.userId)).toEqual(['demo-arbitrator', 'demo-arbitrator-2']);
+    const firstVote = await store.castDisputeVote(
+      dispute.id,
+      'demo-arbitrator',
+      'support_refund',
+      '依据冻结状态与执行证据，支持争议方退款并终止任务。',
+      '2026-08-18T00:01:00.000Z',
+    );
+    expect(firstVote.state).toBe('applied');
+    if (firstVote.state === 'applied') expect(firstVote.governance.proposal?.status).toBe('active');
+    expect((await store.castDisputeVote(
+      dispute.id,
+      'demo-arbitrator',
+      'support_refund',
+      '重复投票不应改变已记录的第一张选票。',
+      '2026-08-18T00:01:30.000Z',
+    )).state).toBe('already_voted');
+    await store.setArbitrationMember('demo-arbitrator-2', false, 'demo-arbitrator', '2026-08-18T00:02:00.000Z');
+    const snapshotUser = (await store.getProfile('demo-arbitrator-2'))!;
+    expect((await store.listDisputes(snapshotUser)).map((item) => item.id)).toContain(dispute.id);
+    const finalVote = await store.castDisputeVote(
+      dispute.id,
+      'demo-arbitrator-2',
+      'support_refund',
+      '成员停用不应追溯改变已经冻结的提案投票快照。',
+      '2026-08-18T00:03:00.000Z',
+    );
+    expect(finalVote.state).toBe('applied');
+    if (finalVote.state === 'applied') expect(finalVote.governance.proposal?.status).toBe('succeeded');
+    const finalizedReplay = await store.finalizeDisputeProposal(dispute.id, 'demo-arbitrator', '2026-08-18T00:04:00.000Z');
+    expect(finalizedReplay.state).toBe('finalized');
     database.db.prepare("UPDATE missions SET status = 'review' WHERE id = ?").run(dispute.missionId);
     expect((await store.acceptMission(dispute.missionId, 'demo-requester', null))?.applied).toBe(false);
     expect((await store.getEscrow(dispute.missionId))?.status).toBe('frozen');

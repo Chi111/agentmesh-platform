@@ -11,6 +11,7 @@ interface ImportMetaEnv {
   readonly VITE_BASE_RPC_URL?: string;
   readonly VITE_ESCROW_CONTRACT_ADDRESS?: string;
   readonly VITE_ESCROW_DEPLOYMENT_BLOCK?: string;
+  readonly VITE_ESCROW_DEPLOYMENT_TX_HASH?: string;
   readonly VITE_MUSDC_ADDRESS?: string;
   readonly VITE_USDC_ADDRESS?: string;
   readonly VITE_USDC_DECIMALS?: string;

@@ -3,15 +3,14 @@ import { lazy, useEffect, useState, type ReactNode } from 'react';
 import { useAuth } from './auth/AuthProvider';
 import { AuthDialog } from './auth/AuthDialog';
 import { AppShell } from './components/layout/AppShell';
-import { ArbitrationPage } from './pages/ArbitrationPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { TeamAssemblyPage } from './pages/TeamAssemblyPage';
 import { useAppStore } from './store/useAppStore';
 
 const AcceptancePage = lazy(() => import('./pages/AcceptancePage').then((module) => ({ default: module.AcceptancePage })));
 const AdminPage = lazy(() => import('./pages/AdminPage').then((module) => ({ default: module.AdminPage })));
 const AgentDetailPage = lazy(() => import('./pages/AgentDetailPage').then((module) => ({ default: module.AgentDetailPage })));
 const AgentMarketPage = lazy(() => import('./pages/AgentMarketPage').then((module) => ({ default: module.AgentMarketPage })));
+const ArbitrationPage = lazy(() => import('./pages/ArbitrationPage').then((module) => ({ default: module.ArbitrationPage })));
+const ContractShowcasePage = lazy(() => import('./pages/ContractShowcasePage').then((module) => ({ default: module.ContractShowcasePage })));
 const DashboardPage = lazy(() => import('./pages/DashboardPage').then((module) => ({ default: module.DashboardPage })));
 const DeveloperAgentsPage = lazy(() => import('./pages/DeveloperAgentsPage').then((module) => ({ default: module.DeveloperAgentsPage })));
 const DeveloperDashboardPage = lazy(() => import('./pages/DeveloperDashboardPage').then((module) => ({ default: module.DeveloperDashboardPage })));
@@ -22,6 +21,8 @@ const MissionsPage = lazy(() => import('./pages/MissionsPage').then((module) => 
 const NewMissionPage = lazy(() => import('./pages/NewMissionPage').then((module) => ({ default: module.NewMissionPage })));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage').then((module) => ({ default: module.NotFoundPage })));
 const RegisterAgentPage = lazy(() => import('./pages/RegisterAgentPage').then((module) => ({ default: module.RegisterAgentPage })));
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => ({ default: module.SettingsPage })));
+const TeamAssemblyPage = lazy(() => import('./pages/TeamAssemblyPage').then((module) => ({ default: module.TeamAssemblyPage })));
 const TestFundsPage = lazy(() => import('./pages/TestFundsPage').then((module) => ({ default: module.TestFundsPage })));
 const WorkflowPage = lazy(() => import('./pages/WorkflowPage').then((module) => ({ default: module.WorkflowPage })));
 
@@ -94,6 +95,7 @@ export default function App() {
     <WorkspaceBootstrap><Routes>
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
       <Route path="/screens/:screenId" element={<LegacyScreenRedirect />} />
+      <Route path="/contract" element={<ContractShowcasePage />} />
       <Route element={<AppShell />}>
         <Route path="/dashboard" element={protectedPage(<DashboardPage />)} />
         <Route path="/missions" element={protectedPage(<MissionsPage />)} />

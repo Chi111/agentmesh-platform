@@ -14,8 +14,8 @@ export default defineConfig({
     { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
   ],
   webServer: {
-    command: 'npm run dev --workspace frontend -- --host 127.0.0.1 --port 4173',
-    env: { VITE_PRIVY_APP_ID: '' },
+    command: 'npm run dev --workspace frontend -- --mode e2e --host 127.0.0.1 --port 4173',
+    env: { VITE_PRIVY_APP_ID: '', VITE_E2E_AUTH: 'true' },
     url: 'http://127.0.0.1:4173',
     reuseExistingServer: true,
     timeout: 120_000,

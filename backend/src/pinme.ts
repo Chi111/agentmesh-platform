@@ -3,6 +3,11 @@ export interface PinmeEnv {
   PROJECT_NAME?: string;
   BASE_URL?: string;
   LLM_MODEL?: string;
+  BUILTIN_AGENT_MODEL?: string;
+}
+
+export interface PinmeLlmOptions {
+  model?: string;
 }
 
 type PinmeEnvelope<T = unknown> = {
@@ -115,6 +120,7 @@ export async function verifyPinmeToken(env: PinmeEnv, idToken: string): Promise<
 export async function callPinmeLlm(
   env: PinmeEnv,
   messages: Array<{ role: 'system' | 'user'; content: string }>,
+  options: PinmeLlmOptions = {},
 ): Promise<{ content?: string; error?: string }> {
   const config = pinmeConfig(env);
   if (!config) return { error: 'LLM service is not configured' };
@@ -126,7 +132,7 @@ export async function callPinmeLlm(
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': config.apiKey },
         body: JSON.stringify({
-          model: env.LLM_MODEL ?? 'openai/gpt-4o-mini',
+          model: options.model?.trim() || env.LLM_MODEL?.trim() || 'openai/gpt-4o-mini',
           temperature: 0.2,
           response_format: { type: 'json_object' },
           messages,

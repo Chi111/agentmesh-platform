@@ -1,4 +1,4 @@
-import { Activity, ArrowRight, Bot, CircleDollarSign, Clock3, Plus, ShieldCheck, Sparkles, Target, TrendingUp } from 'lucide-react';
+import { Activity, ArrowRight, Bot, CircleDollarSign, Clock3, GitBranch, Plus, ShieldCheck, Sparkles, Target, TrendingUp } from 'lucide-react';
 import { useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { MetricCard } from '../components/ui/MetricCard';
@@ -20,6 +20,8 @@ export function DashboardPage() {
   const budgetTokens = [...new Set(missions.map((mission) => paymentToken(mission.paymentMethod)))];
   const averageSuccess = agents.length ? agents.reduce((total, agent) => total + agent.successRate, 0) / agents.length : 0;
   const stages = storedStages ?? [];
+  const edges = detail?.edges ?? [];
+  const rootCount = stages.filter((stage) => !edges.some((edge) => edge.targetStageId === stage.id)).length;
   const evidenceCount = detail?.events.length ?? 0;
 
   useEffect(() => {
@@ -73,24 +75,25 @@ export function DashboardPage() {
             </Link>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-3">
-            {stages.map((stage, index) => (
+          <div className="flex flex-wrap items-center gap-3 font-mono text-[10px] text-white/40"><span className="inline-flex items-center gap-1.5"><GitBranch size={13} />DAG · {stages.length} NODES · {edges.length} DEPENDENCIES</span><span>{rootCount} ROOTS</span></div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {stages.slice(0, 6).map((stage, index) => (
               <article className="relative rounded-xl border border-white/10 bg-white/[0.035] p-4" key={stage.id}>
-                {index < stages.length - 1 ? <span className="absolute -right-3 top-7 hidden h-px w-6 bg-cyan/40 md:block" /> : null}
                 <div className="flex items-center justify-between">
                   <span className={`flex size-8 items-center justify-center rounded-full border ${stage.status === 'done' ? 'border-lime/50 bg-lime/15 text-lime' : stage.status === 'running' ? 'border-cyan/50 bg-cyan/15 text-cyan' : 'border-white/15 bg-white/5 text-white/35'}`}>
-                    {stage.status === 'done' ? <ShieldCheck size={16} /> : stage.status === 'running' ? <Sparkles size={16} /> : <Clock3 size={16} />}
+                    {stage.nodeType === 'approval' ? <ShieldCheck size={16} /> : stage.status === 'running' ? <Sparkles size={16} /> : <Clock3 size={16} />}
                   </span>
-                  <span className="font-mono text-[10px] text-white/35">0{index + 1}</span>
+                  <span className="font-mono text-[10px] text-white/35">{stage.nodeType === 'approval' ? 'GATE' : `TASK · ${index + 1}`}</span>
                 </div>
                 <h3 className="mt-4 text-sm font-semibold">{stage.name}</h3>
-                <p className="mt-1 text-xs text-white/40">{stage.status === 'done' ? '阶段完成' : stage.status === 'running' ? 'Agent 执行中' : stage.status === 'failed' ? '执行失败，等待处理' : '等待上游输出'}</p>
+                <p className="mt-1 text-xs text-white/40">{stage.status === 'done' ? '节点完成' : stage.nodeType === 'approval' && stage.status === 'running' ? '等待任务方审批' : stage.status === 'running' ? 'Agent 执行中' : stage.status === 'failed' ? '执行失败，等待显式处理' : edges.some((edge) => edge.targetStageId === stage.id) ? '等待依赖满足' : '根节点等待派发'}</p>
                 <div className="mt-3 h-1 overflow-hidden rounded-full bg-white/10">
                   <span className={`block h-full rounded-full ${stage.status === 'done' ? 'w-full bg-lime' : stage.status === 'running' ? 'w-1/2 bg-cyan' : 'w-0'}`} />
                 </div>
               </article>
             ))}
           </div>
+          {stages.length > 6 ? <p className="text-xs text-white/40">控制台仅预览前 6 个拓扑节点；进入任务可查看完整 {stages.length} 节点 DAG。</p> : null}
 
           {stages.length === 0 ? <div className="rounded-xl border border-dashed border-white/15 p-5 text-center text-xs text-white/40">工作流尚未确认；进入任务继续选择 Agent 和执行顺序。</div> : null}
           <div className="flex flex-wrap gap-x-6 gap-y-2 border-t border-white/10 pt-4 font-mono text-[10px] text-white/40">

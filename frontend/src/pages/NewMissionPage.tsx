@@ -46,7 +46,7 @@ export function NewMissionPage() {
     setSubmitting(true);
     try {
       const id = await createMission({ title: title.trim(), description: description.trim(), category, tags, budget, paymentMethod, deadline, priority, expertise, yieldEnabled: false });
-      navigate(`/missions/${id}/team`);
+      navigate(`/missions/${id}/workflow`);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : '任务创建失败，请稍后重试。');
     } finally {

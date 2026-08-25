@@ -13,16 +13,16 @@ import type {
   PlatformStore,
   UserContext,
   UserRole,
+  WorkflowEdge,
   WorkflowStage,
+  WorkflowViewport,
 } from './contracts';
 import {
   canAccessMission,
-  fallbackCompilation,
   fallbackTrialScore,
   makeId,
   makeMissionId,
   matchCandidates,
-  parseLlmCompilation,
   parseTrialScore,
 } from './logic';
 import {
@@ -53,14 +53,41 @@ import {
 } from './chain';
 import { D1PlatformStore, type D1Database } from './store';
 import { AGENTMESH_TESTNET_SETTLEMENT, isWeb3Payment } from './payments';
+import {
+  hasMeaningfulStageOutput,
+  stageRequiresArtifact,
+  structuredStageResult,
+  workflowDeliveryReadiness,
+} from './deliveryPolicy';
+import {
+  blockedNodeIds,
+  incomingStageIds,
+  linearEdges,
+  normalizeViewport,
+  readyNodes,
+  validateWorkflowGraph,
+  workflowAggregate,
+  WorkflowValidationError,
+} from './workflowGraph';
+import {
+  adaptiveFallbackCompilation,
+  compileWorkflowWithLangGraph,
+  type WorkflowCompilerMetadata,
+} from './workflowCompiler';
 
 export interface Env extends PinmeEnv, PrivyEnv, SettlementEnv {
   DB?: D1Database;
   CORS_ORIGIN?: string;
   AGENT_WEBHOOK_SECRET?: string;
   AGENT_CREDENTIALS_JSON?: string;
+  AGENT_CREDENTIALS_ENCRYPTED_JSON?: string;
   TEST_TOPUP_ENABLED?: string;
   AGENT_ENDPOINT_ALLOWLIST?: string;
+  PUBLIC_BASE_URL?: string;
+}
+
+interface WorkerExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
 }
 
 interface AppDependencies {
@@ -88,6 +115,8 @@ const BUILTIN_AGENT_PROFILES = {
     instruction: 'Act as a delivery writer. Turn the task and upstream evidence into an acceptance-ready structured deliverable with a title, executive summary, body, limitations, and action list.',
   },
 } as const;
+
+const DEFAULT_BUILTIN_AGENT_MODEL = 'openai/gpt-5.6-sol';
 
 type BuiltinAgentKind = keyof typeof BUILTIN_AGENT_PROFILES;
 
@@ -285,8 +314,264 @@ function recordValue(body: Record<string, unknown>, key: string): Record<string,
   return value as Record<string, unknown>;
 }
 
-function hasStructuredStageOutput(stage: WorkflowStage): boolean {
-  return stage.status === 'done' && Boolean(stage.output && Object.keys(stage.output).length > 0);
+function workflowDraftFromBody(
+  body: Record<string, unknown>,
+  mission: Mission,
+  existingStages: WorkflowStage[],
+  now: string,
+): { stages: WorkflowStage[]; edges: WorkflowEdge[]; viewport: WorkflowViewport; expectedVersion: number } {
+  if (!Array.isArray(body.nodes) || !Array.isArray(body.edges)) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'nodes and edges must be arrays');
+  }
+  const existingById = new Map(existingStages.map((stage) => [stage.id, stage]));
+  const stages = body.nodes.map((value, index): WorkflowStage => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ApiError(400, 'INVALID_NODE', 'Every node must be an object');
+    const node = value as Record<string, unknown>;
+    const id = typeof node.id === 'string' && node.id.trim() ? node.id.trim().slice(0, 120) : makeId('STAGE');
+    const nodeType = node.nodeType === 'approval' ? 'approval' : node.nodeType === 'task' ? 'task' : null;
+    if (!nodeType) throw new ApiError(400, 'INVALID_NODE_TYPE', 'nodeType must be task or approval');
+    const existing = existingById.get(id);
+    const budget = nodeType === 'approval' ? 0 : Number(node.budget);
+    if (!Number.isFinite(budget) || budget < 0 || budget > mission.budget) throw new ApiError(400, 'VALIDATION_ERROR', `Node ${id} has an invalid budget`);
+    const positionX = Number(node.positionX);
+    const positionY = Number(node.positionY);
+    const agentId = nodeType === 'task' && typeof node.agentId === 'string' && node.agentId.trim() ? node.agentId.trim() : null;
+    const rawInput = recordValue(node, 'input');
+    let normalizedInput: Record<string, unknown>;
+    if (nodeType === 'task') {
+      const executionMode = rawInput.executionMode ?? 'analyze';
+      if (!['analyze', 'implement', 'review'].includes(String(executionMode))) {
+        throw new ApiError(400, 'INVALID_EXECUTION_MODE', `Task node ${id} has an unsupported execution mode`);
+      }
+      for (const contractKey of ['inputContract', 'outputContract'] as const) {
+        const contract = rawInput[contractKey];
+        if (contract !== undefined && typeof contract !== 'string') {
+          throw new ApiError(400, 'INVALID_NODE_CONTRACT', `${contractKey} for node ${id} must be text`);
+        }
+        if (typeof contract === 'string' && contract.length > 4_000) {
+          throw new ApiError(400, 'INVALID_NODE_CONTRACT', `${contractKey} for node ${id} must not exceed 4000 characters`);
+        }
+      }
+      normalizedInput = { ...rawInput, executionMode: String(executionMode) };
+    } else {
+      const approvalCriteria = typeof rawInput.approvalCriteria === 'string' ? rawInput.approvalCriteria.trim() : '';
+      if (approvalCriteria.length < 2 || approvalCriteria.length > 2_000) {
+        throw new ApiError(400, 'INVALID_APPROVAL_CRITERIA', `Approval node ${id} requires criteria between 2 and 2000 characters`);
+      }
+      normalizedInput = { approvalCriteria };
+    }
+    return {
+      id,
+      missionId: mission.id,
+      position: index + 1,
+      nodeType,
+      positionX: Number.isFinite(positionX) ? Math.max(-100_000, Math.min(100_000, positionX)) : 0,
+      positionY: Number.isFinite(positionY) ? Math.max(-100_000, Math.min(100_000, positionY)) : 0,
+      progress: 0,
+      name: requiredString(node, 'name', 2, 120),
+      purpose: requiredString(node, 'purpose', 2, 600),
+      category: nodeType === 'approval' ? '人工审批' : requiredString(node, 'category', 2, 80),
+      budget,
+      status: 'queued',
+      agentId,
+      input: normalizedInput,
+      output: null,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+  });
+  const edges = body.edges.map((value): WorkflowEdge => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ApiError(400, 'INVALID_EDGE', 'Every edge must be an object');
+    const edge = value as Record<string, unknown>;
+    return {
+      id: typeof edge.id === 'string' && edge.id.trim() ? edge.id.trim().slice(0, 120) : makeId('EDGE'),
+      missionId: mission.id,
+      sourceStageId: requiredString(edge, 'sourceStageId', 1, 120),
+      targetStageId: requiredString(edge, 'targetStageId', 1, 120),
+      createdAt: now,
+    };
+  });
+  const expectedVersion = Number(body.workflowVersion);
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 1) throw new ApiError(400, 'VALIDATION_ERROR', 'workflowVersion must be a positive integer');
+  const viewportValue = body.viewport && typeof body.viewport === 'object' && !Array.isArray(body.viewport)
+    ? body.viewport as Partial<WorkflowViewport>
+    : mission.workflowViewport;
+  return { stages, edges, viewport: normalizeViewport(viewportValue), expectedVersion };
+}
+
+function graphApiError(error: unknown): never {
+  if (error instanceof WorkflowValidationError) throw new ApiError(400, error.code, error.message);
+  throw error;
+}
+
+function handoffSummary(stage: WorkflowStage): Record<string, unknown> {
+  const output = structuredStageResult(stage.output) ?? {};
+  const summary = typeof output.summary === 'string' && output.summary.trim()
+    ? output.summary.trim().slice(0, 4_000)
+    : `${stage.name} 已完成。`;
+  const handoff: Record<string, unknown> = { summary };
+  for (const key of ['findings', 'risks'] as const) {
+    const value = output[key];
+    if (Array.isArray(value)) {
+      handoff[key] = value
+        .filter((item): item is string => typeof item === 'string')
+        .slice(0, 20)
+        .map((item) => item.slice(0, 1_000));
+    }
+  }
+  for (const key of ['recommendation', 'deliverable'] as const) {
+    const value = output[key];
+    if (typeof value === 'string' && value.trim()) handoff[key] = value.trim().slice(0, 4_000);
+  }
+  if (typeof output.verified === 'boolean') handoff.verified = output.verified;
+  return handoff;
+}
+
+function callbackArtifacts(
+  body: Record<string, unknown>,
+  missionId: string,
+  stageId: string,
+  agentId: string,
+  createdAt: string,
+): Deliverable[] {
+  if (body.artifacts === undefined) return [];
+  if (!Array.isArray(body.artifacts)) throw new ApiError(400, 'VALIDATION_ERROR', 'artifacts must be an array');
+  if (body.artifacts.length > 20) throw new ApiError(400, 'VALIDATION_ERROR', 'artifacts must contain at most 20 values');
+  return body.artifacts.map((value, index) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new ApiError(400, 'VALIDATION_ERROR', `artifacts[${index}] must be an object`);
+    }
+    const artifact = value as Record<string, unknown>;
+    const contentHash = requiredString(artifact, 'contentHash', 8, 256);
+    if (!/^sha256:[a-f0-9]{64}$/i.test(contentHash)) {
+      throw new ApiError(400, 'VALIDATION_ERROR', `artifacts[${index}].contentHash must be a sha256 digest`);
+    }
+    return {
+      id: makeId('DEL'),
+      missionId,
+      stageId,
+      agentId,
+      name: requiredString(artifact, 'name', 2, 180),
+      uri: safeUrl(requiredString(artifact, 'uri', 8, 2_000), `artifacts[${index}].uri`),
+      contentHash,
+      mimeType: requiredString(artifact, 'mimeType', 3, 120),
+      status: 'submitted',
+      createdAt,
+    };
+  });
+}
+
+function requireWorkflowDelivery(stages: WorkflowStage[], deliverables: Deliverable[]): void {
+  const readiness = workflowDeliveryReadiness(stages, deliverables);
+  if (readiness.ready) return;
+  if (readiness.code === 'WORKFLOW_INCOMPLETE') {
+    throw new ApiError(409, readiness.code, 'Every workflow node must be completed before review');
+  }
+  if (readiness.code === 'ARTIFACT_REQUIRED') {
+    throw new ApiError(
+      409,
+      readiness.code,
+      `Implementation nodes require submitted artifacts: ${readiness.missingArtifactStageIds.join(', ')}`,
+    );
+  }
+  throw new ApiError(
+    409,
+    readiness.code,
+    `Completed task nodes require a valid structured result: ${readiness.missingOutputStageIds.join(', ')}`,
+  );
+}
+
+function agentEventPayload(body: Record<string, unknown>, artifactCount: number): Record<string, unknown> {
+  const raw = recordValue(body, 'payload');
+  const payload: Record<string, unknown> = { artifactCount };
+  for (const key of ['runtime', 'source', 'failureCode', 'phase'] as const) {
+    const value = raw[key];
+    if (typeof value === 'string' && value.trim()) payload[key] = value.trim().slice(0, 120);
+  }
+  for (const key of ['retryable', 'verified'] as const) {
+    if (typeof raw[key] === 'boolean') payload[key] = raw[key];
+  }
+  return payload;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function normalizedStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const result = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim().slice(0, 2_000))
+    .filter(Boolean)
+    .slice(0, 50);
+  return result.length > 0 ? result : undefined;
+}
+
+function normalizeCallbackOutput(output: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!output) return undefined;
+  const wrappedResult = objectRecord(output.result);
+  const source = wrappedResult ?? output;
+  const result: Record<string, unknown> = {};
+  for (const key of ['summary', 'deliverable', 'recommendation'] as const) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim()) result[key] = value.trim().slice(0, key === 'deliverable' ? 50_000 : 20_000);
+  }
+  for (const key of ['findings', 'risks'] as const) {
+    const value = normalizedStringList(source[key]);
+    if (value) result[key] = value;
+  }
+  if (typeof source.verified === 'boolean') result.verified = source.verified;
+  if (['succeeded', 'failed', 'blocked'].includes(String(source.completionStatus))) {
+    result.completionStatus = source.completionStatus;
+  }
+  for (const key of ['model', 'agentTier'] as const) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim()) result[key] = value.trim().slice(0, 120);
+  }
+
+  const verification = objectRecord(source.verification);
+  if (verification) {
+    const commands = Array.isArray(verification.commands)
+      ? verification.commands.slice(0, 50).flatMap((item) => {
+        const command = objectRecord(item);
+        if (!command || typeof command.command !== 'string' || !command.command.trim()) return [];
+        return [{
+          command: command.command.trim().slice(0, 1_000),
+          required: command.required === true,
+          status: typeof command.status === 'string' ? command.status.slice(0, 40) : 'unknown',
+          ...(Number.isInteger(command.exitCode) ? { exitCode: command.exitCode } : {}),
+          ...(typeof command.output === 'string' ? { output: command.output.slice(0, 2_000) } : {}),
+        }];
+      })
+      : [];
+    result.verification = { commands };
+  }
+
+  const changes = objectRecord(source.changes);
+  if (changes) {
+    result.changes = Object.fromEntries(
+      ['filesChanged', 'additions', 'deletions']
+        .filter((key) => Number.isInteger(changes[key]) && Number(changes[key]) >= 0)
+        .map((key) => [key, Number(changes[key])]),
+    );
+  }
+
+  const normalized: Record<string, unknown> = wrappedResult ? { result } : result;
+  for (const key of ['runtime', 'source'] as const) {
+    const value = output[key];
+    if (typeof value === 'string' && value.trim()) normalized[key] = value.trim().slice(0, 120);
+  }
+  const error = objectRecord(output.error);
+  if (error) {
+    normalized.error = {
+      code: typeof error.code === 'string' ? error.code.slice(0, 120) : 'AGENT_ERROR',
+      retryable: error.retryable === true,
+    };
+  }
+  return normalized;
 }
 
 function safeUrl(value: string, field: string, protocols = ['https:', 'ipfs:']): string {
@@ -469,7 +754,61 @@ async function enforceRateLimit(
   }
 }
 
-function agentCredentialHeaders(env: Env, agent: Agent): Record<string, string> {
+function decodeBase64Url(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error('invalid base64url');
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const decoded = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '='));
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+}
+
+async function encryptedAgentCredential(env: Env, agentId: string): Promise<string | undefined> {
+  const encrypted = env.AGENT_CREDENTIALS_ENCRYPTED_JSON?.trim();
+  if (!encrypted) return undefined;
+  try {
+    const parsed = JSON.parse(encrypted) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('object required');
+    const envelope = parsed as Record<string, unknown>;
+    const credentials = envelope.credentials;
+    if (envelope.version !== 1 || !credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
+      throw new Error('invalid envelope');
+    }
+    const entry = (credentials as Record<string, unknown>)[agentId];
+    if (entry === undefined) return undefined;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('invalid entry');
+    const { iv, ciphertext } = entry as Record<string, unknown>;
+    if (typeof iv !== 'string' || typeof ciphertext !== 'string' || !env.API_KEY?.trim()) throw new Error('invalid credential');
+    const encoder = new TextEncoder();
+    // Only ciphertext crosses the plain-text deployment binding; the existing project secret remains the local root key.
+    const keyBytes = await crypto.subtle.digest('SHA-256', encoder.encode(`agentmesh-agent-credentials:v1\n${env.API_KEY}`));
+    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+    const plaintext = await crypto.subtle.decrypt({
+      name: 'AES-GCM',
+      iv: decodeBase64Url(iv) as BufferSource,
+      additionalData: encoder.encode(`agentmesh-agent-credential:${agentId}:v1`),
+    }, key, decodeBase64Url(ciphertext) as BufferSource);
+    const credential = new TextDecoder().decode(plaintext).trim();
+    if (!credential) throw new Error('empty credential');
+    return credential;
+  } catch {
+    throw new ApiError(503, 'AGENT_CREDENTIALS_INVALID', 'Encrypted Agent credential configuration is invalid');
+  }
+}
+
+async function agentCredentialsConfigured(env: Env): Promise<boolean> {
+  try {
+    const entries = JSON.parse(env.AGENT_CREDENTIALS_JSON ?? '{}') as unknown;
+    if (entries && typeof entries === 'object' && !Array.isArray(entries)
+      && Object.values(entries as Record<string, unknown>).some((value) => typeof value === 'string' && value.trim())) return true;
+    const encrypted = env.AGENT_CREDENTIALS_ENCRYPTED_JSON?.trim();
+    if (!encrypted) return false;
+    const envelope = JSON.parse(encrypted) as { credentials?: Record<string, unknown> };
+    return Boolean(envelope.credentials && Object.values(envelope.credentials).length > 0);
+  } catch {
+    return false;
+  }
+}
+
+async function agentCredentialHeaders(env: Env, agent: Agent): Promise<Record<string, string>> {
   if (agent.authType === 'none') return {};
   let entries: Record<string, string> = {};
   try {
@@ -478,7 +817,7 @@ function agentCredentialHeaders(env: Env, agent: Agent): Record<string, string> 
   } catch {
     throw new ApiError(503, 'AGENT_CREDENTIALS_INVALID', 'Agent credential secret map is invalid JSON');
   }
-  const credential = entries[agent.id]?.trim();
+  const credential = entries[agent.id]?.trim() || await encryptedAgentCredential(env, agent.id);
   if (!credential) throw new ApiError(409, 'AGENT_CREDENTIAL_REQUIRED', 'This Agent requires a Worker secret credential');
   if (agent.authType === 'api_key') return { 'X-API-Key': credential };
   return { Authorization: `${agent.authType === 'bearer' ? 'Bearer ' : 'JWT '}${credential}` };
@@ -575,15 +914,16 @@ function queryLimit(url: URL, fallback: number, maximum: number): number {
 }
 
 async function missionDetail(store: PlatformStore, mission: Mission, now = new Date().toISOString()): Promise<MissionDetail> {
-  const [stages, offers, events, deliverables, escrow, disputes] = await Promise.all([
+  const [stages, edges, offers, events, deliverables, escrow, disputes] = await Promise.all([
     store.listStages(mission.id),
+    store.listEdges(mission.id),
     store.listStageOffers(mission.id, now),
     store.listEvents(mission.id),
     store.listDeliverables(mission.id),
     store.getEscrow(mission.id),
     store.getDisputes(mission.id),
   ]);
-  return { mission, stages, offers, events, deliverables, escrow, disputes };
+  return { mission, stages, edges, offers, events, deliverables, escrow, disputes };
 }
 
 const OFFER_WINDOW_MS = 24 * 60 * 60 * 1_000;
@@ -624,11 +964,13 @@ async function runBuiltinAgent(
   mission: Mission,
   stage: WorkflowStage,
   stages: WorkflowStage[],
+  edges: WorkflowEdge[],
 ): Promise<{ output: Record<string, unknown>; source: 'pinme-llm' | 'deterministic-fallback' }> {
   const kind = builtinAgentKind(agent);
   if (!kind) throw new ApiError(409, 'BUILTIN_AGENT_INVALID', 'The official Agent runtime is not recognized');
+  const directUpstream = new Set(incomingStageIds(stage.id, edges));
   const upstream = stages
-    .filter((candidate) => candidate.position < stage.position)
+    .filter((candidate) => directUpstream.has(candidate.id))
     .map((candidate) => ({ id: candidate.id, name: candidate.name, output: candidate.output }));
   const fallback: Record<string, unknown> = {
     summary: `${agent.name} 已完成“${stage.name}”的结构化测试网执行。`,
@@ -671,6 +1013,7 @@ async function executeBuiltinAgent(
   fallback: Record<string, unknown>,
 ): Promise<{ output: Record<string, unknown>; source: 'pinme-llm' | 'deterministic-fallback' }> {
   const profile = BUILTIN_AGENT_PROFILES[kind];
+  const model = env.BUILTIN_AGENT_MODEL?.trim() || DEFAULT_BUILTIN_AGENT_MODEL;
   const llm = await (dependencies.llmCaller ?? callPinmeLlm)(env, [
     {
       role: 'system',
@@ -680,7 +1023,7 @@ async function executeBuiltinAgent(
       role: 'user',
       content: stableJson(input),
     },
-  ]);
+  ], { model });
   const parsed = parseJsonObject(llm.content);
   const source = parsed ? 'pinme-llm' : 'deterministic-fallback';
   return {
@@ -689,7 +1032,7 @@ async function executeBuiltinAgent(
       agent: { id: agent.id, name: agent.name, capability: kind },
       source,
       result: parsed ?? fallback,
-      runtime: { protocol: 'agentmesh.builtin.v1', llmError: parsed ? null : llm.error ?? 'invalid_json' },
+      runtime: { protocol: 'agentmesh.builtin.v1', model, llmError: parsed ? null : llm.error ?? 'invalid_json' },
     },
   };
 }
@@ -731,14 +1074,15 @@ async function completeBuiltinAgentDispatch(input: {
   store: PlatformStore;
   mission: Mission;
   stages: WorkflowStage[];
+  edges: WorkflowEdge[];
   stage: WorkflowStage;
   agent: Agent;
   runId: string;
   expiresAt: string;
   now: Date;
 }): Promise<{ stage: WorkflowStage; mission: Mission | null; acknowledgement: Record<string, unknown> }> {
-  const { request, env, dependencies, store, mission, stages, stage, agent, runId, expiresAt, now } = input;
-  const execution = await runBuiltinAgent(env, dependencies, agent, mission, stage, stages);
+  const { request, env, dependencies, store, mission, stages, edges, stage, agent, runId, expiresAt, now } = input;
+  const execution = await runBuiltinAgent(env, dependencies, agent, mission, stage, stages, edges);
   const completedAt = (dependencies.now?.() ?? new Date()).toISOString();
   await store.addEvent({
     id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'dispatch.accepted',
@@ -785,9 +1129,12 @@ async function completeBuiltinAgentDispatch(input: {
     message: `${agent.name} 已提交结构化交付物`, actorType: 'agent', actorId: agent.id,
     payload: { deliverableId, contentHash, builtin: true }, createdAt: completedAt,
   });
-  const latestStages = await store.listStages(mission.id);
+  const [latestStages, latestDeliverables] = await Promise.all([
+    store.listStages(mission.id),
+    store.listDeliverables(mission.id),
+  ]);
   let latestMission = await store.getMission(mission.id);
-  if (latestStages.length > 0 && latestStages.every((candidate) => candidate.status === 'done')) {
+  if (workflowDeliveryReadiness(latestStages, latestDeliverables).ready) {
     latestMission = await store.submitMissionForReview(mission.id, reviewDueAt(now));
   }
   await deliverNotification(store, env, dependencies, {
@@ -804,12 +1151,267 @@ async function completeBuiltinAgentDispatch(input: {
   };
 }
 
-async function requireMissionAccess(store: PlatformStore, user: UserContext, missionId: string): Promise<{ mission: Mission; stages: WorkflowStage[]; agents: Agent[] }> {
+interface NodeDispatchResult {
+  stage: WorkflowStage;
+  mission: Mission | null;
+  agent: { id: string; name: string };
+  acknowledgement: unknown;
+  builtin: boolean;
+}
+
+async function refreshWorkflowAggregate(store: PlatformStore, missionId: string): Promise<Mission | null> {
+  const [stages, edges] = await Promise.all([store.listStages(missionId), store.listEdges(missionId)]);
+  const aggregate = workflowAggregate(stages, edges);
+  return store.updateMissionWorkflowState(missionId, aggregate.progress, aggregate.currentStage);
+}
+
+async function activateReadyApprovals(
+  store: PlatformStore,
+  missionId: string,
+  actorId: string | null,
+  now: string,
+): Promise<WorkflowStage[]> {
+  const [stages, edges] = await Promise.all([store.listStages(missionId), store.listEdges(missionId)]);
+  const approvals = readyNodes(stages, edges).approvals;
+  for (const gate of approvals) {
+    const activated = await store.updateStage(missionId, gate.id, 'running');
+    if (!activated) continue;
+    await store.addEvent({
+      id: makeId('EVT'), missionId, stageId: gate.id, type: 'gate.awaiting_approval',
+      message: `${gate.name} 正在等待任务方审批`, actorType: 'platform', actorId,
+      payload: { criteria: gate.input.approvalCriteria ?? gate.purpose }, createdAt: now,
+    });
+  }
+  return approvals;
+}
+
+async function enqueueReadyTaskNodes(store: PlatformStore, missionId: string, now: string): Promise<WorkflowStage[]> {
+  await activateReadyApprovals(store, missionId, null, now);
+  const [stages, edges] = await Promise.all([store.listStages(missionId), store.listEdges(missionId)]);
+  const tasks = readyNodes(stages, edges).tasks;
+  await store.enqueueDispatches(missionId, tasks.map((stage) => stage.id), now);
+  await refreshWorkflowAggregate(store, missionId);
+  return tasks;
+}
+
+async function dispatchTaskNode(input: {
+  request: Request;
+  env: Env;
+  dependencies: AppDependencies;
+  store: PlatformStore;
+  mission: Mission;
+  stages: WorkflowStage[];
+  edges: WorkflowEdge[];
+  agents: Agent[];
+  stage: WorkflowStage;
+  runId: string;
+  expiresAt: string;
+  now: Date;
+}): Promise<NodeDispatchResult> {
+  const { request, env, dependencies, store, mission, stages, edges, agents, stage, runId, expiresAt, now } = input;
+  if (stage.nodeType !== 'task' || !stage.agentId) throw new ApiError(409, 'WORKFLOW_INCOMPLETE', 'Runnable task node has no assigned Agent');
+  const agent = agents.find((candidate) => candidate.id === stage.agentId);
+  if (!agent || agent.status !== 'active') throw new ApiError(409, 'AGENT_UNAVAILABLE', 'Assigned Agent is not active');
+  const callbackSecret = env.AGENT_WEBHOOK_SECRET?.trim() || env.API_KEY?.trim();
+  if (!callbackSecret) throw new ApiError(503, 'CALLBACK_SIGNING_UNAVAILABLE', 'Agent callback signing is not configured');
+  const claimedStage = stage.status === 'running' ? stage : await store.claimStageForDispatch(mission.id, stage.id);
+  if (!claimedStage) throw new ApiError(409, 'STAGE_ALREADY_DISPATCHED', 'This task node is already running, completed, or blocked by dependencies');
+  try {
+    const builtinKind = builtinAgentKind(agent);
+    if (!builtinKind) await (dependencies.endpointValidator ?? validateAgentEndpointResolution)(agent.endpoint, env);
+    const credentialHeaders = builtinKind ? {} : await agentCredentialHeaders(env, agent);
+    const token = await callbackToken(callbackSecret, mission.id, stage.id, agent.id, runId, expiresAt);
+    await store.createAgentDispatch({ runId, missionId: mission.id, stageId: stage.id, agentId: agent.id, expiresAt });
+    if (builtinKind) {
+      const completed = await completeBuiltinAgentDispatch({
+        request, env, dependencies, store, mission, stages, edges, stage: claimedStage, agent, runId, expiresAt, now,
+      });
+      await refreshWorkflowAggregate(store, mission.id);
+      return {
+        stage: completed.stage,
+        mission: completed.mission,
+        agent: { id: agent.id, name: agent.name },
+        acknowledgement: completed.acknowledgement,
+        builtin: true,
+      };
+    }
+    const directUpstream = new Set(incomingStageIds(stage.id, edges));
+    const upstreamArtifacts = directUpstream.size ? await store.listDeliverables(mission.id) : [];
+    const upstream = stages
+      .filter((candidate) => directUpstream.has(candidate.id) && candidate.status === 'done')
+      .map((candidate) => ({
+        id: candidate.id,
+        name: candidate.name,
+        nodeType: candidate.nodeType,
+        purpose: candidate.purpose,
+        handoff: handoffSummary(candidate),
+        // Compatibility alias for v1 endpoints. This is intentionally the bounded
+        // handoff summary rather than the complete predecessor output.
+        output: handoffSummary(candidate),
+        artifacts: upstreamArtifacts
+          .filter((artifact) => artifact.stageId === candidate.id)
+          .map((artifact) => ({
+            id: artifact.id,
+            name: artifact.name,
+            uri: artifact.uri,
+            contentHash: artifact.contentHash,
+            mimeType: artifact.mimeType,
+          })),
+      }));
+    const callbackUrl = `${new URL(request.url).origin}/api/hooks/agents/${encodeURIComponent(agent.id)}/events`;
+    const dispatchBody = JSON.stringify({
+      protocol: 'agentmesh.node-dispatch.v2',
+      task: {
+        agent: { id: agent.id, name: agent.name },
+        mission: {
+          id: mission.id, title: mission.title, description: mission.description, category: mission.category,
+          tags: mission.tags, deadline: mission.deadline, priority: mission.priority, expertise: mission.expertise,
+        },
+        node: {
+          id: stage.id, position: stage.position, nodeType: stage.nodeType, name: stage.name,
+          purpose: stage.purpose, category: stage.category, budget: stage.budget, input: stage.input,
+        },
+        // Legacy field retained for existing endpoints during the v2 migration.
+        stage: {
+          id: stage.id, position: stage.position, totalStages: stages.filter((candidate) => candidate.nodeType === 'task').length,
+          name: stage.name, purpose: stage.purpose, category: stage.category, budget: stage.budget, input: stage.input,
+        },
+        upstream,
+      },
+      callback: { url: callbackUrl, signature: token, runId, expiresAt, callbackIdRequired: true },
+    });
+    let dispatchResponse: Response | null = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        dispatchResponse = await (dependencies.fetcher ?? fetch)(agent.endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-AgentMesh-Task-Id': runId,
+            'X-AgentMesh-Agent-Id': agent.id,
+            ...credentialHeaders,
+          },
+          body: dispatchBody,
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (dispatchResponse.ok || dispatchResponse.status < 500 || attempt === 2) break;
+      } catch {
+        dispatchResponse = null;
+        if (attempt === 2) break;
+      }
+      await sleep(250 * attempt);
+    }
+    if (!dispatchResponse) throw new ApiError(502, 'AGENT_UNAVAILABLE', 'Agent endpoint could not be reached after two attempts');
+    if (!dispatchResponse.ok) {
+      const authRejected = dispatchResponse.status === 401 || dispatchResponse.status === 403;
+      if (authRejected && agent.authType === 'none') {
+        throw new ApiError(409, 'AGENT_AUTH_CONFIGURATION_REQUIRED', 'Agent endpoint requires authentication but this Agent is registered without credentials', { httpStatus: dispatchResponse.status, authType: agent.authType });
+      }
+      if (authRejected) throw new ApiError(502, 'AGENT_AUTH_REJECTED', `Agent endpoint rejected the configured ${agent.authType} credential`, { httpStatus: dispatchResponse.status, authType: agent.authType });
+      throw new ApiError(502, 'AGENT_REJECTED_TASK', `Agent endpoint returned HTTP ${dispatchResponse.status}`, { httpStatus: dispatchResponse.status, authType: agent.authType });
+    }
+    const responseText = await readLimitedResponse(dispatchResponse);
+    let acknowledgement: unknown = responseText;
+    try { acknowledgement = responseText ? JSON.parse(responseText) : null; } catch { /* Plain text is valid. */ }
+    const updatedStage = (await store.listStages(mission.id)).find((candidate) => candidate.id === stage.id) ?? claimedStage;
+    await store.addEvent({
+      id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'dispatch.accepted',
+      message: `${agent.name} 已接收任务节点`, actorType: 'platform', actorId: null,
+      payload: { acknowledgement, runId, expiresAt, upstreamNodeIds: [...directUpstream] },
+      createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
+    });
+    await refreshWorkflowAggregate(store, mission.id);
+    return { stage: updatedStage, mission: await store.getMission(mission.id), agent: { id: agent.id, name: agent.name }, acknowledgement, builtin: false };
+  } catch (error) {
+    const failedAt = (dependencies.now?.() ?? new Date()).toISOString();
+    const failed = await store.transitionRunningStage(mission.id, stage.id, 'failed', {
+      error: error instanceof Error ? error.message : 'Agent dispatch failed', retryable: true,
+      ...(error instanceof ApiError && error.details && typeof error.details === 'object' && !Array.isArray(error.details) ? error.details : {}),
+    });
+    await store.completeAgentDispatch(runId, failedAt);
+    if (failed) {
+      await store.addEvent({
+        id: makeId('EVT'), missionId: mission.id, stageId: stage.id,
+        type: error instanceof ApiError && ['AGENT_AUTH_REJECTED', 'AGENT_AUTH_CONFIGURATION_REQUIRED'].includes(error.code)
+          ? 'dispatch.authentication_failed'
+          : 'dispatch.failed',
+        message: `${agent.name} 未能接收任务节点`, actorType: 'platform', actorId: null,
+        payload: { retryable: true, code: error instanceof ApiError ? error.code : 'DISPATCH_FAILED' }, createdAt: failedAt,
+      });
+      await refreshWorkflowAggregate(store, mission.id);
+    }
+    throw error;
+  }
+}
+
+async function dispatchReadyWorkflowNodes(input: {
+  request: Request;
+  env: Env;
+  dependencies: AppDependencies;
+  store: PlatformStore;
+  missionId: string;
+  now: Date;
+  cascadeBuiltin?: boolean;
+}): Promise<Array<NodeDispatchResult | { stageId: string; error: { status: number; code: string; message: string } }>> {
+  const { request, env, dependencies, store, missionId, now, cascadeBuiltin = false } = input;
+  await enqueueReadyTaskNodes(store, missionId, now.toISOString());
+  const [mission, stages, edges, agents, pending] = await Promise.all([
+    store.getMission(missionId), store.listStages(missionId), store.listEdges(missionId), store.listAgents(),
+    store.listPendingDispatches(80, now.toISOString()),
+  ]);
+  if (!mission) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+  const missionPending = pending.filter((item) => item.missionId === missionId);
+  const pendingStageIds = new Set(missionPending.map((item) => item.stageId));
+  const readyIds = new Set([
+    ...readyNodes(stages, edges).tasks.map((stage) => stage.id),
+    ...stages.filter((stage) => stage.nodeType === 'task' && stage.status === 'running' && pendingStageIds.has(stage.id)).map((stage) => stage.id),
+  ]);
+  const terminalItems = missionPending.filter((item) => {
+    const stage = stages.find((candidate) => candidate.id === item.stageId);
+    return !stage || stage.status === 'done' || stage.status === 'failed';
+  });
+  await Promise.all(terminalItems.map(async (item) => {
+    if (!await store.claimDispatch(item.id, now.toISOString())) return;
+    await store.completeDispatch(item.id, 'done', now.toISOString());
+  }));
+  const items = missionPending.filter((item) => readyIds.has(item.stageId));
+  const results = await Promise.all(items.map(async (item) => {
+    if (!await store.claimDispatch(item.id, now.toISOString())) {
+      return { stageId: item.stageId, error: { status: 409, code: 'STAGE_ALREADY_DISPATCHED', message: 'Dispatch was claimed by another worker' } };
+    }
+    const stage = stages.find((candidate) => candidate.id === item.stageId);
+    if (!stage) {
+      await store.completeDispatch(item.id, 'done', now.toISOString());
+      return { stageId: item.stageId, error: { status: 409, code: 'NODE_NOT_FOUND', message: 'Workflow node no longer exists' } };
+    }
+    try {
+      const result = await dispatchTaskNode({
+        request, env, dependencies, store, mission, stages, edges, agents, stage,
+        runId: item.runId, expiresAt: item.expiresAt, now,
+      });
+      await store.completeDispatch(item.id, 'done', (dependencies.now?.() ?? new Date()).toISOString());
+      return result;
+    } catch (error) {
+      await store.completeDispatch(item.id, 'done', (dependencies.now?.() ?? new Date()).toISOString());
+      return {
+        stageId: item.stageId,
+        error: { status: error instanceof ApiError ? error.status : 502, code: error instanceof ApiError ? error.code : 'DISPATCH_FAILED', message: error instanceof Error ? error.message : 'Dispatch failed' },
+      };
+    }
+  }));
+  if (cascadeBuiltin && results.some((result) => !('error' in result) && result.builtin && result.stage.status === 'done')) {
+    const downstream = await dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now: dependencies.now?.() ?? new Date(), cascadeBuiltin: true });
+    return [...results, ...downstream];
+  }
+  return results;
+}
+
+async function requireMissionAccess(store: PlatformStore, user: UserContext, missionId: string): Promise<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[]; agents: Agent[] }> {
   const mission = await store.getMission(missionId);
   if (!mission) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
-  const [stages, agents] = await Promise.all([store.listStages(missionId), store.listAgents()]);
+  const [stages, edges, agents] = await Promise.all([store.listStages(missionId), store.listEdges(missionId), store.listAgents()]);
   if (!canAccessMission(user, mission, agents, stages)) throw new ApiError(403, 'FORBIDDEN', 'You do not have access to this mission');
-  return { mission, stages, agents };
+  return { mission, stages, edges, agents };
 }
 
 async function runIdempotent(
@@ -885,31 +1487,9 @@ function missionStreamResponse(request: Request, env: Env, store: PlatformStore,
   });
 }
 
-function llmCompilationPrompt(mission: Mission): Array<{ role: 'system' | 'user'; content: string }> {
-  return [
-    {
-      role: 'system',
-      content: 'You compile goals into safe Agent workflows. Return JSON only with objective, acceptanceCriteria, risks, and stages. Each stage has name, purpose, category, budget, and input. Use 1-8 stages. Stage budgets may be relative; the platform normalizes them.',
-    },
-    {
-      role: 'user',
-      content: JSON.stringify({
-        title: mission.title,
-        description: mission.description,
-        category: mission.category,
-        tags: mission.tags,
-        budget: mission.budget,
-        deadline: mission.deadline,
-        priority: mission.priority,
-        expertise: mission.expertise,
-      }),
-    },
-  ];
-}
-
 export function createApp(dependencies: AppDependencies = {}) {
   return {
-    async fetch(request: Request, env: Env): Promise<Response> {
+    async fetch(request: Request, env: Env, executionContext?: WorkerExecutionContext): Promise<Response> {
       const requestId = crypto.randomUUID();
       const url = new URL(request.url);
       const { pathname } = url;
@@ -935,6 +1515,7 @@ export function createApp(dependencies: AppDependencies = {}) {
               ...(privyAuthConfigured ? ['privy'] : []),
             ],
             llmConfigured: Boolean(env.API_KEY && env.PROJECT_NAME),
+            agentCredentialsConfigured: await agentCredentialsConfigured(env),
             settlement: settlementDescriptor(env),
             testTopupEnabled: testTopupEnabled(env),
             realtime: 'sse_with_polling_fallback',
@@ -949,7 +1530,20 @@ export function createApp(dependencies: AppDependencies = {}) {
               'google_id_token',
               ...(isPrivyConfigured(env) ? ['email_otp', 'siwe_wallet', 'embedded_wallet'] : []),
             ],
-            orchestration: ['compile', 'candidate_matching', 'workflow_confirmation', 'agent_offer_acceptance', 'event_log'],
+            orchestration: [
+              'compile',
+              'candidate_matching',
+              'workflow_confirmation',
+              'agent_offer_acceptance',
+              'visual_dag',
+              'workflow_draft_versioning',
+              'manual_agent_assignment',
+              'parallel_dispatch',
+              'join_dependencies',
+              'approval_gates',
+              'explicit_node_retry',
+              'event_log',
+            ],
             identity: { canonicalProfiles: true, signedPrivyLinkedAccounts: true },
             settlement: settlementDescriptor(env),
             wallet: { web2Balance: true, testTopupEnabled: testTopupEnabled(env), testOnly: true, withdrawable: false },
@@ -1059,21 +1653,40 @@ export function createApp(dependencies: AppDependencies = {}) {
           const provided = request.headers.get('X-AgentMesh-Signature')?.trim() ?? '';
           const expected = await callbackToken(callbackSecret, missionId, stageId, agentId, runId, expiresAt);
           if (!provided || !safeEqual(provided, expected)) throw new ApiError(401, 'INVALID_CALLBACK_SIGNATURE', 'Invalid Agent callback signature');
-          const [mission, stages] = await Promise.all([store.getMission(missionId), store.listStages(missionId)]);
+          const [mission, stages, existingDeliverables] = await Promise.all([
+            store.getMission(missionId),
+            store.listStages(missionId),
+            store.listDeliverables(missionId),
+          ]);
           if (!mission) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
-          if (mission.status !== 'running') throw new ApiError(409, 'MISSION_NOT_RUNNING', 'Agent callbacks are accepted only while the mission is running');
-          if ((await store.getEscrow(missionId))?.status !== 'held') throw new ApiError(409, 'ESCROW_NOT_HELD', 'Agent callbacks are paused while escrow is not held');
           const stage = stages.find((candidate) => candidate.id === stageId);
           if (!stage || stage.agentId !== agentId) throw new ApiError(403, 'INVALID_ASSIGNMENT', 'Agent is not assigned to this stage');
-          if (stage.status !== 'running') throw new ApiError(409, 'INVALID_STAGE_TRANSITION', 'Agent callbacks require a currently running stage');
           const stageStatus = enumValue(body, 'status', ['running', 'done', 'failed'] as const);
-          const output = body.output === undefined ? undefined : recordValue(body, 'output');
-          const progress = body.progress === undefined ? undefined : finiteNumber(body, 'progress', mission.progress, 100);
+          const output = normalizeCallbackOutput(body.output === undefined ? undefined : recordValue(body, 'output'));
+          const callbackCreatedAt = (dependencies.now?.() ?? new Date()).toISOString();
+          const artifacts = callbackArtifacts(body, missionId, stageId, agentId, callbackCreatedAt);
+          if (artifacts.length > 0 && stageStatus !== 'done') {
+            throw new ApiError(400, 'INVALID_ARTIFACT_STATUS', 'Artifacts can only be submitted with a done callback');
+          }
+          if (stageStatus === 'done' && !hasMeaningfulStageOutput({ ...stage, status: 'done', output: output ?? null })) {
+            throw new ApiError(422, 'INVALID_COMPLETION_OUTPUT', 'A done callback requires a successful structured result with a summary and evidence');
+          }
+          const hasExistingStageArtifact = existingDeliverables.some((deliverable) => (
+            deliverable.stageId === stageId && deliverable.status !== 'rejected'
+          ));
+          if (stageStatus === 'done' && stageRequiresArtifact(stage, stages) && !hasExistingStageArtifact && artifacts.length === 0) {
+            throw new ApiError(422, 'ARTIFACT_REQUIRED', 'Implement nodes must submit at least one downloadable artifact before completion');
+          }
+          // Callback progress is scoped to the current node, not the mission's
+          // weighted aggregate. A newly-started downstream node may validly
+          // report a value lower than the mission's existing percentage.
+          const progress = body.progress === undefined ? undefined : finiteNumber(body, 'progress', 0, 100);
           const event: ExecutionEvent = {
             id: makeId('EVT'), missionId, stageId, type: `stage.${stageStatus}`,
             message: optionalString(body, 'message', 500) ?? `${stage.name} 状态更新为 ${stageStatus}`,
-            actorType: 'agent', actorId: agentId, payload: recordValue(body, 'payload'),
-            createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
+            actorType: 'agent', actorId: agentId,
+            payload: agentEventPayload(body, artifacts.length),
+            createdAt: callbackCreatedAt,
           };
           const callbackResult = await store.applyAgentCallback({
             runId,
@@ -1085,6 +1698,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             now: now.toISOString(),
             status: stageStatus,
             output,
+            artifacts,
             progress,
             currentStage: stageStatus === 'done' ? `${stage.name} 已完成` : `${stage.name} ${stageStatus}`,
             event,
@@ -1100,9 +1714,17 @@ export function createApp(dependencies: AppDependencies = {}) {
           const latestStages = await store.listStages(missionId);
           const deliverables = await store.listDeliverables(missionId);
           let latestMission = await store.getMission(missionId);
-          const workflowHasSignedOutputs = latestStages.length > 0 && latestStages.every(hasStructuredStageOutput);
-          if (latestStages.length > 0 && latestStages.every((item) => item.status === 'done') && (deliverables.length > 0 || workflowHasSignedOutputs)) {
+          const readiness = workflowDeliveryReadiness(latestStages, deliverables);
+          if (readiness.ready) {
             latestMission = await store.submitMissionForReview(missionId, reviewDueAt(now));
+          } else {
+            latestMission = await refreshWorkflowAggregate(store, missionId);
+            if (stageStatus === 'done') {
+              await enqueueReadyTaskNodes(store, missionId, now.toISOString());
+              if (executionContext) {
+                executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+              }
+            }
           }
           await deliverNotification(store, env, dependencies, {
             userId: mission.requesterId,
@@ -1185,6 +1807,26 @@ export function createApp(dependencies: AppDependencies = {}) {
           return success(request, env, requestId, await store.listAdminActions(queryLimit(url, 100, 200)));
         }
 
+        if (pathname === '/api/arbitration/members' && method === 'GET') {
+          if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
+          return success(request, env, requestId, await store.listArbitrationMembers());
+        }
+
+        const arbitrationMemberMatch = pathname.match(/^\/api\/arbitration\/members\/([^/]+)$/);
+        if (arbitrationMemberMatch && method === 'PUT') {
+          if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
+          const targetId = decodeURIComponent(arbitrationMemberMatch[1]);
+          const body = await readObject(request);
+          const member = await store.setArbitrationMember(
+            targetId,
+            requiredBoolean(body, 'active'),
+            user.id,
+            (dependencies.now?.() ?? new Date()).toISOString(),
+          );
+          if (!member) throw new ApiError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
+          return success(request, env, requestId, member);
+        }
+
         const adminRoleMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)\/role$/);
         if (adminRoleMatch && method === 'PUT') {
           if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
@@ -1262,18 +1904,20 @@ export function createApp(dependencies: AppDependencies = {}) {
               currentStage: '任务已编译，等待团队确认',
               team: [],
               compiledSpec: null,
+              workflowVersion: 1,
+              workflowViewport: { x: 0, y: 0, zoom: 1 },
               createdAt: now,
               updatedAt: now,
             };
-            const compilation = fallbackCompilation(mission);
+            const compilation = adaptiveFallbackCompilation(mission);
             mission.compiledSpec = compilation.spec;
-            const created = await store.createMission(mission, compilation.stages);
+            const created = await store.createMission(mission, compilation.stages, compilation.edges);
             await store.addEvent({
               id: makeId('EVT'), missionId: created.id, stageId: null, type: 'mission.created',
               message: '任务规格已创建并生成初始工作流', actorType: 'requester', actorId: user.id,
-              payload: { source: 'deterministic-fallback' }, createdAt: now,
+              payload: { source: 'adaptive-fallback' }, createdAt: now,
             });
-            return { status: 201, body: { mission: created, stages: compilation.stages } };
+            return { status: 201, body: { mission: created, stages: compilation.stages, edges: compilation.edges } };
           });
           return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
         }
@@ -1326,6 +1970,109 @@ export function createApp(dependencies: AppDependencies = {}) {
           return success(request, env, requestId, updated);
         }
 
+        const workflowDraftMatch = pathname.match(/^\/api\/missions\/([^/]+)\/workflow\/draft$/);
+        if (workflowDraftMatch && method === 'PUT') {
+          const missionId = decodeURIComponent(workflowDraftMatch[1]);
+          const context = await requireMissionAccess(store, user, missionId);
+          if (context.mission.requesterId !== user.id && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can edit the workflow');
+          if (!['draft', 'matching'].includes(context.mission.status) || (await store.getEscrow(missionId))?.status !== 'pending') {
+            throw new ApiError(409, 'WORKFLOW_LOCKED', 'The workflow cannot change after escrow funding starts');
+          }
+          const body = await readObject(request);
+          const draft = workflowDraftFromBody(body, context.mission, context.stages, now.toISOString());
+          let ordered: WorkflowStage[];
+          try {
+            ordered = validateWorkflowGraph({ mission: context.mission, stages: draft.stages, edges: draft.edges });
+          } catch (error) {
+            graphApiError(error);
+          }
+          const result = await store.saveWorkflowDraft(missionId, ordered, draft.edges, draft.viewport, draft.expectedVersion);
+          if (result.state === 'missing') throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+          if (result.state === 'locked') throw new ApiError(409, 'WORKFLOW_LOCKED', 'The workflow cannot change after escrow funding starts');
+          if (result.state === 'version_conflict') throw new ApiError(409, 'WORKFLOW_VERSION_CONFLICT', 'The workflow changed in another session; reload before saving', { currentVersion: (await store.getMission(missionId))?.workflowVersion });
+          await store.addEvent({
+            id: makeId('EVT'), missionId, stageId: null, type: 'workflow.draft_saved',
+            message: 'DAG 工作流草稿已保存', actorType: 'requester', actorId: user.id,
+            payload: { workflowVersion: result.mission.workflowVersion, nodeCount: ordered.length, edgeCount: draft.edges.length },
+            createdAt: now.toISOString(),
+          });
+          return success(request, env, requestId, { mission: result.mission, stages: ordered, edges: draft.edges });
+        }
+
+        const gateDecisionMatch = pathname.match(/^\/api\/missions\/([^/]+)\/gates\/([^/]+)\/decision$/);
+        if (gateDecisionMatch && method === 'POST') {
+          const missionId = decodeURIComponent(gateDecisionMatch[1]);
+          const gateId = decodeURIComponent(gateDecisionMatch[2]);
+          const context = await requireMissionAccess(store, user, missionId);
+          if (context.mission.requesterId !== user.id && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can decide an approval Gate');
+          if (context.mission.status !== 'running' || (await store.getEscrow(missionId))?.status !== 'held') {
+            throw new ApiError(409, 'MISSION_NOT_RUNNING', 'Gate decisions require a running funded mission');
+          }
+          const gate = context.stages.find((stage) => stage.id === gateId && stage.nodeType === 'approval');
+          if (!gate) throw new ApiError(404, 'GATE_NOT_FOUND', 'Approval Gate not found');
+          if (gate.status !== 'running') throw new ApiError(409, 'GATE_NOT_READY', 'Approval Gate is not waiting for a decision');
+          const body = await readObject(request);
+          const decision = enumValue(body, 'decision', ['approved', 'rejected'] as const);
+          const feedback = optionalString(body, 'feedback', 2_000);
+          const decidedAt = now.toISOString();
+          if (decision === 'approved') {
+            await store.updateStage(missionId, gateId, 'done', { decision, feedback, decidedAt, actorId: user.id });
+            await store.addEvent({
+              id: makeId('EVT'), missionId, stageId: gateId, type: 'gate.approved', message: `${gate.name} 已批准`,
+              actorType: 'requester', actorId: user.id, payload: { feedback }, createdAt: decidedAt,
+            });
+            await enqueueReadyTaskNodes(store, missionId, decidedAt);
+            if (executionContext) executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+          } else {
+            const reworkNodeIds = stringArray(body, 'reworkNodeIds', 30);
+            if (!feedback) throw new ApiError(400, 'GATE_FEEDBACK_REQUIRED', 'Rejecting a Gate requires written feedback');
+            const directUpstream = new Set(incomingStageIds(gateId, context.edges));
+            const eligible = new Set(context.stages.filter((stage) => stage.nodeType === 'task' && directUpstream.has(stage.id)).map((stage) => stage.id));
+            if (!reworkNodeIds.length) throw new ApiError(400, 'REWORK_NODE_REQUIRED', 'Rejecting a Gate requires at least one direct upstream task node');
+            if (reworkNodeIds.some((id) => !eligible.has(id))) throw new ApiError(400, 'INVALID_REWORK_NODE', 'Gate rework nodes must be direct upstream task nodes');
+            await store.updateStage(missionId, gateId, 'failed', { decision, feedback, reworkNodeIds, decidedAt, actorId: user.id });
+            await store.addEvent({
+              id: makeId('EVT'), missionId, stageId: gateId, type: 'gate.rejected', message: `${gate.name} 已驳回并要求返工`,
+              actorType: 'requester', actorId: user.id,
+              payload: { feedback, reworkNodeIds, priorOutputs: Object.fromEntries(context.stages.filter((stage) => reworkNodeIds.includes(stage.id)).map((stage) => [stage.id, stage.output])) },
+              createdAt: decidedAt,
+            });
+            await store.resetWorkflowNodes(missionId, reworkNodeIds, gateId);
+            await enqueueReadyTaskNodes(store, missionId, decidedAt);
+            if (executionContext) executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+          }
+          let updatedMission = await refreshWorkflowAggregate(store, missionId);
+          const latestGateStages = await store.listStages(missionId);
+          if (decision === 'approved' && latestGateStages.length > 0 && latestGateStages.every((stage) => stage.status === 'done')) {
+            updatedMission = await store.submitMissionForReview(missionId, reviewDueAt(now));
+          }
+          return success(request, env, requestId, {
+            mission: updatedMission,
+            stages: latestGateStages,
+            edges: context.edges,
+          });
+        }
+
+        const retryNodeMatch = pathname.match(/^\/api\/missions\/([^/]+)\/nodes\/([^/]+)\/retry$/);
+        if (retryNodeMatch && method === 'POST') {
+          const missionId = decodeURIComponent(retryNodeMatch[1]);
+          const stageId = decodeURIComponent(retryNodeMatch[2]);
+          const context = await requireMissionAccess(store, user, missionId);
+          if (context.mission.requesterId !== user.id && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can retry a task node');
+          if (context.mission.status !== 'running' || (await store.getEscrow(missionId))?.status !== 'held') throw new ApiError(409, 'MISSION_NOT_RUNNING', 'Retry requires a running funded mission');
+          const stage = context.stages.find((candidate) => candidate.id === stageId && candidate.nodeType === 'task');
+          if (!stage) throw new ApiError(404, 'NODE_NOT_FOUND', 'Task node not found');
+          if (stage.status !== 'failed') throw new ApiError(409, 'NODE_NOT_FAILED', 'Only a failed task node can be retried');
+          await store.resetWorkflowNodes(missionId, [stageId]);
+          await store.addEvent({
+            id: makeId('EVT'), missionId, stageId, type: 'node.retry_requested', message: `${stage.name} 已请求重试`,
+            actorType: 'requester', actorId: user.id, payload: {}, createdAt: now.toISOString(),
+          });
+          await enqueueReadyTaskNodes(store, missionId, now.toISOString());
+          if (executionContext) executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+          return success(request, env, requestId, { mission: await refreshWorkflowAggregate(store, missionId), stages: await store.listStages(missionId), edges: context.edges });
+        }
+
         const missionActionMatch = pathname.match(/^\/api\/missions\/([^/]+)\/(compile|candidates|workflow|start|dispatch|events|deliverables|review|accept|disputes)$/);
         if (missionActionMatch) {
           const missionId = decodeURIComponent(missionActionMatch[1]);
@@ -1337,18 +2084,41 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (!['draft', 'matching'].includes(context.mission.status) || (await store.getEscrow(missionId))?.status !== 'pending') {
               throw new ApiError(409, 'WORKFLOW_LOCKED', 'The workflow cannot change after escrow funding starts');
             }
-            const llm = await callPinmeLlm(env, llmCompilationPrompt(context.mission));
-            const compiled = llm.content ? parseLlmCompilation(llm.content, context.mission) : null;
-            const result = compiled ?? fallbackCompilation(context.mission);
-            const saved = await store.saveCompilation(missionId, result.spec, result.stages);
-            if (!saved) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+            const compiler = await compileWorkflowWithLangGraph(
+              context.mission,
+              (messages) => (dependencies.llmCaller ?? callPinmeLlm)(env, messages),
+            );
+            let result = compiler.compilation;
+            let compilationSource = compiler.source;
+            let compilerMetadata: WorkflowCompilerMetadata = compiler.metadata;
+            let ordered: WorkflowStage[];
+            try {
+              ordered = validateWorkflowGraph({ mission: context.mission, stages: result.stages, edges: result.edges });
+            } catch (error) {
+              result = adaptiveFallbackCompilation(context.mission);
+              compilationSource = 'adaptive-fallback';
+              ordered = result.stages;
+              compilerMetadata = {
+                ...compilerMetadata,
+                fallbackReason: error instanceof Error ? error.message.slice(0, 1_000) : 'Final workflow validation failed.',
+                warnings: [...compilerMetadata.warnings, 'Final workflow validation failed; adaptive fallback was used.'].slice(0, 8),
+              };
+              result.spec = { ...result.spec, source: compilationSource, compiler: compilerMetadata };
+            }
+            const saved = await store.saveCompilation(missionId, result.spec, ordered, result.edges, context.mission.workflowVersion);
+            if (saved.state === 'missing') throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+            if (saved.state === 'locked') throw new ApiError(409, 'WORKFLOW_LOCKED', 'The workflow cannot change after escrow funding starts');
+            if (saved.state === 'version_conflict') throw new ApiError(409, 'WORKFLOW_VERSION_CONFLICT', 'The workflow changed while AI was compiling it; retry from the latest version');
             await store.addEvent({
               id: makeId('EVT'), missionId, stageId: null, type: 'mission.compiled',
-              message: compiled ? 'PinMe LLM 已生成任务工作流' : '已使用可靠降级策略生成任务工作流',
-              actorType: 'platform', actorId: null, payload: { source: compiled ? 'pinme-llm' : 'fallback', llmError: llm.error ?? null },
+              message: compilationSource === 'langgraph-planner' ? 'LangGraph 已生成并校验智能 DAG 工作流' : '已使用自适应降级策略生成 DAG 工作流',
+              actorType: 'platform', actorId: null, payload: { source: compilationSource, compiler: compilerMetadata },
               createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
             });
-            return success(request, env, requestId, { mission: saved, stages: result.stages }, 200, { source: compiled ? 'pinme-llm' : 'fallback' });
+            return success(request, env, requestId, { mission: saved.mission, stages: ordered, edges: result.edges }, 200, {
+              source: compilationSource,
+              compiler: compilerMetadata,
+            });
           }
 
           if (action === 'candidates' && method === 'GET') {
@@ -1362,16 +2132,39 @@ export function createApp(dependencies: AppDependencies = {}) {
             }
             const body = await readObject(request);
             const assignments = recordValue(body, 'assignments');
+            const existingOffers = await store.listStageOffers(missionId, now.toISOString());
+            const canReissueOffers = existingOffers.some((offer) => offer.status === 'declined' || offer.status === 'expired');
+            if (existingOffers.length && !canReissueOffers) {
+              const assignmentsUnchanged = context.stages
+                .filter((stage) => stage.nodeType === 'task')
+                .every((stage) => assignments[stage.id] === undefined || assignments[stage.id] === stage.agentId);
+              if (!assignmentsUnchanged) {
+                throw new ApiError(409, 'WORKFLOW_OFFERS_ACTIVE', 'Save the updated workflow before sending a new set of invitations');
+              }
+              return success(request, env, requestId, {
+                mission: context.mission,
+                stages: context.stages,
+                edges: context.edges,
+                offers: existingOffers,
+                escrow: await store.getEscrow(missionId),
+              }, 200, { replayed: true });
+            }
             const activeAgents = new Map(context.agents.filter((agent) => agent.status === 'active').map((agent) => [agent.id, agent]));
             const updatedStages = context.stages.map((stage) => {
-              const agentId = typeof assignments[stage.id] === 'string' ? String(assignments[stage.id]) : '';
-              if (!agentId || !activeAgents.has(agentId)) throw new ApiError(400, 'INVALID_ASSIGNMENT', `Stage ${stage.id} requires an active Agent`);
-              return { ...stage, agentId, updatedAt: (dependencies.now?.() ?? new Date()).toISOString() };
+              if (stage.nodeType === 'approval') return { ...stage, agentId: null, budget: 0, updatedAt: now.toISOString() };
+              const assigned = typeof assignments[stage.id] === 'string' ? String(assignments[stage.id]) : stage.agentId;
+              return { ...stage, agentId: assigned || null, updatedAt: now.toISOString() };
             });
-            const team = [...new Set(updatedStages.map((stage) => stage.agentId).filter((id): id is string => Boolean(id)))];
+            let orderedStages: WorkflowStage[];
+            try {
+              orderedStages = validateWorkflowGraph({ mission: context.mission, stages: updatedStages, edges: context.edges, agents: context.agents, requireAssignments: true });
+            } catch (error) {
+              graphApiError(error);
+            }
+            const team = [...new Set(orderedStages.map((stage) => stage.agentId).filter((id): id is string => Boolean(id)))];
             const createdAt = now.toISOString();
             const expiresAt = new Date(now.getTime() + OFFER_WINDOW_MS).toISOString();
-            const offers = updatedStages.map<StageOffer>((stage) => {
+            const offers = orderedStages.filter((stage) => stage.nodeType === 'task').map<StageOffer>((stage) => {
               const autoAccepted = Boolean(builtinAgentKind(activeAgents.get(stage.agentId!)!));
               return {
                 id: makeId('OFFER'), missionId, stageId: stage.id, agentId: stage.agentId!,
@@ -1382,7 +2175,7 @@ export function createApp(dependencies: AppDependencies = {}) {
                 updatedAt: createdAt,
               };
             });
-            const saved = await store.confirmWorkflow(missionId, updatedStages, team, offers);
+            const saved = await store.confirmWorkflow(missionId, orderedStages, team, offers);
             if (!saved) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
             const autoAcceptedCount = offers.filter((offer) => offer.status === 'accepted').length;
             await store.addEvent({
@@ -1396,7 +2189,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             await Promise.all(offers.map(async (offer) => {
               if (offer.status === 'accepted') return;
               const agent = activeAgents.get(offer.agentId);
-              const stage = updatedStages.find((candidate) => candidate.id === offer.stageId);
+              const stage = orderedStages.find((candidate) => candidate.id === offer.stageId);
               if (!agent) return;
               await deliverNotification(store, env, dependencies, {
                 userId: agent.ownerId,
@@ -1406,12 +2199,12 @@ export function createApp(dependencies: AppDependencies = {}) {
                 tone: 'info',
               });
             }));
-            return success(request, env, requestId, { mission: saved, stages: updatedStages, offers, escrow: await store.getEscrow(missionId) });
+            return success(request, env, requestId, { mission: saved, stages: orderedStages, edges: context.edges, offers, escrow: await store.getEscrow(missionId) });
           }
 
           if (action === 'start' && method === 'POST') {
             if (context.mission.requesterId !== user.id && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can start execution');
-            if (context.stages.some((stage) => !stage.agentId)) throw new ApiError(409, 'WORKFLOW_INCOMPLETE', 'Every stage must have an assigned Agent');
+            if (context.stages.some((stage) => stage.nodeType === 'task' && !stage.agentId)) throw new ApiError(409, 'WORKFLOW_INCOMPLETE', 'Every task node must have an assigned Agent');
             const body = await readObject(request);
             const depositTxHash = optionalString(body, 'depositTxHash', 200);
             const existingEscrow = await store.getEscrow(missionId);
@@ -1425,7 +2218,8 @@ export function createApp(dependencies: AppDependencies = {}) {
               throw new ApiError(409, 'MISSION_ALREADY_STARTED', 'Mission funding has already started or is no longer available');
             }
             const offers = await store.listStageOffers(missionId, now.toISOString());
-            const offersAccepted = context.stages.length > 0 && context.stages.every((stage) => offers.some((offer) => (
+            const taskStages = context.stages.filter((stage) => stage.nodeType === 'task');
+            const offersAccepted = taskStages.length > 0 && taskStages.every((stage) => offers.some((offer) => (
               offer.stageId === stage.id && offer.agentId === stage.agentId && offer.status === 'accepted'
             )));
             if (!offersAccepted) throw new ApiError(409, 'OFFERS_NOT_ACCEPTED', 'Every assigned Agent must accept a valid stage offer before funding starts');
@@ -1442,7 +2236,7 @@ export function createApp(dependencies: AppDependencies = {}) {
               if (!depositTxHash) throw new ApiError(400, 'DEPOSIT_TX_REQUIRED', 'A verified escrow deposit transaction is required');
               let settlementPlan;
               try {
-                settlementPlan = buildSettlementPlan(context.stages, context.agents);
+                settlementPlan = buildSettlementPlan(context.stages.filter((stage) => stage.nodeType === 'task'), context.agents);
               } catch (error) {
                 throw new ApiError(409, 'INVALID_SETTLEMENT_PLAN', error instanceof Error ? error.message : 'The settlement plan is invalid');
               }
@@ -1495,6 +2289,10 @@ export function createApp(dependencies: AppDependencies = {}) {
               payload: { depositTxHash, payoutHash, requesterWalletAddress, paymentMethod: context.mission.paymentMethod, settlementMode: settlementDescriptor(env).mode, chainVerification },
               createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
             }, 1, '执行网络已启动');
+            await enqueueReadyTaskNodes(store, missionId, now.toISOString());
+            if (executionContext) {
+              executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+            }
             return success(request, env, requestId, { mission: saved, escrow: await store.getEscrow(missionId), pollAfterMs: 3000 });
           }
 
@@ -1502,195 +2300,26 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (context.mission.requesterId !== user.id && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can dispatch execution');
             if (context.mission.status !== 'running') throw new ApiError(409, 'MISSION_NOT_RUNNING', 'Mission must be running before dispatch');
             if ((await store.getEscrow(missionId))?.status !== 'held') throw new ApiError(409, 'ESCROW_NOT_HELD', 'Mission escrow must be held before dispatch');
-            const callbackSecret = env.AGENT_WEBHOOK_SECRET?.trim() || env.API_KEY?.trim();
-            if (!callbackSecret) throw new ApiError(503, 'CALLBACK_SIGNING_UNAVAILABLE', 'Agent callback signing is not configured');
-            const nextStage = context.stages.find((stage, index) => (
-              (stage.status === 'queued' || stage.status === 'failed')
-              && context.stages.slice(0, index).every((previous) => previous.status === 'done')
-            ));
-            if (!nextStage) throw new ApiError(409, 'NO_RUNNABLE_STAGE', 'No workflow stage is ready to dispatch');
-            if (!nextStage.agentId) throw new ApiError(409, 'WORKFLOW_INCOMPLETE', 'Runnable stage has no assigned Agent');
-            const agent = context.agents.find((candidate) => candidate.id === nextStage.agentId);
-            if (!agent || agent.status !== 'active') throw new ApiError(409, 'AGENT_UNAVAILABLE', 'Assigned Agent is not active');
-            const builtinKind = builtinAgentKind(agent);
-            if (!builtinKind) await (dependencies.endpointValidator ?? validateAgentEndpointResolution)(agent.endpoint, env);
-            const credentialHeaders = builtinKind ? {} : agentCredentialHeaders(env, agent);
-            const claimedStage = await store.claimStageForDispatch(missionId, nextStage.id);
-            if (!claimedStage) throw new ApiError(409, 'STAGE_ALREADY_DISPATCHED', 'This workflow stage is already running or completed');
-            const runId = crypto.randomUUID();
-            const expiresAt = new Date(now.getTime() + 60 * 60 * 1_000).toISOString();
-            const token = await callbackToken(callbackSecret, missionId, nextStage.id, agent.id, runId, expiresAt);
-            try {
-              await store.createAgentDispatch({ runId, missionId, stageId: nextStage.id, agentId: agent.id, expiresAt });
-            } catch (error) {
-              await store.resetStageDispatch(missionId, nextStage.id);
-              throw error;
+            const queuedReady = readyNodes(context.stages, context.edges).tasks;
+            if (!queuedReady.length) {
+              const pending = await store.listPendingDispatches(80, now.toISOString());
+              const pendingIds = new Set(pending.filter((item) => item.missionId === missionId).map((item) => item.stageId));
+              const recovering = context.stages.some((stage) => stage.nodeType === 'task' && stage.status === 'running' && pendingIds.has(stage.id));
+              if (!recovering) throw new ApiError(409, 'NO_RUNNABLE_NODE', 'No queued workflow task node is ready to dispatch; failed nodes require an explicit retry');
             }
-            if (builtinKind) {
-              try {
-                const completed = await completeBuiltinAgentDispatch({
-                  request,
-                  env,
-                  dependencies,
-                  store,
-                  mission: context.mission,
-                  stages: context.stages,
-                  stage: claimedStage,
-                  agent,
-                  runId,
-                  expiresAt,
-                  now,
-                });
-                return success(request, env, requestId, {
-                  stage: completed.stage,
-                  mission: completed.mission,
-                  agent: { id: agent.id, name: agent.name },
-                  acknowledgement: completed.acknowledgement,
-                }, 202, { builtin: true });
-              } catch (error) {
-                const failedAt = (dependencies.now?.() ?? new Date()).toISOString();
-                const failedStage = await store.transitionRunningStage(missionId, nextStage.id, 'failed', {
-                  error: error instanceof Error ? error.message : 'Official Agent execution failed',
-                  builtin: true,
-                });
-                await store.completeAgentDispatch(runId, failedAt);
-                if (failedStage) {
-                  await store.addEvent({
-                    id: makeId('EVT'), missionId, stageId: nextStage.id, type: 'dispatch.failed',
-                    message: `${agent.name} 官方运行时执行失败`, actorType: 'platform', actorId: null,
-                    payload: { builtin: true }, createdAt: failedAt,
-                  });
-                }
-                if (error instanceof ApiError) throw error;
-                throw new ApiError(502, 'BUILTIN_AGENT_FAILED', 'The official test Agent could not complete this stage');
-              }
-            }
-            const callbackUrl = `${url.origin}/api/hooks/agents/${encodeURIComponent(agent.id)}/events`;
-            const upstream = context.stages
-              .filter((stage) => stage.position < nextStage.position && stage.status === 'done')
-              .map((stage) => ({
-                id: stage.id,
-                name: stage.name,
-                purpose: stage.purpose,
-                output: stage.output,
-              }));
-            const dispatchBody = JSON.stringify({
-              task: {
-                mission: {
-                  id: context.mission.id,
-                  title: context.mission.title,
-                  description: context.mission.description,
-                  category: context.mission.category,
-                  tags: context.mission.tags,
-                  deadline: context.mission.deadline,
-                  priority: context.mission.priority,
-                  expertise: context.mission.expertise,
-                },
-                stage: {
-                  id: nextStage.id,
-                  position: nextStage.position,
-                  totalStages: context.stages.length,
-                  name: nextStage.name,
-                  purpose: nextStage.purpose,
-                  category: nextStage.category,
-                  budget: nextStage.budget,
-                  input: nextStage.input,
-                },
-                upstream,
-              },
-              callback: { url: callbackUrl, signature: token, runId, expiresAt, callbackIdRequired: true },
-            });
-            let dispatchResponse: Response | null = null;
-            for (let attempt = 1; attempt <= 2; attempt += 1) {
-              try {
-                dispatchResponse = await (dependencies.fetcher ?? fetch)(agent.endpoint, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'X-AgentMesh-Task-Id': runId,
-                    ...credentialHeaders,
-                  },
-                  body: dispatchBody,
-                  signal: AbortSignal.timeout(15_000),
-                });
-                if (dispatchResponse.ok || dispatchResponse.status < 500 || attempt === 2) break;
-              } catch {
-                dispatchResponse = null;
-                if (attempt === 2) break;
-              }
-              await sleep(250 * attempt);
-            }
-            if (!dispatchResponse) {
-              const failedAt = (dependencies.now?.() ?? new Date()).toISOString();
-              const failedStage = await store.transitionRunningStage(missionId, nextStage.id, 'failed', {
-                error: 'Agent endpoint could not be reached after two attempts',
-                retryable: true,
-              });
-              await store.completeAgentDispatch(runId, now.toISOString());
-              if (!failedStage) {
-                const callbackStage = (await store.listStages(missionId)).find((stage) => stage.id === nextStage.id);
-                if (callbackStage && (callbackStage.status === 'done' || callbackStage.status === 'failed')) {
-                  return success(request, env, requestId, { stage: callbackStage, agent: { id: agent.id, name: agent.name }, acknowledgement: null }, 202, { callbackWon: true });
-                }
-              }
-              await store.addEvent({
-                id: makeId('EVT'), missionId, stageId: nextStage.id, type: 'dispatch.failed',
-                message: `${agent.name} 端点重试后仍不可用，可重新派发`, actorType: 'platform', actorId: null,
-                payload: { attempts: 2, retryable: true }, createdAt: failedAt,
-              }, undefined, `${nextStage.name} 派发失败，可重试`, 'failed');
-              throw new ApiError(502, 'AGENT_UNAVAILABLE', 'Agent endpoint could not be reached. The failed stage can be retried.');
-            }
-            if (!dispatchResponse.ok) {
-              const failedAt = (dependencies.now?.() ?? new Date()).toISOString();
-              const authenticationRejected = dispatchResponse.status === 401 || dispatchResponse.status === 403;
-              const authenticationMisconfigured = authenticationRejected && agent.authType === 'none';
-              const failedStage = await store.transitionRunningStage(missionId, nextStage.id, 'failed', {
-                error: authenticationMisconfigured
-                  ? 'Agent endpoint requires authentication but the Agent is registered without credentials'
-                  : `Agent endpoint returned HTTP ${dispatchResponse.status}`,
-                httpStatus: dispatchResponse.status,
-                authType: agent.authType,
-                retryable: true,
-              });
-              await store.completeAgentDispatch(runId, now.toISOString());
-              if (!failedStage) {
-                const callbackStage = (await store.listStages(missionId)).find((stage) => stage.id === nextStage.id);
-                if (callbackStage && (callbackStage.status === 'done' || callbackStage.status === 'failed')) {
-                  return success(request, env, requestId, { stage: callbackStage, agent: { id: agent.id, name: agent.name }, acknowledgement: null }, 202, { callbackWon: true });
-                }
-              }
-              await store.addEvent({
-                id: makeId('EVT'), missionId, stageId: nextStage.id,
-                type: authenticationRejected ? 'dispatch.authentication_failed' : 'dispatch.failed',
-                message: authenticationMisconfigured
-                  ? `${agent.name} 端点要求鉴权，但平台登记为无鉴权`
-                  : `${agent.name} 拒绝了阶段任务，可重新派发`,
-                actorType: 'platform', actorId: null,
-                payload: { httpStatus: dispatchResponse.status, authType: agent.authType, retryable: true },
-                createdAt: failedAt,
-              }, undefined, `${nextStage.name} 派发失败，可重试`, 'failed');
-              if (authenticationMisconfigured) {
-                throw new ApiError(409, 'AGENT_AUTH_CONFIGURATION_REQUIRED', 'Agent endpoint requires a Bearer credential, but this Agent is registered with no authentication. Configure the Agent credential before retrying.');
-              }
-              if (authenticationRejected) {
-                throw new ApiError(502, 'AGENT_AUTH_REJECTED', `Agent endpoint rejected the configured ${agent.authType} credential. The failed stage can be retried after the credential is corrected.`);
-              }
-              throw new ApiError(502, 'AGENT_REJECTED_TASK', `Agent endpoint returned HTTP ${dispatchResponse.status}. The failed stage can be retried.`);
-            }
-            const responseText = await readLimitedResponse(dispatchResponse);
-            let acknowledgement: unknown = responseText;
-            try {
-              acknowledgement = responseText ? JSON.parse(responseText) : null;
-            } catch {
-              // Plain-text acknowledgements are valid.
-            }
-            const updatedStage = (await store.listStages(missionId)).find((stage) => stage.id === nextStage.id) ?? claimedStage;
-            await store.addEvent({
-              id: makeId('EVT'), missionId, stageId: nextStage.id, type: 'dispatch.accepted',
-              message: `${agent.name} 已接收任务`, actorType: 'platform', actorId: null,
-              payload: { acknowledgement, runId, expiresAt }, createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
-            }, context.mission.progress, `${agent.name} 正在执行 ${nextStage.name}`);
-            return success(request, env, requestId, { stage: updatedStage, agent: { id: agent.id, name: agent.name }, acknowledgement }, 202);
+            const dispatches = await dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now });
+            if (!dispatches.length) throw new ApiError(409, 'NO_RUNNABLE_NODE', 'No workflow task node is ready to dispatch');
+            const first = dispatches[0];
+            if (dispatches.length === 1 && 'error' in first) throw new ApiError(first.error.status, first.error.code, first.error.message);
+            const firstSuccess = dispatches.find((item): item is NodeDispatchResult => !('error' in item));
+            return success(request, env, requestId, {
+              dispatches,
+              // Compatibility fields for clients that still consume one linear stage.
+              stage: firstSuccess?.stage ?? null,
+              mission: firstSuccess?.mission ?? await store.getMission(missionId),
+              agent: firstSuccess?.agent ?? null,
+              acknowledgement: firstSuccess?.acknowledgement ?? null,
+            }, 202, { count: dispatches.length, parallel: dispatches.length > 1, builtin: firstSuccess?.builtin ?? false });
           }
 
           if (action === 'events' && method === 'GET') {
@@ -1787,10 +2416,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             const escrow = await store.getEscrow(missionId);
             if (escrow?.status !== 'held') throw new ApiError(409, 'ESCROW_NOT_HELD', 'Mission escrow must be held before review');
             const deliverables = await store.listDeliverables(missionId);
-            if (context.stages.some((stage) => stage.status !== 'done')) throw new ApiError(409, 'WORKFLOW_INCOMPLETE', 'Every workflow stage must be completed before review');
-            if (deliverables.length === 0 && !context.stages.every(hasStructuredStageOutput)) {
-              throw new ApiError(409, 'DELIVERABLE_REQUIRED', 'A submitted deliverable or signed structured output from every stage is required before review');
-            }
+            requireWorkflowDelivery(context.stages, deliverables);
             const saved = await store.submitMissionForReview(missionId, reviewDueAt(now));
             await deliverNotification(store, env, dependencies, {
               userId: context.mission.requesterId,
@@ -1807,9 +2433,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (context.mission.status === 'completed') return success(request, env, requestId, await missionDetail(store, context.mission, now.toISOString()), 200, { replayed: true });
             if (context.mission.status !== 'review') throw new ApiError(409, 'MISSION_NOT_REVIEWABLE', 'Mission must be in review before acceptance');
             const deliverables = await store.listDeliverables(missionId);
-            if (deliverables.length === 0 && !context.stages.every(hasStructuredStageOutput)) {
-              throw new ApiError(409, 'DELIVERABLE_REQUIRED', 'No submitted deliverable or complete signed Agent output is available for acceptance');
-            }
+            requireWorkflowDelivery(context.stages, deliverables);
             const escrow = await store.getEscrow(missionId);
             if (!escrow) throw new ApiError(404, 'ESCROW_NOT_FOUND', 'Mission escrow not found');
             if (escrow.status === 'frozen') throw new ApiError(409, 'ESCROW_FROZEN', 'Resolve the active dispute before accepting this mission');
@@ -1830,7 +2454,10 @@ export function createApp(dependencies: AppDependencies = {}) {
               if (!releaseTxHash) throw new ApiError(400, 'RELEASE_TX_REQUIRED', 'A verified escrow release transaction is required');
               let settlementPlan;
               try {
-                settlementPlan = buildSettlementPlan(context.stages, context.agents);
+                settlementPlan = buildSettlementPlan(
+                  context.stages.filter((stage) => stage.nodeType === 'task'),
+                  context.agents,
+                );
               } catch (error) {
                 throw new ApiError(409, 'INVALID_SETTLEMENT_PLAN', error instanceof Error ? error.message : 'The settlement plan is invalid');
               }
@@ -1987,7 +2614,7 @@ export function createApp(dependencies: AppDependencies = {}) {
                 headers: {
                   'Content-Type': 'application/json',
                   'X-AgentMesh-Trial': challenge,
-                  ...agentCredentialHeaders(env, agent),
+                  ...await agentCredentialHeaders(env, agent),
                 },
                 body: JSON.stringify({
                   type: 'agentmesh.trial.v1',
@@ -1996,7 +2623,8 @@ export function createApp(dependencies: AppDependencies = {}) {
                 }),
                 signal: AbortSignal.timeout(15_000),
               });
-            } catch {
+            } catch (error) {
+              if (error instanceof ApiError) throw error;
               throw new ApiError(502, 'AGENT_TRIAL_UNREACHABLE', 'The Agent endpoint could not be reached during the live trial');
             }
             if (!trialResponse.ok) throw new ApiError(502, 'AGENT_TRIAL_REJECTED', `The Agent endpoint returned HTTP ${trialResponse.status} during trial`);
@@ -2057,7 +2685,7 @@ export function createApp(dependencies: AppDependencies = {}) {
           return success(request, env, requestId, await store.listDisputes(user));
         }
 
-        const disputeActionMatch = pathname.match(/^\/api\/disputes\/([^/]+)\/(actions|review|resolve)$/);
+        const disputeActionMatch = pathname.match(/^\/api\/disputes\/([^/]+)\/(actions|governance|review|votes|finalize|resolve)$/);
         if (disputeActionMatch) {
           const disputeId = decodeURIComponent(disputeActionMatch[1]);
           const action = disputeActionMatch[2];
@@ -2068,11 +2696,40 @@ export function createApp(dependencies: AppDependencies = {}) {
             return success(request, env, requestId, await store.listDisputeActions(disputeId));
           }
 
+          const arbitrationNow = (dependencies.now?.() ?? new Date()).toISOString();
+          if (action === 'governance' && method === 'GET') {
+            const governance = await store.getDisputeGovernance(disputeId, user.id, arbitrationNow);
+            if (!governance) throw new ApiError(404, 'DISPUTE_NOT_FOUND', 'Dispute not found');
+            return success(request, env, requestId, governance);
+          }
+
+          if (action === 'votes' && method === 'POST') {
+            const body = await readObject(request);
+            const choice = enumValue(body, 'choice', ['support_refund', 'oppose_refund', 'abstain'] as const);
+            const reason = requiredString(body, 'reason', 12, 2_000);
+            const result = await store.castDisputeVote(disputeId, user.id, choice, reason, arbitrationNow);
+            if (result.state === 'missing') throw new ApiError(404, 'PROPOSAL_NOT_FOUND', 'Arbitration proposal not found');
+            if (result.state === 'not_eligible') throw new ApiError(403, 'ARBITRATION_NOT_ELIGIBLE', 'This account is not in the proposal electorate snapshot');
+            if (result.state === 'already_voted') throw new ApiError(409, 'ARBITRATION_ALREADY_VOTED', 'Each electorate member can vote only once');
+            if (result.state === 'expired') throw new ApiError(409, 'ARBITRATION_VOTING_ENDED', 'The voting period has ended');
+            if (result.state === 'closed') throw new ApiError(409, 'ARBITRATION_PROPOSAL_CLOSED', 'The arbitration proposal is already finalized');
+            return success(request, env, requestId, result.governance, 201);
+          }
+
           if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
           if (action === 'review' && method === 'POST') {
-            if (accessible.status === 'reviewing') return success(request, env, requestId, accessible, 200, { replayed: true });
-            if (accessible.status !== 'open') throw new ApiError(409, 'DISPUTE_CLOSED', 'Only open disputes can enter review');
-            const dispute = await store.startDisputeReview(disputeId, user.id);
+            if (!['open', 'reviewing'].includes(accessible.status)) throw new ApiError(409, 'DISPUTE_CLOSED', 'Only open disputes can enter review');
+            const existingGovernance = await store.getDisputeGovernance(disputeId, user.id, arbitrationNow);
+            if (existingGovernance?.proposal) return success(request, env, requestId, accessible, 200, { replayed: true });
+            let dispute;
+            try {
+              dispute = await store.startDisputeReview(disputeId, user.id, arbitrationNow);
+            } catch (reviewError) {
+              if (reviewError instanceof Error && reviewError.message.includes('ARBITRATION_NO_ELIGIBLE_MEMBERS')) {
+                throw new ApiError(409, 'ARBITRATION_NO_ELIGIBLE_MEMBERS', '至少需要一名与案件无利益冲突的活跃仲裁委员');
+              }
+              throw reviewError;
+            }
             await deliverNotification(store, env, dependencies, {
               userId: accessible.openedBy,
               category: 'settlement',
@@ -2081,6 +2738,13 @@ export function createApp(dependencies: AppDependencies = {}) {
               tone: 'info',
             });
             return success(request, env, requestId, dispute);
+          }
+
+          if (action === 'finalize' && method === 'POST') {
+            const result = await store.finalizeDisputeProposal(disputeId, user.id, arbitrationNow);
+            if (result.state === 'missing') throw new ApiError(404, 'PROPOSAL_NOT_FOUND', 'Arbitration proposal not found');
+            if (result.state === 'not_ready') throw new ApiError(409, 'ARBITRATION_VOTE_NOT_READY', 'Voting is still active and the result is not irreversible');
+            return success(request, env, requestId, result.governance);
           }
 
           if (action === 'resolve' && method === 'POST') {
@@ -2092,6 +2756,13 @@ export function createApp(dependencies: AppDependencies = {}) {
             const status = enumValue(body, 'status', ['resolved', 'rejected'] as const);
             const resolution = requiredString(body, 'resolution', 20, 4_000);
             const resolutionTxHash = optionalString(body, 'resolutionTxHash', 200);
+            const governance = await store.getDisputeGovernance(disputeId, user.id, arbitrationNow);
+            const authorized = status === 'resolved'
+              ? governance?.proposal?.status === 'succeeded' && governance.proposal.outcome === 'refund_requester'
+              : governance?.proposal?.status === 'defeated' && governance.proposal.outcome === 'reject_dispute';
+            if (!authorized) {
+              throw new ApiError(409, 'ARBITRATION_AUTHORIZATION_REQUIRED', 'A finalized DAO vote matching this ruling is required');
+            }
             const mission = await store.getMission(accessible.missionId);
             const escrow = await store.getEscrow(accessible.missionId);
             if (!mission || !escrow) throw new ApiError(404, 'MISSION_NOT_FOUND', 'The disputed mission or escrow no longer exists');
@@ -2156,6 +2827,18 @@ export function createApp(dependencies: AppDependencies = {}) {
       } catch (error) {
         if (error instanceof ApiError) return failure(request, env, requestId, error);
         return failure(request, env, requestId, new ApiError(500, 'INTERNAL_ERROR', 'Internal server error'));
+      }
+    },
+    async scheduled(_controller: unknown, env: Env, executionContext: WorkerExecutionContext): Promise<void> {
+      const store = getStore(env, dependencies);
+      const now = dependencies.now?.() ?? new Date();
+      const pending = await store.listPendingDispatches(80, now.toISOString());
+      const missionIds = [...new Set(pending.map((item) => item.missionId))];
+      const configuredOrigin = env.PUBLIC_BASE_URL?.trim()
+        || (env.PROJECT_NAME?.trim() ? `https://${env.PROJECT_NAME.trim()}.api.pinme.pro` : 'https://agentmesh.invalid');
+      for (const missionId of missionIds) {
+        const request = new Request(`${configuredOrigin.replace(/\/$/, '')}/api/internal/workflow-dispatch`);
+        executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
       }
     },
   };

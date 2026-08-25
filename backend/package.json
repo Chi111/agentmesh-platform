@@ -12,7 +12,9 @@
     "wrangler": "4.123.0"
   },
   "dependencies": {
+    "@langchain/langgraph": "^1.4.12",
     "jose": "^6.2.9",
-    "viem": "^2.55.16"
+    "viem": "^2.55.16",
+    "zod": "^3.25.76"
   }
 }

@@ -4,9 +4,7 @@ type MissionSummary = Pick<Mission, 'id' | 'status' | 'team' | 'currentStage'>;
 
 export function routeForMission(mission: Pick<MissionSummary, 'id' | 'status' | 'team'>) {
   if (mission.status === 'matching') {
-    return mission.team.length > 0
-      ? `/missions/${mission.id}/workflow`
-      : `/missions/${mission.id}/team`;
+    return `/missions/${mission.id}/workflow`;
   }
   if (mission.status === 'review' || mission.status === 'completed' || mission.status === 'cancelled') {
     return `/missions/${mission.id}/acceptance`;

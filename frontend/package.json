@@ -10,8 +10,10 @@
     "deploy": "cd .. && pinme save"
   },
   "dependencies": {
+    "@dagrejs/dagre": "^3.1.1",
     "@privy-io/react-auth": "3.37.2",
     "@sentry/react": "10.70.0",
+    "@xyflow/react": "^12.11.3",
     "firebase": "^12.17.1",
     "lucide-react": "^1.31.0",
     "posthog-js": "1.417.1",

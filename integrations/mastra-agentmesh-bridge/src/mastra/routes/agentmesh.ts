@@ -33,8 +33,10 @@ function parseAgentJson(content: string): JsonObject | null {
     const normalized = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
     const parsed = objectValue(JSON.parse(normalized) as unknown);
     if (!parsed || !nonEmptyString(parsed.summary, 20_000)) return null;
+    if (!['succeeded', 'failed', 'blocked'].includes(String(parsed.completionStatus))) return null;
     const deliverable = deliverableText(parsed.deliverable);
-    return deliverable ? { ...parsed, deliverable } : null;
+    if (parsed.completionStatus === 'succeeded' && !deliverable) return null;
+    return deliverable ? { ...parsed, deliverable } : parsed;
   } catch {
     return null;
   }
@@ -55,7 +57,7 @@ export const agentmeshEndpointInfo = registerApiRoute('/agentmesh/invoke', {
     responses: { 200: { description: 'Bridge metadata' } },
   },
   handler: async c => c.json({
-    name: 'AgentMesh Mastra Bridge',
+    name: 'DeepSeek Chill Coding Agent',
     runtime: 'mastra',
     protocol: 'agentmesh.dispatch.v2',
     method: 'POST',
@@ -127,26 +129,34 @@ export const agentmeshEndpoint = registerApiRoute('/agentmesh/invoke', {
     if (!agentId) return c.json({ error: 'Callback URL is not an approved AgentMesh endpoint' }, 400);
 
     const stageName = nonEmptyString(stage.name, 300) ?? stageId;
+    const stageInput = objectValue(stage.input);
+    const executionMode = nonEmptyString(stageInput?.executionMode, 30) ?? 'analyze';
     const stagePosition = Number(stage.position);
     const totalStages = Number(stage.totalStages);
     const completedProgress = Number.isInteger(stagePosition) && Number.isInteger(totalStages) && stagePosition > 0 && totalStages >= stagePosition
       ? Math.round((stagePosition / totalStages) * 100)
       : undefined;
     let result: JsonObject | null = null;
-    let failureCode: 'LLM_NOT_CONFIGURED' | 'LLM_GENERATION_FAILED' | 'INVALID_AGENT_OUTPUT' | null = null;
-    if (!isPinmeLlmConfigured) {
+    let failureCode: 'ARTIFACT_RUNTIME_REQUIRED' | 'LLM_NOT_CONFIGURED' | 'LLM_GENERATION_FAILED' | 'INVALID_AGENT_OUTPUT' | 'AGENT_REPORTED_INCOMPLETE' | null = null;
+    if (executionMode === 'implement') {
+      failureCode = 'ARTIFACT_RUNTIME_REQUIRED';
+    } else if (!isPinmeLlmConfigured) {
       failureCode = 'LLM_NOT_CONFIGURED';
     } else {
       try {
-        const mastraAgent = c.get('mastra').getAgent('agentmeshBridgeAgent');
+        const mastraAgent = c.get('mastra').getAgent('deepseekChillCodingAgent');
         const generated = await mastraAgent.generate([
           'Execute the following complete AgentMesh task.',
           'Match the language of the mission title and description unless they explicitly request another language.',
           'Return the requested artifact as a plain string in the deliverable field, not as a nested object.',
+          'Return exactly one JSON object with completionStatus, summary, deliverable, findings, risks, and recommendation.',
+          'completionStatus must be succeeded, failed, or blocked. Use succeeded only when the requested result is actually complete.',
+          'Do not wrap the JSON object in Markdown fences or add text outside it.',
           JSON.stringify(task),
         ].join('\n'));
         result = parseAgentJson(generated.text);
         if (!result) failureCode = 'INVALID_AGENT_OUTPUT';
+        else if (result.completionStatus !== 'succeeded') failureCode = 'AGENT_REPORTED_INCOMPLETE';
       } catch {
         failureCode = 'LLM_GENERATION_FAILED';
       }
@@ -154,12 +164,16 @@ export const agentmeshEndpoint = registerApiRoute('/agentmesh/invoke', {
 
     const failed = failureCode !== null;
     const source = failed ? 'mastra-error' : 'mastra-agent';
-    const failureMessage = failureCode === 'LLM_NOT_CONFIGURED'
+    const failureMessage = failureCode === 'ARTIFACT_RUNTIME_REQUIRED'
+      ? '当前 Mastra 文本桥不能创建可下载工程制品；implement 节点需要接入共享 Agent Runtime 后重试。'
+      : failureCode === 'LLM_NOT_CONFIGURED'
       ? 'Mastra 运行时未配置 PinMe LLM，本阶段未生成交付内容，请配置后重试。'
       : failureCode === 'INVALID_AGENT_OUTPUT'
         ? 'Mastra 返回了无效的结构化内容，本阶段未完成，请重试。'
         : failureCode === 'LLM_GENERATION_FAILED'
           ? 'PinMe LLM 调用失败，本阶段未完成，请检查项目配置或余额后重试。'
+          : failureCode === 'AGENT_REPORTED_INCOMPLETE'
+            ? 'Agent 明确报告本阶段未完成，平台已保留结构化说明但不会将其计为交付。'
           : `${stageName} 已由 Mastra 完成`;
 
     const callbackResponse = await fetch(callbackUrl, {
@@ -179,7 +193,7 @@ export const agentmeshEndpoint = registerApiRoute('/agentmesh/invoke', {
         progress: failed ? undefined : completedProgress,
         message: failureMessage,
         output: failed
-          ? { runtime: 'mastra', source, error: { code: failureCode, retryable: true } }
+          ? { runtime: 'mastra', source, ...(result ? { result } : {}), error: { code: failureCode, retryable: true } }
           : { runtime: 'mastra', source, result },
         payload: { runtime: 'mastra', source, failureCode },
       }),

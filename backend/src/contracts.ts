@@ -2,6 +2,7 @@ export type UserRole = 'requester' | 'developer' | 'admin';
 export type AgentStatus = 'trial' | 'active' | 'paused';
 export type MissionStatus = 'draft' | 'matching' | 'running' | 'review' | 'completed' | 'cancelled';
 export type StageStatus = 'queued' | 'running' | 'done' | 'failed';
+export type WorkflowNodeType = 'task' | 'approval';
 export type PaymentMethod = 'web2_balance' | 'web3_musdc' | 'web3_seth';
 
 export interface UserContext {
@@ -65,6 +66,8 @@ export interface Mission {
   currentStage: string;
   team: string[];
   compiledSpec: Record<string, unknown> | null;
+  workflowVersion: number;
+  workflowViewport: WorkflowViewport;
   createdAt: string;
   updatedAt: string;
 }
@@ -85,6 +88,10 @@ export interface WorkflowStage {
   id: string;
   missionId: string;
   position: number;
+  nodeType: WorkflowNodeType;
+  positionX: number;
+  positionY: number;
+  progress: number;
   name: string;
   purpose: string;
   category: string;
@@ -95,6 +102,20 @@ export interface WorkflowStage {
   output: Record<string, unknown> | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface WorkflowEdge {
+  id: string;
+  missionId: string;
+  sourceStageId: string;
+  targetStageId: string;
+  createdAt: string;
+}
+
+export interface WorkflowViewport {
+  x: number;
+  y: number;
+  zoom: number;
 }
 
 export interface ExecutionEvent {
@@ -174,6 +195,81 @@ export interface Dispute {
   resolvedAt: string | null;
 }
 
+export type ArbitrationMemberStatus = 'active' | 'inactive';
+export type DisputeVoteChoice = 'support_refund' | 'oppose_refund' | 'abstain';
+export type ArbitrationProposalStatus = 'active' | 'succeeded' | 'defeated' | 'inconclusive' | 'quorum_failed' | 'executed';
+
+export interface ArbitrationMember {
+  userId: string;
+  displayName: string;
+  email?: string;
+  role: UserRole;
+  status: ArbitrationMemberStatus;
+  power: number;
+  appointedBy: string;
+  appointedAt: string;
+  updatedAt: string;
+}
+
+export interface ArbitrationProposal {
+  id: string;
+  disputeId: string;
+  proposerId: string;
+  status: ArbitrationProposalStatus;
+  weightMode: 'one_person_one_vote' | 'power';
+  votingStartsAt: string;
+  votingEndsAt: string;
+  quorumRequired: number;
+  eligibleWeight: number;
+  supportVotes: number;
+  opposeVotes: number;
+  abstainVotes: number;
+  outcome: 'refund_requester' | 'reject_dispute' | null;
+  finalizedAt: string | null;
+  finalizedBy: string | null;
+  executedAt: string | null;
+  executedBy: string | null;
+  createdAt: string;
+}
+
+export interface ArbitrationElector {
+  userId: string;
+  displayName: string;
+  powerSnapshot: number;
+  voteWeight: number;
+}
+
+export interface DisputeVote {
+  id: string;
+  proposalId: string;
+  voterId: string;
+  voterDisplayName: string;
+  choice: DisputeVoteChoice;
+  reason: string;
+  voteWeight: number;
+  createdAt: string;
+}
+
+export interface DisputeGovernance {
+  proposal: ArbitrationProposal | null;
+  electorate: ArbitrationElector[];
+  votes: DisputeVote[];
+  currentUser: {
+    eligible: boolean;
+    canVote: boolean;
+    hasVoted: boolean;
+    choice: DisputeVoteChoice | null;
+  };
+}
+
+export type DisputeVoteMutationResult =
+  | { state: 'applied'; governance: DisputeGovernance }
+  | { state: 'missing' | 'not_eligible' | 'already_voted' | 'closed' | 'expired' };
+
+export type DisputeFinalizeResult =
+  | { state: 'finalized' | 'not_ready'; governance: DisputeGovernance }
+  | { state: 'missing' };
+
 export interface Notification {
   id: string;
   userId: string;
@@ -206,6 +302,7 @@ export interface DisputeAction {
 export interface AdminUser extends UserContext {
   createdAt: string;
   updatedAt: string;
+  arbitration: Pick<ArbitrationMember, 'status' | 'power'> | null;
 }
 
 export interface AdminAction {
@@ -272,6 +369,7 @@ export interface CandidateMatch {
 export interface MissionDetail {
   mission: Mission;
   stages: WorkflowStage[];
+  edges: WorkflowEdge[];
   offers: StageOffer[];
   events: ExecutionEvent[];
   deliverables: Deliverable[];
@@ -323,14 +421,37 @@ export interface AgentCallbackUpdate {
   now: string;
   status: Exclude<StageStatus, 'queued'>;
   output?: Record<string, unknown> | null;
+  artifacts?: Deliverable[];
   progress?: number;
   currentStage: string;
   event: ExecutionEvent;
 }
 
+export interface DispatchOutboxItem {
+  id: string;
+  missionId: string;
+  stageId: string;
+  runId: string;
+  expiresAt: string;
+  status: 'pending' | 'processing' | 'done';
+  attempts: number;
+  nextAttemptAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type WorkflowDraftSaveResult =
+  | { state: 'saved'; mission: Mission }
+  | { state: 'version_conflict' }
+  | { state: 'locked' }
+  | { state: 'missing' };
+
 export type AgentCallbackApplyResult =
   | { state: 'applied'; stage: WorkflowStage }
-  | { state: 'duplicate' | 'expired' | 'missing' | 'invalid' };
+  | { state: 'duplicate' }
+  | { state: 'expired' }
+  | { state: 'missing' }
+  | { state: 'invalid' };
 
 export interface PlatformStore {
   ensureIdentityProfile(identity: AuthIdentityInput): Promise<UserContext>;
@@ -346,8 +467,9 @@ export interface PlatformStore {
 
   listMissions(user: UserContext): Promise<Mission[]>;
   getMission(id: string): Promise<Mission | null>;
-  createMission(mission: Mission, stages: WorkflowStage[]): Promise<Mission>;
-  saveCompilation(id: string, spec: Record<string, unknown>, stages: WorkflowStage[]): Promise<Mission | null>;
+  createMission(mission: Mission, stages: WorkflowStage[], edges?: WorkflowEdge[]): Promise<Mission>;
+  saveCompilation(id: string, spec: Record<string, unknown>, stages: WorkflowStage[], edges: WorkflowEdge[], expectedVersion: number): Promise<WorkflowDraftSaveResult>;
+  saveWorkflowDraft(id: string, stages: WorkflowStage[], edges: WorkflowEdge[], viewport: WorkflowViewport, expectedVersion: number): Promise<WorkflowDraftSaveResult>;
   confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[]): Promise<Mission | null>;
   startMission(
     id: string,
@@ -360,6 +482,7 @@ export interface PlatformStore {
   submitMissionForReview(id: string, reviewDueAt: string): Promise<Mission | null>;
   acceptMission(id: string, actorId: string, releaseTxHash: string | null): Promise<AcceptanceResult | null>;
   listStages(missionId: string): Promise<WorkflowStage[]>;
+  listEdges(missionId: string): Promise<WorkflowEdge[]>;
   listStageOffers(missionId: string, now?: string): Promise<StageOffer[]>;
   getStageOffer(id: string, now?: string): Promise<StageOffer | null>;
   respondStageOffer(id: string, ownerId: string, decision: 'accepted' | 'declined', respondedAt: string): Promise<StageOffer | null>;
@@ -367,6 +490,14 @@ export interface PlatformStore {
   resetStageDispatch(missionId: string, stageId: string): Promise<void>;
   updateStage(missionId: string, stageId: string, status: StageStatus, output?: Record<string, unknown> | null): Promise<WorkflowStage | null>;
   transitionRunningStage(missionId: string, stageId: string, status: Exclude<StageStatus, 'queued'>, output?: Record<string, unknown> | null): Promise<WorkflowStage | null>;
+  setStageProgress(missionId: string, stageId: string, progress: number): Promise<WorkflowStage | null>;
+  resetWorkflowNodes(missionId: string, stageIds: string[], gateId?: string): Promise<void>;
+  updateMissionWorkflowState(missionId: string, progress: number, currentStage: string): Promise<Mission | null>;
+
+  enqueueDispatches(missionId: string, stageIds: string[], now: string): Promise<DispatchOutboxItem[]>;
+  listPendingDispatches(limit: number, now: string): Promise<DispatchOutboxItem[]>;
+  claimDispatch(id: string, now: string): Promise<boolean>;
+  completeDispatch(id: string, status: 'done' | 'pending', now: string, nextAttemptAt?: string): Promise<void>;
 
   addEvent(event: ExecutionEvent, progress?: number, currentStage?: string, stageGuard?: StageStatus): Promise<ExecutionEvent>;
   listEvents(missionId: string): Promise<ExecutionEvent[]>;
@@ -379,7 +510,10 @@ export interface PlatformStore {
   listDisputes(user: UserContext): Promise<Dispute[]>;
   getDisputes(missionId: string): Promise<Dispute[]>;
   createDispute(dispute: Dispute): Promise<Dispute>;
-  startDisputeReview(id: string, actorId: string): Promise<Dispute | null>;
+  startDisputeReview(id: string, actorId: string, startedAt?: string): Promise<Dispute | null>;
+  getDisputeGovernance(id: string, userId: string, now?: string): Promise<DisputeGovernance | null>;
+  castDisputeVote(id: string, voterId: string, choice: DisputeVoteChoice, reason: string, votedAt: string): Promise<DisputeVoteMutationResult>;
+  finalizeDisputeProposal(id: string, actorId: string, finalizedAt: string): Promise<DisputeFinalizeResult>;
   resolveDispute(id: string, resolution: string, status: 'resolved' | 'rejected', actorId: string, resolutionTxHash: string | null): Promise<DisputeResolutionResult | null>;
   listDisputeActions(disputeId: string): Promise<DisputeAction[]>;
 
@@ -395,6 +529,8 @@ export interface PlatformStore {
   updateUserPreferences(userId: string, preferences: UserPreferences): Promise<UserPreferences>;
 
   listAdminUsers(limit: number): Promise<AdminUser[]>;
+  listArbitrationMembers(): Promise<ArbitrationMember[]>;
+  setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string): Promise<ArbitrationMember | null>;
   countProfilesByRole(role: UserRole): Promise<number>;
   updateAdminUserRole(targetId: string, role: UserRole, actorId: string, createdAt: string): Promise<{ profile: AdminUser; action: AdminAction | null } | null>;
   listAdminActions(limit: number): Promise<AdminAction[]>;

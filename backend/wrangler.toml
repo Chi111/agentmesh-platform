@@ -1,3 +1,7 @@
 name = "agentmesh-platform-74a3"
 compatibility_date = "2026-03-01"
+compatibility_flags = ["global_fetch_strictly_public"]
 main = "src/worker.ts"
+
+[triggers]
+crons = ["*/1 * * * *"]

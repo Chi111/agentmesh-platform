@@ -27,5 +27,5 @@ const pinmeOpenAI = createOpenAI({
 export const isPinmeLlmConfigured = Boolean(apiKey && projectName);
 
 export const pinmeOpenAIModel = pinmeOpenAI.chat(
-  process.env.PINME_MODEL?.trim() || 'openai/gpt-4o-mini',
+  process.env.PINME_MODEL?.trim() || 'deepseek/deepseek-v3.2',
 );

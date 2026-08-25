@@ -37,14 +37,17 @@ Privy 的部署配置、回退逻辑和安全边界见 [`authentication.md`](aut
 | `GET/POST` | `/api/missions` | 查询或创建任务 |
 | `GET` | `/api/wallet` | 查询当前用户 CREDIT 余额、测试充值状态和最近流水 |
 | `POST` | `/api/wallet/test-topup` | 每 24 小时领取固定 100 CREDIT 测试余额 |
-| `GET` | `/api/missions/:id` | 任务、阶段、接单邀请、事件、交付物、托管与争议聚合 |
+| `GET` | `/api/missions/:id` | 任务、DAG 节点与边、接单邀请、事件、交付物、托管与争议聚合 |
 | `GET` | `/api/missions/:id/stream` | 鉴权 SSE 任务快照；客户端断线后回退轮询 |
-| `POST` | `/api/missions/:id/compile` | PinMe LLM 编译任务；失败时确定性降级 |
+| `POST` | `/api/missions/:id/compile` | LangGraph 执行复杂度分析、DAG 规划、本地校验和一次定向修复；兼容旧 `stages` 响应，失败时生成 2–12 个任务节点的自适应 DAG；不自动分配 Agent |
 | `GET` | `/api/missions/:id/candidates` | 分类、标签、信誉、质量、价格与公平扰动匹配 |
-| `POST` | `/api/missions/:id/workflow` | 确认阶段与 Agent 分配，替换旧邀请并生成 24 小时阶段邀请 |
+| `PUT` | `/api/missions/:id/workflow/draft` | 以 `workflowVersion` 乐观锁保存节点、边和 viewport；重新编排使旧邀请失效 |
+| `POST` | `/api/missions/:id/workflow` | 确认当前图和手动 Agent 分配；只为任务节点生成 24 小时邀请，Gate 不接单也不分账 |
 | `POST` | `/api/missions/:id/offers/:offerId` | 被分配 Agent 的所有者接受或拒绝阶段邀请 |
 | `POST` | `/api/missions/:id/start` | 全部当前邀请接受后原子锁定账本并启动；并发请求只扣款和写启动事件一次；合约模式验证带 `payoutHash` 的 `depositTxHash` |
-| `POST` | `/api/missions/:id/dispatch` | 将下一个可运行阶段派发至开发者 Endpoint，或执行官方测试 Agent 的内置 PinMe LLM 运行时 |
+| `POST` | `/api/missions/:id/dispatch` | 并行派发全部依赖已满足的任务节点；失败节点不会隐式重试 |
+| `POST` | `/api/missions/:id/gates/:nodeId/decision` | 任务方批准 Gate，或填写反馈并选择直接上游任务返工 |
+| `POST` | `/api/missions/:id/nodes/:nodeId/retry` | 任务方显式重试一个失败任务节点，不自动换 Agent |
 | `GET/POST` | `/api/missions/:id/events` | 读取事件；管理员可追加审计事件，任务方仅可提交服务端模板化的人工协助命令 |
 | `GET/POST` | `/api/missions/:id/deliverables` | 读取或提交交付 URI 与内容哈希 |
 | `POST` | `/api/missions/:id/review` | 所有阶段完成且已有交付物后提交验收，并写入 7 天后的 `reviewDueAt` |
@@ -59,14 +62,19 @@ Privy 的部署配置、回退逻辑和安全边界见 [`authentication.md`](aut
 | `GET` | `/api/developer/ledger?token=CREDIT&limit=50&cursor=…` | 按 CREDIT / mUSDC / sETH 隔离的逐笔账目、状态汇总、12 周趋势和不透明游标；单页最多 100 条 |
 | `GET` | `/api/disputes` | 当前用户可访问的争议 |
 | `GET` | `/api/disputes/:id/actions` | 当前案件的追加式处理轨迹 |
-| `POST` | `/api/disputes/:id/review` | 管理员接手公开案件并进入审核 |
-| `POST` | `/api/disputes/:id/resolve` | 管理员裁决；Web3 必须提交已验证的解冻或退款交易 |
+| `GET` | `/api/disputes/:id/governance` | 提案、委员会快照、公开投票与当前用户资格 |
+| `POST` | `/api/disputes/:id/review` | 管理员创建唯一仲裁提案并冻结无利益冲突的委员会快照 |
+| `POST` | `/api/disputes/:id/votes` | 快照成员提交一次不可修改的支持、反对或弃权票 |
+| `POST` | `/api/disputes/:id/finalize` | 管理员在截止或结果不可逆后定案 |
+| `POST` | `/api/disputes/:id/resolve` | 执行与已定案结果一致的裁决；Web3 仍必须提交已验证的解冻或退款交易 |
 | `GET` | `/api/notifications` | 通知列表 |
 | `POST` | `/api/notifications/read` | 标记通知已读 |
 | `POST` | `/api/notifications/test-email` | 向当前认证邮箱发送通道测试邮件 |
 | `GET` | `/api/admin/users?limit=100` | 管理员读取工作区成员与角色 |
 | `PUT` | `/api/admin/users/:id/role` | 管理员调整角色；禁止自我降权，并由 API + D1 trigger 双重保证至少一位管理员 |
 | `GET` | `/api/admin/audit?limit=100` | 管理员读取追加式角色变更审计 |
+| `GET` | `/api/arbitration/members` | 管理员读取仲裁委员会成员与 Power |
+| `PUT` | `/api/arbitration/members/:id` | 管理员任命或停用仲裁委员；不追溯改变已有提案快照 |
 
 任务阶段、交付、验收、结算与争议状态变化会经过统一通知投递器。用户关闭对应类别后，站内和邮件均不生成；开启邮件通道且 profile 有认证邮箱时，Worker 使用 PinMe Email 投递。邮件网络失败不会回滚已提交的任务状态或站内通知。
 
@@ -76,9 +84,24 @@ Worker 向 Agent Endpoint 发送：
 
 ```json
 {
+  "protocol": "agentmesh.node-dispatch.v2",
   "task": {
-    "mission": { "id": "TASK-..." },
-    "stage": { "id": "STAGE-...", "status": "queued" }
+    "agent": { "id": "AGENT-...", "name": "Engineering Agent" },
+    "mission": { "id": "TASK-...", "title": "..." },
+    "node": {
+      "id": "STAGE-...",
+      "nodeType": "task",
+      "name": "后端实现",
+      "input": { "executionMode": "implement" }
+    },
+    "stage": { "id": "STAGE-...", "name": "后端实现" },
+    "upstream": [
+      {
+        "id": "STAGE-DIRECT-PREDECESSOR",
+        "handoff": { "summary": "...", "risks": [] },
+        "artifacts": [{ "id": "DEL-...", "uri": "ipfs://...", "contentHash": "sha256:..." }]
+      }
+    ]
   },
   "callback": {
     "url": "https://<worker>/api/hooks/agents/<agentId>/events",
@@ -90,7 +113,15 @@ Worker 向 Agent Endpoint 发送：
 }
 ```
 
-Agent 使用 `X-AgentMesh-Signature` 回调，并在请求体带回 `missionId + stageId + agentId + runId + expiresAt + callbackId`。签名绑定一次派发且有时效；只有任务 `running`、托管 `held`、阶段 `running` 三个条件同时成立时才会应用回调。`callbackId` 占用、阶段 CAS、执行事件、单调进度和派发终态在同一个 D1 原子批次中提交，任一步失败都会整体回滚。首次 `done` / `failed` 终态不可被乱序回调或派单故障覆盖。令牌由独立的 `AGENT_WEBHOOK_SECRET` 通过 HMAC-SHA256 派生，不暴露项目密钥。派发占用同样原子检查任务与托管状态，再对网络错误或 5xx 做有限重试；Agent Endpoint 应按 `X-AgentMesh-Task-Id` 幂等处理。
+请求头包含稳定的 `X-AgentMesh-Task-Id` 和 `X-AgentMesh-Agent-Id`。`upstream` 只包含直接前驱的受限交接摘要与 artifact reference，不把完整历史输出塞入后继 prompt；旧 Endpoint 仍可读取兼容 `stage` 与 `upstream[].output` 字段。
+
+Agent 使用 `X-AgentMesh-Signature` 回调，并在请求体带回 `missionId + stageId + agentId + runId + expiresAt + callbackId`。`done` 回调必须包含成功的结构化 `output`；`implement` 节点还必须携带至少一个 `artifacts[]`（`name + uri + sha256 contentHash + mimeType`），或在终态回调前已经为该节点登记制品。回调内的 artifact、阶段状态、执行事件、节点进度、Agent 履约事件和 outbox 终态在同一个 D1 原子批次中提交，不能出现“节点完成但制品未登记”的半成功状态。
+
+签名绑定一次派发且有效 2 小时；只有任务 `running`、托管 `held`、阶段 `running` 三个条件同时成立时才会应用回调。首次 `done` / `failed` 终态不可被乱序回调或派单故障覆盖。令牌由独立的 `AGENT_WEBHOOK_SECRET` 通过 HMAC-SHA256 派生，不暴露项目密钥。派发占用同样原子检查任务与托管状态，再对网络错误或 5xx 做有限重试；Agent Endpoint 应按 `X-AgentMesh-Task-Id` 幂等处理。
+
+D1 outbox 为每次节点运行持久化 `runId + expiresAt`；请求后 `waitUntil` 与每分钟 cron 共同排空。进程恢复和网络重试沿用同一 run ID，只有显式重试或 Gate 返工才生成新的运行身份。多个根节点和同批就绪节点并行派发；Join 等待全部直接前驱 `done`。依赖失败只动态阻塞后继，其他独立分支继续。
+
+Gate 在所有入边完成后由 `queued` 转为 `running`（待审批）。批准后进入 `done` 并调度后继；驳回必须提供反馈并选择一个或多个直接上游任务，所选任务与 Gate 回到 `queued`，原输出保留在事件证据中。任务总进度按任务节点预算加权，Gate 不占预算；全部节点完成后才是 100%。
 
 Agent 注册 API 不接受 `apiKey`、`token`、`secret` 或 `credential` 字段。需要认证的 Agent Endpoint 必须在 Worker Secret `AGENT_CREDENTIALS_JSON` 中按 Agent ID 配置凭据；在凭据不可用时，派发接口返回 `409 AGENT_CREDENTIAL_REQUIRED`。Endpoint 必须使用 HTTPS 443；Worker 拒绝用户名密码、localhost、私网/保留 IPv4 和直接 IPv6 字面地址，试炼和派发前还会解析 A/AAAA 并拒绝任何非公网结果。生产可再用 `AGENT_ENDPOINT_ALLOWLIST` 限制域名。
 
@@ -104,7 +135,7 @@ Agent 成功率不再直接复制试炼分。平台为每个阶段只记录一�
 
 通用事件接口不接受开发者伪造阶段进度；开发者应使用签名 Agent 回调或交付物接口。任务方的 `mission.assistance_requested` 由服务端生成固定消息和规范状态，不接受调用方自定义 `progress`、`stageId` 或 `currentStage`。
 
-启动、验收、争议创建和裁决均在 D1 使用状态条件与原子批次：并发启动只扣款一次；验收与冻结只有一个分支获胜；每个任务最多一个活跃争议；首个裁决之后的请求不能覆盖结果或重复退款。
+启动、验收、争议创建和裁决均在 D1 使用状态条件与原子批次：并发启动只扣款一次；验收与冻结只有一个分支获胜；每个任务最多一个活跃争议。争议裁决必须先经过委员会快照、一人一票、60% 法定人数和明确多数；平票、全部弃权或未达到法定人数均不授权资金动作。首个有效执行之后的请求不能覆盖结果或重复退款。
 
 ## Migrations
 
@@ -119,6 +150,13 @@ Agent 成功率不再直接复制试炼分。平台为每个阶段只记录一�
 - `009_remove_demo_data.sql`：清理历史版本写入的展示账户、样例任务和关联记录。
 - `010_market_foundation.sql`：阶段接单邀请、Agent 履约事件、验收期限，以及 Web2 余额触发器修正。
 - `011_official_test_agents.sql`：3 个可运行的官方测试 Agent 及其系统所有者；不写入样例任务或用户工作区数据。
+- `012_escrow_requester_wallet.sql`：记录托管请求方钱包，强化链上验收与争议归属。
+- `013_reconcile_signed_output_reviews.sql`：把已有签名完成输出的历史运行任务修正到待验收状态。
+- `014_reopen_mastra_fallback_deliveries.sql`：重开受 Mastra 降级交付影响的任务，保留审计证据。
+- `015_reopen_nonlocalized_final_delivery.sql`：重开不符合本地化最终交付要求的历史任务。
+- `016_visual_workflow_dag.sql`：DAG 节点布局与版本、边、历史线性迁移、托管后图锁和持久化 dispatch outbox。
+- `017_reopen_missing_engineering_artifact.sql`：撤销缺少真实工程制品的历史伪完成状态，保留原输出证据并原样保留 held/frozen 托管。
+- `018_dao_arbitration.sql`：仲裁委员会、Power 预留、提案生命周期、成员快照、不可修改投票和执行审计。
 
 部署 Worker 与数据库的联合修改使用：
 

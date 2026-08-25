@@ -1,5 +1,6 @@
-import type { Agent, CandidateMatch, Mission, UserContext, WorkflowStage } from './contracts';
+import type { Agent, CandidateMatch, Mission, UserContext, WorkflowEdge, WorkflowStage } from './contracts';
 import { paymentBudgetPrecision } from './payments';
+import { linearEdges } from './workflowGraph';
 
 export function makeId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`;
@@ -30,56 +31,10 @@ export function canAccessMission(user: UserContext, mission: Mission, agents: Ag
   return stages.some((stage) => stage.agentId && ownedAgentIds.has(stage.agentId));
 }
 
-export function fallbackCompilation(mission: Mission): { spec: Record<string, unknown>; stages: WorkflowStage[] } {
-  const now = new Date().toISOString();
-  const categories = mission.category.includes('视频')
-    ? ['内容生成', '图像生成', '视频生成']
-    : mission.category.includes('研究') || mission.category.includes('分析')
-      ? ['数据研究', '商业分析', '内容生成']
-      : [mission.category, '质量验证', '交付整合'];
-  const names = mission.category.includes('视频')
-    ? ['叙事策略与脚本', '视觉设定与素材', '生成合成与质检']
-    : ['目标澄清与资料采集', '核心执行与交叉验证', '交付整合与质量检查'];
-  const weights = [0.2, 0.35, 0.45];
-  const precision = paymentBudgetPrecision(mission.paymentMethod);
-  const stages = names.map<WorkflowStage>((name, index) => ({
-    id: makeId('STAGE'),
-    missionId: mission.id,
-    position: index + 1,
-    name,
-    purpose: index === 0
-      ? `把“${mission.title}”整理为结构化输入和验收标准。`
-      : index === 1
-        ? `完成${mission.category}的核心生产，并持续记录可验证证据。`
-        : '汇总上游输出，执行质量校验并生成最终交付包。',
-    category: categories[index],
-    budget: Number((mission.budget * weights[index]).toFixed(precision)),
-    status: 'queued',
-    agentId: null,
-    input: { missionId: mission.id, dependsOn: index === 0 ? [] : [index] },
-    output: null,
-    createdAt: now,
-    updatedAt: now,
-  }));
-  const allocated = stages.reduce((sum, stage) => sum + stage.budget, 0);
-  stages[stages.length - 1].budget = Number((stages[stages.length - 1].budget + mission.budget - allocated).toFixed(precision));
-  return {
-    spec: {
-      objective: mission.title,
-      acceptanceCriteria: [
-        '交付物与任务描述一致',
-        '每个阶段保留执行证据与内容哈希',
-        '最终交付可由任务方独立验收',
-      ],
-      constraints: {
-        budget: mission.budget,
-        deadline: mission.deadline,
-        expertise: mission.expertise,
-      },
-      source: 'deterministic-fallback',
-    },
-    stages,
-  };
+export interface WorkflowCompilation {
+  spec: Record<string, unknown>;
+  stages: WorkflowStage[];
+  edges: WorkflowEdge[];
 }
 
 type LlmCompilation = {
@@ -87,41 +42,89 @@ type LlmCompilation = {
   acceptanceCriteria?: unknown;
   risks?: unknown;
   stages?: unknown;
+  nodes?: unknown;
+  edges?: unknown;
 };
 
-export function parseLlmCompilation(content: string, mission: Mission): { spec: Record<string, unknown>; stages: WorkflowStage[] } | null {
+export function parseLlmCompilation(content: string, mission: Mission): WorkflowCompilation | null {
   let parsed: LlmCompilation;
   try {
     parsed = JSON.parse(content) as LlmCompilation;
   } catch {
     return null;
   }
-  if (!Array.isArray(parsed.stages) || parsed.stages.length < 1 || parsed.stages.length > 8) return null;
+  const nodes = Array.isArray(parsed.nodes) ? parsed.nodes : parsed.stages;
+  if (!Array.isArray(nodes) || nodes.length < 1 || nodes.length > 30) return null;
   const now = new Date().toISOString();
-  const rawStages = parsed.stages as Array<Record<string, unknown>>;
-  const requestedBudgets = rawStages.map((stage) => {
+  const rawStages = nodes as Array<Record<string, unknown>>;
+  const taskRows = rawStages.filter((stage) => stage.nodeType !== 'approval');
+  if (taskRows.length < 1) return null;
+  const requestedBudgets = taskRows.map((stage) => {
     const value = Number(stage.budget ?? 0);
-    return Number.isFinite(value) && value > 0 ? value : mission.budget / rawStages.length;
+    return Number.isFinite(value) && value > 0 ? value : mission.budget / taskRows.length;
   });
   const requestedTotal = requestedBudgets.reduce((sum, value) => sum + value, 0) || 1;
   const precision = paymentBudgetPrecision(mission.paymentMethod);
-  const stages: WorkflowStage[] = rawStages.map((stage, index) => ({
-    id: makeId('STAGE'),
+  let taskIndex = 0;
+  const externalIds = new Map<string, string>();
+  const stages: WorkflowStage[] = rawStages.map((stage, index) => {
+    const id = makeId('STAGE');
+    const externalId = typeof stage.id === 'string' && stage.id.trim() ? stage.id.trim() : String(index + 1);
+    externalIds.set(externalId, id);
+    const nodeType = stage.nodeType === 'approval' ? 'approval' : 'task';
+    const requestedBudget = nodeType === 'task' ? requestedBudgets[taskIndex++] : 0;
+    return {
+    id,
     missionId: mission.id,
     position: index + 1,
+    nodeType,
+    positionX: Number.isFinite(Number(stage.positionX)) ? Number(stage.positionX) : 80 + (index % 4) * 320,
+    positionY: Number.isFinite(Number(stage.positionY)) ? Number(stage.positionY) : 100 + Math.floor(index / 4) * 220,
+    progress: 0,
     name: typeof stage.name === 'string' && stage.name.trim() ? stage.name.trim().slice(0, 120) : `执行阶段 ${index + 1}`,
     purpose: typeof stage.purpose === 'string' ? stage.purpose.trim().slice(0, 600) : '',
     category: typeof stage.category === 'string' && stage.category.trim() ? stage.category.trim().slice(0, 80) : mission.category,
-    budget: Number((mission.budget * (requestedBudgets[index] / requestedTotal)).toFixed(precision)),
+    budget: nodeType === 'task' ? Number((mission.budget * (requestedBudget / requestedTotal)).toFixed(precision)) : 0,
     status: 'queued',
     agentId: null,
-    input: typeof stage.input === 'object' && stage.input !== null ? stage.input as Record<string, unknown> : {},
+    input: (() => {
+      const rawInput = typeof stage.input === 'object' && stage.input !== null
+        ? stage.input as Record<string, unknown>
+        : {};
+      if (nodeType === 'approval') {
+        return {
+          approvalCriteria: typeof rawInput.approvalCriteria === 'string' && rawInput.approvalCriteria.trim()
+            ? rawInput.approvalCriteria.trim().slice(0, 2_000)
+            : '确认所有直接上游结果满足任务目标和验收标准。',
+        };
+      }
+      const executionMode = ['analyze', 'implement', 'review'].includes(String(rawInput.executionMode))
+        ? String(rawInput.executionMode)
+        : index === 0 ? 'analyze' : index === rawStages.length - 1 ? 'review' : 'implement';
+      return {
+        ...rawInput,
+        executionMode,
+        inputContract: typeof rawInput.inputContract === 'string' ? rawInput.inputContract.slice(0, 4_000) : '',
+        outputContract: typeof rawInput.outputContract === 'string' ? rawInput.outputContract.slice(0, 4_000) : '',
+      };
+    })(),
     output: null,
     createdAt: now,
     updatedAt: now,
-  }));
+  }; });
   const allocated = stages.reduce((sum, stage) => sum + stage.budget, 0);
-  stages[stages.length - 1].budget = Number((stages[stages.length - 1].budget + mission.budget - allocated).toFixed(precision));
+  const finalTask = [...stages].reverse().find((stage) => stage.nodeType === 'task');
+  if (!finalTask) return null;
+  finalTask.budget = Number((finalTask.budget + mission.budget - allocated).toFixed(precision));
+  const rawEdges = Array.isArray(parsed.edges) ? parsed.edges as Array<Record<string, unknown>> : [];
+  const edges = rawEdges.flatMap((edge) => {
+    const source = externalIds.get(String(edge.source ?? edge.sourceStageId ?? ''));
+    const target = externalIds.get(String(edge.target ?? edge.targetStageId ?? ''));
+    return source && target ? [{
+      id: makeId('EDGE'), missionId: mission.id, sourceStageId: source, targetStageId: target, createdAt: now,
+    }] : [];
+  });
+  const normalizedEdges = edges.length || rawEdges.length ? edges : linearEdges(mission.id, stages, now);
   const acceptanceCriteria = Array.isArray(parsed.acceptanceCriteria)
     ? parsed.acceptanceCriteria.filter((item): item is string => typeof item === 'string').slice(0, 12)
     : [];
@@ -133,13 +136,14 @@ export function parseLlmCompilation(content: string, mission: Mission): { spec: 
       source: 'pinme-llm',
     },
     stages,
+    edges: normalizedEdges,
   };
 }
 
 export function matchCandidates(mission: Mission, stages: WorkflowStage[], agents: Agent[]): CandidateMatch[] {
   const activeAgents = agents.filter((agent) => agent.status === 'active');
   const missionTags = mission.tags.map(normalize);
-  return stages.map((stage) => {
+  return stages.filter((stage) => stage.nodeType === 'task').map((stage) => {
     const stageCategory = normalize(stage.category);
     const ranked = activeAgents.map((agent) => {
       const agentTags = agent.tags.map(normalize);

@@ -20,6 +20,22 @@ test('anonymous users can only browse the public Agent directory', async ({ page
   expect(pageErrors).toEqual([]);
 });
 
+test('public contract showcase remains useful without authentication or RPC availability', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route('**/ethereum-sepolia-rpc.publicnode.com/**', (route) => route.abort('failed'));
+
+  await page.goto('/#/contract');
+
+  await expect(page.getByRole('heading', { name: '协作有共识， 资金有路径。' })).toBeVisible();
+  await expect(page.getByRole('link', { name: '在 Etherscan 验证' })).toHaveAttribute(
+    'href',
+    'https://sepolia.etherscan.io/address/0xe05a5e46139294402393e5601d771e6c7564a573',
+  );
+  await expect(page.getByText('实时 RPC 暂时不可用，静态合约档案仍可验证。')).toBeVisible();
+  await expect(page.locator('#app-sidebar')).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+});
+
 test('private workspace routes require authentication instead of local fallback data', async ({ page }) => {
   for (const route of ['/dashboard', '/missions/new', '/developer', '/arbitration', '/settings', '/wallet/test-funds']) {
     await page.goto(`/#${route}`);
@@ -162,12 +178,90 @@ test('operational errors use a localized top-right notification', async ({ page 
   await expect(notification).toHaveCount(0);
 });
 
+test('DAO arbitration renders a real electorate vote and locks the resulting ruling', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const profile = { id: 'arbiter-admin', email: 'arbiter@example.test', displayName: 'DAO Arbiter', role: 'admin' };
+  const mission = {
+    id: 'TASK-DAO-E2E', title: 'DAO 仲裁浏览器验收', description: '验证一人一票的提案流程。', category: '软件开发', tags: ['仲裁'],
+    budget: 100, paymentMethod: 'web2_balance', deadline: '2026-09-01', reviewDueAt: null, priority: 'high', expertise: 'expert',
+    yieldEnabled: false, status: 'review', progress: 100, currentStage: '争议治理中', team: ['agent-one'], createdAt: '2026-08-23T00:00:00.000Z',
+    workflowVersion: 1, workflowViewport: { x: 0, y: 0, zoom: 1 },
+  };
+  const dispute = {
+    id: 'DSP-DAO-E2E', missionId: mission.id, openedBy: 'requester-e2e', reason: '交付物与任务规格存在明显偏差，需要委员会核验并决定是否退款。',
+    evidence: [], status: 'reviewing', resolution: null, freezeTxHash: null, resolutionTxHash: null,
+    createdAt: '2026-08-23T00:00:00.000Z', resolvedAt: null,
+  };
+  const proposal = {
+    id: 'PROP-DAO-E2E', disputeId: dispute.id, proposerId: profile.id, status: 'active', weightMode: 'one_person_one_vote',
+    votingStartsAt: '2026-08-23T00:00:00.000Z', votingEndsAt: '2026-08-26T00:00:00.000Z', quorumRequired: 1, eligibleWeight: 1,
+    supportVotes: 0, opposeVotes: 0, abstainVotes: 0, outcome: null, finalizedAt: null, finalizedBy: null, executedAt: null, executedBy: null,
+    createdAt: '2026-08-23T00:00:00.000Z',
+  };
+  let governance = {
+    proposal,
+    electorate: [{ userId: profile.id, displayName: profile.displayName, powerSnapshot: 1, voteWeight: 1 }],
+    votes: [] as Array<Record<string, unknown>>,
+    currentUser: { eligible: true, canVote: true, hasVoted: false, choice: null as string | null },
+  };
+  const token = [
+    Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
+    Buffer.from(JSON.stringify({ sub: profile.id, email: profile.email, iat: 1_787_200_000, exp: 1_818_736_000 })).toString('base64url'),
+    'test-signature',
+  ].join('.');
+  const envelope = (data: unknown) => JSON.stringify({ data });
+
+  await page.route('**/v1/accounts:signInWithPassword**', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ localId: profile.id, email: profile.email, tenantId: 'agentmesh-platf-749a-powdj', idToken: token, refreshToken: 'test-refresh-token', expiresIn: '3600', registered: true }),
+  }));
+  await page.route('**/v1/accounts:lookup**', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ users: [{ localId: profile.id, email: profile.email, emailVerified: true, tenantId: 'agentmesh-platf-749a-powdj' }] }),
+  }));
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const fulfill = (data: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: envelope(data) });
+    if (path === '/api/auth/verify') return fulfill({ profile });
+    if (path === '/api/bootstrap') return fulfill({ profile, missions: [mission], agents: [], notifications: [], developer: null });
+    if (path === '/api/disputes') return fulfill([dispute]);
+    if (path === `/api/disputes/${dispute.id}/actions`) return fulfill([]);
+    if (path === `/api/disputes/${dispute.id}/governance`) return fulfill(governance);
+    if (path === `/api/disputes/${dispute.id}/votes` && request.method() === 'POST') {
+      const input = request.postDataJSON() as { choice: string; reason: string };
+      governance = {
+        proposal: { ...proposal, status: 'succeeded', supportVotes: 1, outcome: 'refund_requester', finalizedAt: '2026-08-23T00:05:00.000Z', finalizedBy: profile.id },
+        electorate: governance.electorate,
+        votes: [{ id: 'VOTE-DAO-E2E', proposalId: proposal.id, voterId: profile.id, voterDisplayName: profile.displayName, choice: input.choice, reason: input.reason, voteWeight: 1, createdAt: '2026-08-23T00:05:00.000Z' }],
+        currentUser: { eligible: true, canVote: false, hasVoted: true, choice: input.choice },
+      };
+      return fulfill(governance, 201);
+    }
+    return fulfill({ code: 'NOT_MOCKED', path }, 404);
+  });
+
+  await page.goto('/#/arbitration');
+  await page.getByRole('button', { name: '登录 AgentMesh' }).click();
+  const loginDialog = page.getByRole('dialog').last();
+  await loginDialog.getByLabel('邮箱').fill(profile.email);
+  await loginDialog.getByLabel('密码').fill('browser-test-password');
+  await loginDialog.getByRole('button', { name: '登录真实工作区' }).click();
+
+  await expect(page.getByRole('heading', { name: '仲裁治理' })).toBeVisible();
+  await expect(page.getByText('1 MEMBER = 1 VOTE')).toBeVisible();
+  await page.getByLabel('投票理由').fill('依据任务规格和交付证据，支持争议方退款并终止任务。');
+  await page.getByRole('button', { name: /确认投票/ }).click();
+  await expect(page.getByText('退款提案通过').first()).toBeVisible();
+  await expect(page.getByRole('button', { name: '执行已通过的裁决' })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+});
+
 test('requester invitations and developer acceptance unlock funding only after every stage responds', async ({ page }) => {
   const profile = { id: 'market-user', email: 'market@example.test', displayName: 'Market User', role: 'requester' as 'requester' | 'developer' };
   const mission = {
     id: 'TASK-MARKET-E2E', title: 'Agent Market 浏览器验收', description: '验证邀请、接单和启动门禁。', category: '商业研究', tags: ['研究'],
     budget: 300, paymentMethod: 'web2_balance', deadline: '2026-09-01', reviewDueAt: null, priority: 'high', expertise: 'expert',
     yieldEnabled: false, status: 'matching', progress: 0, currentStage: '等待工作流确认', team: ['agent-one', 'agent-two', 'agent-three'], createdAt: '2026-08-20T00:00:00.000Z',
+    workflowVersion: 1, workflowViewport: { x: 0, y: 0, zoom: 1 },
   };
   const agents = ['one', 'two', 'three'].map((suffix, index) => ({
     id: `agent-${suffix}`, ownerId: profile.id, name: `Agent ${index + 1}`, category: '商业研究', summary: '用于浏览器验收的已激活 Agent。', tags: ['研究'],
@@ -176,7 +270,11 @@ test('requester invitations and developer acceptance unlock funding only after e
   }));
   const stages = agents.map((agent, index) => ({
     id: `stage-${index + 1}`, missionId: mission.id, position: index + 1, name: `阶段 ${index + 1}`, purpose: '完成可验证阶段输出。', category: '商业研究',
-    budget: 100, status: 'queued', agentId: agent.id, input: {}, output: null,
+    budget: 100, status: 'queued', agentId: agent.id, nodeType: 'task', positionX: 80 + index * 330, positionY: 100, progress: 0,
+    input: { executionMode: 'analyze', inputContract: '', outputContract: '' }, output: null,
+  }));
+  const edges = stages.slice(1).map((stage, index) => ({
+    id: `edge-${index + 1}`, missionId: mission.id, sourceStageId: stages[index].id, targetStageId: stage.id,
   }));
   let offers: Array<Record<string, unknown>> = [];
   const token = [
@@ -204,10 +302,10 @@ test('requester invitations and developer acceptance unlock funding only after e
       profile.role = (request.postDataJSON() as { role: 'requester' | 'developer' }).role;
       return fulfill(profile);
     }
-    if (path === `/api/missions/${mission.id}`) return fulfill({ mission, stages, offers, events: [], deliverables: [], escrow: { status: 'pending', amount: mission.budget, token: 'CREDIT', network: 'agentmesh' }, disputes: [] });
+    if (path === `/api/missions/${mission.id}`) return fulfill({ mission, stages, edges, offers, events: [], deliverables: [], escrow: { status: 'pending', amount: mission.budget, token: 'CREDIT', network: 'agentmesh' }, disputes: [] });
     if (path === `/api/missions/${mission.id}/workflow` && request.method() === 'POST') {
       offers = stages.map((stage, index) => ({ id: `offer-${index + 1}`, missionId: mission.id, stageId: stage.id, agentId: stage.agentId, status: 'pending', expiresAt: '2026-08-21T00:00:00.000Z', respondedAt: null, createdAt: '2026-08-20T00:00:00.000Z', updatedAt: '2026-08-20T00:00:00.000Z' }));
-      return fulfill({ mission, stages, offers });
+      return fulfill({ mission, stages, edges, offers });
     }
     const offerMatch = path.match(new RegExp(`^/api/missions/${mission.id}/offers/(.+)$`));
     if (offerMatch && request.method() === 'POST') {
@@ -224,12 +322,11 @@ test('requester invitations and developer acceptance unlock funding only after e
   await loginDialog.getByLabel('邮箱').fill(profile.email);
   await loginDialog.getByLabel('密码').fill('browser-test-password');
   await loginDialog.getByRole('button', { name: '登录真实工作区' }).click();
-  await expect(page.getByRole('heading', { name: '确认执行工作流' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'DAG 工作流编排' })).toBeVisible();
 
-  await page.getByRole('button', { name: '发送阶段邀请' }).click();
-  await page.getByRole('button', { name: '确认并发送' }).click();
+  await page.getByRole('button', { name: '发送邀请' }).click();
   await expect(page.getByText('已接单 0/3')).toBeVisible();
-  await expect(page.getByRole('button', { name: '重新发送阶段邀请' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '邀请已发送' })).toBeDisabled();
 
   const developerRoleButton = page.locator('header').getByRole('button', { name: '开发者' });
   await developerRoleButton.click();
@@ -248,6 +345,6 @@ test('requester invitations and developer acceptance unlock funding only after e
   await expect(requesterRoleButton).toHaveAttribute('aria-pressed', 'true');
   await expect(page).toHaveURL(/#\/dashboard$/);
   await page.goto(`/#/missions/${mission.id}/workflow`);
-  await expect(page.getByText('已接单 3/3')).toBeVisible();
+  await expect(page.getByText('全部接单')).toBeVisible();
   await expect(page.getByRole('button', { name: '确认托管并启动' })).toBeEnabled();
 });

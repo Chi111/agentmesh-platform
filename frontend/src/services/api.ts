@@ -2,11 +2,14 @@ import type {
   Agent,
   AdminAction,
   AdminUser,
+  ArbitrationMember,
   CandidateMatch,
   Deliverable,
   DeveloperLedger,
   Dispute,
   DisputeAction,
+  DisputeGovernance,
+  DisputeVoteChoice,
   ExecutionEvent,
   Mission,
   MissionDetail,
@@ -20,6 +23,8 @@ import type {
   UserRole,
   WalletAccount,
   WorkflowStage,
+  WorkflowEdge,
+  WorkflowViewport,
 } from '../types/domain';
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
@@ -176,15 +181,30 @@ export const api = {
     method: 'PUT', authenticated: true, body: JSON.stringify({ role }),
   }),
   listAdminActions: (limit = 100) => request<AdminAction[]>(`/api/admin/audit?limit=${encodeURIComponent(String(limit))}`, { authenticated: true }),
-  createMission: (input: NewMissionInput) => request<{ mission: Mission; stages: WorkflowStage[] }>('/api/missions', {
+  listArbitrationMembers: () => request<ArbitrationMember[]>('/api/arbitration/members', { authenticated: true }),
+  setArbitrationMember: (userId: string, active: boolean) => request<ArbitrationMember>(`/api/arbitration/members/${encodeURIComponent(userId)}`, {
+    method: 'PUT', authenticated: true, body: JSON.stringify({ active }),
+  }),
+  createMission: (input: NewMissionInput) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>('/api/missions', {
     method: 'POST',
     authenticated: true,
     idempotencyKey: `mission-${crypto.randomUUID()}`,
     body: JSON.stringify(input),
   }),
   getMission: (missionId: string) => request<MissionDetail>(`/api/missions/${encodeURIComponent(missionId)}`, { authenticated: true }),
+  compileWorkflow: (missionId: string) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>(`/api/missions/${encodeURIComponent(missionId)}/compile`, {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  saveWorkflowDraft: (missionId: string, input: {
+    workflowVersion: number;
+    nodes: WorkflowStage[];
+    edges: WorkflowEdge[];
+    viewport: WorkflowViewport;
+  }) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow/draft`, {
+    method: 'PUT', authenticated: true, body: JSON.stringify(input),
+  }),
   getCandidates: (missionId: string) => request<CandidateMatch[]>(`/api/missions/${encodeURIComponent(missionId)}/candidates`, { authenticated: true }),
-  confirmWorkflow: (missionId: string, assignments: Record<string, string>) => request<{ mission: Mission; stages: WorkflowStage[]; offers: StageOffer[] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow`, {
+  confirmWorkflow: (missionId: string, assignments: Record<string, string>) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[]; offers: StageOffer[] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ assignments }),
   }),
   respondStageOffer: (missionId: string, offerId: string, decision: 'accepted' | 'declined') => request<StageOffer>(`/api/missions/${encodeURIComponent(missionId)}/offers/${encodeURIComponent(offerId)}`, {
@@ -193,7 +213,13 @@ export const api = {
   startMission: (missionId: string, depositTxHash: string | null = null) => request<{ mission: Mission }>(`/api/missions/${encodeURIComponent(missionId)}/start`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ depositTxHash }),
   }),
-  dispatchMission: (missionId: string) => request<{ stage: WorkflowStage; agent: { id: string; name: string }; acknowledgement: unknown }>(`/api/missions/${encodeURIComponent(missionId)}/dispatch`, {
+  dispatchMission: (missionId: string) => request<{ dispatches: unknown[]; stage: WorkflowStage | null; agent: { id: string; name: string } | null; acknowledgement: unknown }>(`/api/missions/${encodeURIComponent(missionId)}/dispatch`, {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  decideGate: (missionId: string, nodeId: string, input: { decision: 'approved' | 'rejected'; feedback?: string; reworkNodeIds?: string[] }) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>(`/api/missions/${encodeURIComponent(missionId)}/gates/${encodeURIComponent(nodeId)}/decision`, {
+    method: 'POST', authenticated: true, body: JSON.stringify(input),
+  }),
+  retryNode: (missionId: string, nodeId: string) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>(`/api/missions/${encodeURIComponent(missionId)}/nodes/${encodeURIComponent(nodeId)}/retry`, {
     method: 'POST', authenticated: true, body: '{}',
   }),
   addMissionEvent: (missionId: string, input: { type: string; message: string; currentStage?: string; stageId?: string; progress?: number }) => request<ExecutionEvent>(`/api/missions/${encodeURIComponent(missionId)}/events`, {
@@ -213,7 +239,14 @@ export const api = {
   }),
   listDisputes: () => request<Dispute[]>('/api/disputes', { authenticated: true }),
   listDisputeActions: (disputeId: string) => request<DisputeAction[]>(`/api/disputes/${encodeURIComponent(disputeId)}/actions`, { authenticated: true }),
+  getDisputeGovernance: (disputeId: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/governance`, { authenticated: true }),
   startDisputeReview: (disputeId: string) => request<Dispute>(`/api/disputes/${encodeURIComponent(disputeId)}/review`, {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  castDisputeVote: (disputeId: string, choice: DisputeVoteChoice, reason: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/votes`, {
+    method: 'POST', authenticated: true, body: JSON.stringify({ choice, reason }),
+  }),
+  finalizeDisputeVote: (disputeId: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/finalize`, {
     method: 'POST', authenticated: true, body: '{}',
   }),
   resolveDispute: (disputeId: string, resolution: string, status: 'resolved' | 'rejected', resolutionTxHash: string | null = null) => request<Dispute>(`/api/disputes/${encodeURIComponent(disputeId)}/resolve`, {

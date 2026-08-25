@@ -52,6 +52,7 @@ const developerNav: NavItem[] = [
   { label: '注册 Agent', to: '/developer/agents/new', icon: Plus },
   { label: '接单记录', to: '/developer/jobs', icon: BriefcaseBusiness },
   { label: '收益中心', to: '/developer/earnings', icon: CircleDollarSign },
+  { label: '仲裁中心', to: '/arbitration', icon: Scale },
 ];
 
 function isSidebarItemActive(pathname: string, role: UserRole, to: string) {
@@ -121,7 +122,7 @@ function Sidebar({
         className={`fixed inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[264px] shrink-0 flex-col overflow-hidden bg-ink px-4 py-5 text-white transition-transform duration-200 [@media(max-height:520px)]:py-3 lg:sticky lg:top-0 lg:z-auto lg:translate-x-0 ${open ? 'translate-x-0' : '-translate-x-full'}`}
       >
         <div className="flex items-center justify-between px-2">
-          <Link to={role === 'requester' ? '/dashboard' : '/developer'} className="flex items-center gap-3" onClick={onClose}>
+          <Link to="/contract" className="flex items-center gap-3" onClick={onClose} aria-label="查看 AgentMesh 合约公开信息" title="合约公开信息">
             <MeshMark />
             <span>
               <strong className="block text-[15px] tracking-tight">AgentMesh</strong>
@@ -303,7 +304,7 @@ function Topbar({
   };
 
   return (
-    <header className="sticky top-0 z-30 flex h-16 items-center border-b border-line bg-white/90 px-4 backdrop-blur-xl md:px-7">
+    <header className="sticky top-0 z-30 flex h-16 shrink-0 items-center border-b border-line bg-white/90 px-4 backdrop-blur-xl md:px-7">
       <button ref={menuButtonRef} type="button" className="mr-3 rounded-lg p-2 text-muted hover:bg-canvas lg:hidden" onClick={onOpenMenu} aria-label="打开菜单" aria-controls="app-sidebar" aria-expanded={mobileMenuOpen}>
         <Menu size={20} />
       </button>
@@ -454,6 +455,8 @@ function RouteContent() {
 
 export function AppShell() {
   const location = useLocation();
+  const isWorkflowWorkspace = /^\/missions\/[^/]+\/workflow\/?$/.test(location.pathname);
+  const isExecutionWorkspace = /^\/missions\/[^/]+\/execution\/?$/.test(location.pathname);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [desktopSidebar, setDesktopSidebar] = useState(() => window.matchMedia('(min-width: 1024px)').matches);
@@ -515,9 +518,13 @@ export function AppShell() {
   return (
     <div className="flex min-h-screen bg-canvas">
       <Sidebar open={mobileOpen} interactive={desktopSidebar || mobileOpen} sidebarRef={sidebarRef} onClose={closeMobileMenu} onOpenAuth={openAuth} />
-      <div className="min-w-0 flex-1">
+      <div className={`min-w-0 flex-1 ${isWorkflowWorkspace ? 'flex h-dvh min-h-0 flex-col overflow-hidden' : isExecutionWorkspace ? 'xl:flex xl:h-dvh xl:min-h-0 xl:flex-col xl:overflow-hidden' : ''}`}>
         <Topbar mobileMenuOpen={mobileOpen} menuButtonRef={menuButtonRef} onOpenMenu={openMobileMenu} />
-        <main className="mx-auto w-full max-w-[1540px] p-4 pb-28 md:p-7 md:pb-28 xl:p-8 xl:pb-28">
+        <main className={isWorkflowWorkspace
+          ? 'mx-auto min-h-0 w-full max-w-[1800px] flex-1 overflow-hidden p-2.5 sm:p-3 md:p-4'
+          : isExecutionWorkspace
+            ? 'mx-auto w-full max-w-[1540px] p-4 pb-28 md:p-7 md:pb-28 xl:min-h-0 xl:flex-1 xl:overflow-hidden xl:p-5'
+          : 'mx-auto w-full max-w-[1540px] p-4 pb-28 md:p-7 md:pb-28 xl:p-8 xl:pb-28'}>
           <RouteContent />
         </main>
       </div>

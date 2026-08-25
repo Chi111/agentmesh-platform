@@ -7,6 +7,22 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: false,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: "vendor",
+              test: /node_modules[\\/]/,
+              entriesAware: true,
+              includeDependenciesRecursively: false,
+              minSize: 20 * 1024,
+              maxSize: 400 * 1024,
+            },
+          ],
+        },
+      },
+    },
   },
   resolve: {
     alias: {

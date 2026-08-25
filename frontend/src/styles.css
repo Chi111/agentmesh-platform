@@ -76,4 +76,114 @@
     background-image: radial-gradient(circle, rgba(102, 112, 120, 0.22) 1px, transparent 1px);
     background-size: 18px 18px;
   }
+
+  .contract-hero-glow::before {
+    position: absolute;
+    inset: -12% -15% auto 42%;
+    height: 680px;
+    border-radius: 999px;
+    background:
+      radial-gradient(circle at 48% 44%, rgba(50, 212, 231, 0.17), transparent 47%),
+      radial-gradient(circle at 72% 35%, rgba(183, 243, 74, 0.08), transparent 32%);
+    content: '';
+    filter: blur(8px);
+    pointer-events: none;
+  }
+
+  .contract-orbit::before,
+  .contract-orbit::after {
+    position: absolute;
+    border-radius: 999px;
+    content: '';
+    pointer-events: none;
+  }
+
+  .contract-orbit::before {
+    inset: 3%;
+    border: 1px solid rgba(50, 212, 231, 0.08);
+    box-shadow: inset 0 0 70px rgba(50, 212, 231, 0.035);
+  }
+
+  .contract-orbit::after {
+    inset: 16%;
+    background: conic-gradient(from 210deg, transparent 0 45%, rgba(50, 212, 231, 0.14) 55%, transparent 66%);
+    mask: radial-gradient(circle, transparent 67%, #000 68% 69%, transparent 70%);
+    animation: contract-orbit-spin 18s linear infinite;
+  }
+
+  @keyframes contract-orbit-spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .contract-orbit::after {
+      animation: none;
+    }
+  }
+
+  .workflow-editor-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workflow-execution-flow {
+    --xy-background-color: transparent;
+    --xy-attribution-background-color: rgba(13, 17, 23, 0.82);
+    --xy-controls-button-background-color: #162129;
+    --xy-controls-button-background-color-hover: #21313b;
+    --xy-controls-button-color: #aebbc3;
+    --xy-controls-button-color-hover: #00b8d9;
+    --xy-controls-button-border-color: rgba(255, 255, 255, 0.1);
+    --xy-controls-box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  }
+
+  .workflow-execution-flow .react-flow__controls {
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+  }
+
+  .workflow-execution-flow .react-flow__attribution {
+    border-left: 1px solid rgba(255, 255, 255, 0.08);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    border-top-left-radius: 6px;
+    padding: 3px 6px;
+  }
+
+  .workflow-execution-flow .react-flow__attribution a {
+    color: rgba(255, 255, 255, 0.36);
+    transition: color 150ms ease;
+  }
+
+  .workflow-execution-flow .react-flow__attribution a:hover {
+    color: #00b8d9;
+  }
+
+  @media (min-width: 1024px) and (max-width: 1279px) {
+    .workflow-editor-grid[data-library='open'][data-inspector='closed'] {
+      grid-template-columns: 200px minmax(0, 1fr);
+    }
+
+    .workflow-editor-grid[data-inspector='open'] {
+      grid-template-columns: minmax(0, 1fr) 320px;
+    }
+
+    .workflow-editor-grid[data-inspector='open'] > .workflow-library-sidebar {
+      display: none !important;
+    }
+  }
+
+  @media (min-width: 1280px) {
+    .workflow-editor-grid[data-library='open'][data-inspector='open'] {
+      grid-template-columns: 200px minmax(0, 1fr) 320px;
+    }
+
+    .workflow-editor-grid[data-library='open'][data-inspector='closed'] {
+      grid-template-columns: 200px minmax(0, 1fr);
+    }
+
+    .workflow-editor-grid[data-library='closed'][data-inspector='open'] {
+      grid-template-columns: minmax(0, 1fr) 320px;
+    }
+  }
 }

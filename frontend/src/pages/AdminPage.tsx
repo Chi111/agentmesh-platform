@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, History, LoaderCircle, Search, ShieldCheck, UserCog, Users, type LucideIcon } from 'lucide-react';
+import { Activity, AlertTriangle, History, LoaderCircle, Search, ShieldCheck, UserCog, Users, Vote, type LucideIcon } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
@@ -34,6 +34,7 @@ export function AdminPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [pending, setPending] = useState<PendingRoleChange | null>(null);
+  const [committeeBusyId, setCommitteeBusyId] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -62,12 +63,32 @@ export function AdminPage() {
     users: users.length,
     developers: users.filter((user) => user.role === 'developer').length,
     admins: users.filter((user) => user.role === 'admin').length,
+    arbitrators: users.filter((user) => user.arbitration?.status === 'active').length,
   };
   const metrics: Array<{ icon: LucideIcon; value: number; label: string }> = [
     { icon: Users, value: counts.users, label: '工作区成员' },
     { icon: UserCog, value: counts.developers, label: 'Agent 开发者' },
     { icon: ShieldCheck, value: counts.admins, label: '平台管理员' },
+    { icon: Vote, value: counts.arbitrators, label: '活跃仲裁委员' },
   ];
+
+  const toggleArbitrator = async (user: AdminUser) => {
+    const active = user.arbitration?.status !== 'active';
+    setCommitteeBusyId(user.id);
+    setError('');
+    try {
+      const member = await api.setArbitrationMember(user.id, active);
+      setUsers((current) => current.map((item) => item.id === user.id ? {
+        ...item,
+        arbitration: { status: member.status, power: member.power },
+      } : item));
+      showToast(`${user.displayName} 已${active ? '加入' : '退出'}仲裁委员会。`, 'success');
+    } catch (memberError) {
+      setError(memberError instanceof Error ? memberError.message : '仲裁委员状态更新失败。');
+    } finally {
+      setCommitteeBusyId('');
+    }
+  };
 
   const confirmRoleChange = async () => {
     if (!pending) return;
@@ -94,7 +115,7 @@ export function AdminPage() {
     <div className="space-y-7">
       <PageHeader eyebrow="Platform Operations" title="平台运营" description="管理工作区成员与角色，查看关键权限变更。角色授权在服务端执行，并保留不可变审计记录。" actions={<span className="mono-chip">LIVE ADMIN</span>} />
 
-      <section className="grid gap-4 md:grid-cols-3">
+      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {metrics.map(({ icon: Icon, value, label }) => <article className="panel flex items-center gap-4 p-5" key={label}><span className="flex size-11 items-center justify-center rounded-xl bg-cyan/10 text-cyan"><Icon size={20} /></span><div><p className="font-mono text-2xl font-semibold">{value}</p><p className="mt-1 text-xs text-muted">{label}</p></div></article>)}
       </section>
 
@@ -102,8 +123,8 @@ export function AdminPage() {
 
       <div className="grid gap-5 2xl:grid-cols-[minmax(0,1.55fr)_minmax(360px,.75fr)]">
         <section className="panel overflow-hidden">
-          <div className="flex flex-col gap-4 border-b border-line p-5 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="font-semibold">成员与权限</h2><p className="mt-1 text-xs text-muted">不能修改自己的管理员角色，系统始终保留至少一位管理员。</p></div><label className="relative w-full sm:w-64"><Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" size={15} /><input className="field h-10 pl-9" aria-label="搜索成员" placeholder="搜索姓名、邮箱或 ID" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
-          {loading ? <div className="flex min-h-72 items-center justify-center text-sm text-muted"><LoaderCircle className="mr-2 animate-spin" size={18} />同步运营数据…</div> : <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left"><thead className="bg-canvas text-[10px] uppercase tracking-[0.12em] text-muted"><tr><th className="px-5 py-3 font-medium">成员</th><th className="px-5 py-3 font-medium">身份</th><th className="px-5 py-3 font-medium">最近更新</th><th className="px-5 py-3 text-right font-medium">角色</th></tr></thead><tbody className="divide-y divide-line">{filteredUsers.map((user) => <tr className="transition hover:bg-canvas/70" key={user.id}><td className="px-5 py-4"><div className="flex items-center gap-3"><span className="flex size-9 items-center justify-center rounded-xl bg-ink font-mono text-[10px] text-cyan">{user.displayName.slice(0, 2).toUpperCase()}</span><span><span className="block text-sm font-semibold">{user.displayName}</span><span className="mt-1 block font-mono text-[9px] text-muted">{user.id}</span></span></div></td><td className="px-5 py-4"><p className="text-xs font-medium">{user.email ?? '无邮箱账户'}</p><p className="mt-1 max-w-64 truncate font-mono text-[9px] text-muted">{user.walletAddress ?? 'No linked wallet'}</p></td><td className="px-5 py-4 text-xs text-muted">{formatTime(user.updatedAt || user.createdAt)}</td><td className="px-5 py-4 text-right">{user.id === profile?.id ? <span className={`inline-flex rounded-full px-2.5 py-1 text-[10px] font-semibold ${roleMeta[user.role].className}`}>{roleMeta[user.role].label} · 当前账户</span> : <select className="field ml-auto h-9 w-28 py-1 text-xs" aria-label={`调整 ${user.displayName} 的角色`} value={user.role} onChange={(event) => { const role = event.target.value as UserProfile['role']; if (role !== user.role) setPending({ user, role }); }}><option value="requester">任务方</option><option value="developer">开发者</option><option value="admin">管理员</option></select>}</td></tr>)}{filteredUsers.length === 0 ? <tr><td colSpan={4} className="px-5 py-14 text-center text-sm text-muted">没有匹配的工作区成员</td></tr> : null}</tbody></table></div>}
+          <div className="flex flex-col gap-4 border-b border-line p-5 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="font-semibold">成员与治理权限</h2><p className="mt-1 text-xs text-muted">仲裁委员身份独立于平台角色；首版一人一票，Power 固定为 1。</p></div><label className="relative w-full sm:w-64"><Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" size={15} /><input className="field h-10 pl-9" aria-label="搜索成员" placeholder="搜索姓名、邮箱或 ID" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
+          {loading ? <div className="flex min-h-72 items-center justify-center text-sm text-muted"><LoaderCircle className="mr-2 animate-spin" size={18} />同步运营数据…</div> : <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left"><thead className="bg-canvas text-[10px] uppercase tracking-[0.12em] text-muted"><tr><th className="px-5 py-3 font-medium">成员</th><th className="px-5 py-3 font-medium">身份</th><th className="px-5 py-3 font-medium">仲裁委员会</th><th className="px-5 py-3 font-medium">最近更新</th><th className="px-5 py-3 text-right font-medium">角色</th></tr></thead><tbody className="divide-y divide-line">{filteredUsers.map((user) => <tr className="transition hover:bg-canvas/70" key={user.id}><td className="px-5 py-4"><div className="flex items-center gap-3"><span className="flex size-9 items-center justify-center rounded-xl bg-ink font-mono text-[10px] text-cyan">{user.displayName.slice(0, 2).toUpperCase()}</span><span><span className="block text-sm font-semibold">{user.displayName}</span><span className="mt-1 block font-mono text-[9px] text-muted">{user.id}</span></span></div></td><td className="px-5 py-4"><p className="text-xs font-medium">{user.email ?? '无邮箱账户'}</p><p className="mt-1 max-w-64 truncate font-mono text-[9px] text-muted">{user.walletAddress ?? 'No linked wallet'}</p></td><td className="px-5 py-4"><button type="button" className={`inline-flex min-h-9 items-center gap-2 rounded-full border px-3 text-xs font-semibold transition ${user.arbitration?.status === 'active' ? 'border-cyan/30 bg-cyan/10 text-cyan' : 'border-line bg-white text-muted'}`} disabled={Boolean(committeeBusyId)} onClick={() => void toggleArbitrator(user)}>{committeeBusyId === user.id ? <LoaderCircle className="animate-spin" size={13} /> : <span className={`size-2 rounded-full ${user.arbitration?.status === 'active' ? 'bg-cyan' : 'bg-muted/35'}`} />}{user.arbitration?.status === 'active' ? `委员 · Power ${user.arbitration.power}` : '任命为委员'}</button></td><td className="px-5 py-4 text-xs text-muted">{formatTime(user.updatedAt || user.createdAt)}</td><td className="px-5 py-4 text-right">{user.id === profile?.id ? <span className={`inline-flex rounded-full px-2.5 py-1 text-[10px] font-semibold ${roleMeta[user.role].className}`}>{roleMeta[user.role].label} · 当前账户</span> : <select className="field ml-auto h-9 w-28 py-1 text-xs" aria-label={`调整 ${user.displayName} 的角色`} value={user.role} onChange={(event) => { const role = event.target.value as UserProfile['role']; if (role !== user.role) setPending({ user, role }); }}><option value="requester">任务方</option><option value="developer">开发者</option><option value="admin">管理员</option></select>}</td></tr>)}{filteredUsers.length === 0 ? <tr><td colSpan={5} className="px-5 py-14 text-center text-sm text-muted">没有匹配的工作区成员</td></tr> : null}</tbody></table></div>}
         </section>
 
         <section className="panel self-start p-5"><div className="flex items-center justify-between"><div><h2 className="font-semibold">权限审计</h2><p className="mt-1 text-xs text-muted">最近的管理员操作</p></div><History className="text-cyan" size={19} /></div><div className="mt-5 space-y-3">{actions.length ? actions.slice(0, 12).map((action) => <article className="rounded-xl border border-line bg-canvas p-4" key={action.id}><div className="flex items-center gap-2"><Activity className="text-cyan" size={14} /><p className="text-xs font-semibold">{userNames.get(action.actorId) ?? action.actorId}</p></div><p className="mt-2 text-xs leading-5 text-muted">将 <span className="font-semibold text-ink">{userNames.get(action.targetUserId) ?? action.targetUserId}</span> 从{roleMeta[action.detail.previousRole].label}调整为{roleMeta[action.detail.nextRole].label}</p><p className="mt-2 font-mono text-[9px] text-muted/70">{formatTime(action.createdAt)}</p></article>) : <p className="rounded-xl border border-dashed border-line px-4 py-10 text-center text-xs text-muted">尚无角色变更记录</p>}</div></section>

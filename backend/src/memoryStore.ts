@@ -5,11 +5,20 @@ import type {
   AgentStatus,
   AdminAction,
   AdminUser,
+  ArbitrationElector,
+  ArbitrationMember,
+  ArbitrationProposal,
   AuthIdentityInput,
   Deliverable,
   DeveloperLedger,
   Dispute,
   DisputeAction,
+  DisputeFinalizeResult,
+  DisputeGovernance,
+  DisputeVote,
+  DisputeVoteChoice,
+  DisputeVoteMutationResult,
+  DispatchOutboxItem,
   Escrow,
   ExecutionEvent,
   IdempotencyClaim,
@@ -25,7 +34,11 @@ import type {
   WalletAccount,
   WalletTransaction,
   WorkflowStage,
+  WorkflowDraftSaveResult,
+  WorkflowEdge,
+  WorkflowViewport,
 } from './contracts';
+import { arbitrationQuorum, arbitrationVotingEndsAt, evaluateArbitrationProposal } from './arbitration';
 import { paymentConfig, TEST_TOPUP_AMOUNT } from './payments';
 
 function copy<T>(value: T): T {
@@ -56,6 +69,7 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly agents = new Map<string, Agent>();
   readonly missions = new Map<string, Mission>();
   readonly stages = new Map<string, WorkflowStage[]>();
+  readonly edges = new Map<string, WorkflowEdge[]>();
   readonly stageOffers = new Map<string, StageOffer[]>();
   readonly agentPerformance = new Map<string, { agentId: string; outcome: 'done' | 'failed' }>();
   readonly events = new Map<string, ExecutionEvent[]>();
@@ -63,6 +77,10 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly escrows = new Map<string, Escrow>();
   readonly disputes = new Map<string, Dispute[]>();
   readonly disputeActions = new Map<string, DisputeAction[]>();
+  readonly arbitrationMembers = new Map<string, ArbitrationMember>();
+  readonly disputeProposals = new Map<string, ArbitrationProposal>();
+  readonly disputeElectorate = new Map<string, ArbitrationElector[]>();
+  readonly disputeVotes = new Map<string, DisputeVote[]>();
   readonly notifications = new Map<string, Notification[]>();
   readonly preferences = new Map<string, UserPreferences>();
   readonly adminActions: AdminAction[] = [];
@@ -74,6 +92,7 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly identities = new Map<string, string>();
   readonly rateLimits = new Map<string, { windowStart: number; count: number }>();
   readonly agentDispatches = new Map<string, AgentDispatch & { completedAt: string | null; callbackIds: Set<string> }>();
+  readonly dispatchOutbox = new Map<string, DispatchOutboxItem & { status: 'pending' | 'processing' | 'done' }>();
 
   private recordAgentPerformance(stageId: string, agentId: string, outcome: 'done' | 'failed') {
     if (this.agentPerformance.has(stageId)) return;
@@ -190,9 +209,10 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(this.missions.get(id) ?? null);
   }
 
-  async createMission(mission: Mission, stages: WorkflowStage[]): Promise<Mission> {
+  async createMission(mission: Mission, stages: WorkflowStage[], edges: WorkflowEdge[] = []): Promise<Mission> {
     this.missions.set(mission.id, copy(mission));
     this.stages.set(mission.id, copy(stages));
+    this.edges.set(mission.id, copy(edges));
     const now = mission.createdAt;
     const payment = paymentConfig(mission.paymentMethod);
     this.escrows.set(mission.id, {
@@ -205,15 +225,45 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(mission);
   }
 
-  async saveCompilation(id: string, spec: Record<string, unknown>, stages: WorkflowStage[]): Promise<Mission | null> {
+  async saveCompilation(
+    id: string,
+    spec: Record<string, unknown>,
+    stages: WorkflowStage[],
+    edges: WorkflowEdge[],
+    expectedVersion: number,
+  ): Promise<WorkflowDraftSaveResult> {
+    const result = await this.saveWorkflowDraft(id, stages, edges, { x: 0, y: 0, zoom: 1 }, expectedVersion);
+    if (result.state !== 'saved') return result;
+    const updated = { ...result.mission, compiledSpec: copy(spec), currentStage: 'AI 已生成 DAG 工作流' };
+    this.missions.set(id, updated);
+    return { state: 'saved', mission: copy(updated) };
+  }
+
+  async saveWorkflowDraft(
+    id: string,
+    stages: WorkflowStage[],
+    edges: WorkflowEdge[],
+    viewport: WorkflowViewport,
+    expectedVersion: number,
+  ): Promise<WorkflowDraftSaveResult> {
     const mission = this.missions.get(id);
-    if (!mission) return null;
-    if (!['draft', 'matching'].includes(mission.status) || this.escrows.get(id)?.status !== 'pending') return copy(mission);
-    const updated: Mission = { ...mission, compiledSpec: copy(spec), status: 'matching', currentStage: 'AI 已生成执行工作流' };
+    if (!mission) return { state: 'missing' };
+    if (!['draft', 'matching'].includes(mission.status) || this.escrows.get(id)?.status !== 'pending') return { state: 'locked' };
+    if (mission.workflowVersion !== expectedVersion) return { state: 'version_conflict' };
+    const updated: Mission = {
+      ...mission,
+      workflowVersion: mission.workflowVersion + 1,
+      workflowViewport: copy(viewport),
+      compiledSpec: null,
+      team: [],
+      status: 'matching',
+      currentStage: 'DAG 草稿已保存，等待校验与邀请',
+    };
     this.missions.set(id, updated);
     this.stages.set(id, copy(stages));
+    this.edges.set(id, copy(edges));
     this.stageOffers.delete(id);
-    return copy(updated);
+    return { state: 'saved', mission: copy(updated) };
   }
 
   async confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[]): Promise<Mission | null> {
@@ -240,7 +290,8 @@ export class MemoryPlatformStore implements PlatformStore {
     const currentEscrow = this.escrows.get(id);
     const stages = this.stages.get(id) ?? [];
     const offers = this.stageOffers.get(id) ?? [];
-    const accepted = stages.length > 0 && stages.every((stage) => stage.agentId && offers.some((offer) => (
+    const taskStages = stages.filter((stage) => stage.nodeType === 'task');
+    const accepted = taskStages.length > 0 && taskStages.every((stage) => stage.agentId && offers.some((offer) => (
       offer.stageId === stage.id
       && offer.agentId === stage.agentId
       && offer.status === 'accepted'
@@ -347,6 +398,10 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(this.stages.get(missionId) ?? []);
   }
 
+  async listEdges(missionId: string): Promise<WorkflowEdge[]> {
+    return copy(this.edges.get(missionId) ?? []);
+  }
+
   async listStageOffers(missionId: string, now = new Date().toISOString()): Promise<StageOffer[]> {
     return copy((this.stageOffers.get(missionId) ?? []).map((offer) => (
       offer.status === 'pending' && Date.parse(offer.expiresAt) <= Date.parse(now)
@@ -380,7 +435,8 @@ export class MemoryPlatformStore implements PlatformStore {
           this.missions.set(missionId, { ...mission, currentStage: 'Agent 已拒绝接单，等待重新选择', updatedAt: respondedAt });
         } else {
           const stages = this.stages.get(missionId) ?? [];
-          const allAccepted = stages.length > 0 && stages.every((stage) => stage.agentId && next.some((candidate) => (
+          const taskStages = stages.filter((stage) => stage.nodeType === 'task');
+          const allAccepted = taskStages.length > 0 && taskStages.every((stage) => stage.agentId && next.some((candidate) => (
             candidate.stageId === stage.id
             && candidate.agentId === stage.agentId
             && candidate.status === 'accepted'
@@ -398,9 +454,15 @@ export class MemoryPlatformStore implements PlatformStore {
     const mission = this.missions.get(missionId);
     const escrow = this.escrows.get(missionId);
     if (mission?.status !== 'running' || escrow?.status !== 'held') return null;
-    const index = stages.findIndex((stage) => stage.id === stageId && (stage.status === 'queued' || stage.status === 'failed'));
-    if (index < 0) return null;
-    const updated = { ...stages[index], status: 'running' as const };
+    const edges = this.edges.get(missionId) ?? [];
+    const dependenciesDone = edges
+      .filter((edge) => edge.targetStageId === stageId)
+      .every((edge) => stages.find((stage) => stage.id === edge.sourceStageId)?.status === 'done');
+    const index = stages.findIndex((stage) => (
+      stage.id === stageId && stage.nodeType === 'task' && stage.agentId && (stage.status === 'queued' || stage.status === 'failed')
+    ));
+    if (index < 0 || !dependenciesDone) return null;
+    const updated = { ...stages[index], status: 'running' as const, progress: Math.max(1, stages[index].progress) };
     const next = [...stages];
     next[index] = updated;
     this.stages.set(missionId, next);
@@ -410,6 +472,90 @@ export class MemoryPlatformStore implements PlatformStore {
   async resetStageDispatch(missionId: string, stageId: string): Promise<void> {
     const stages = this.stages.get(missionId) ?? [];
     this.stages.set(missionId, stages.map((stage) => stage.id === stageId && stage.status === 'running' ? { ...stage, status: 'queued' } : stage));
+  }
+
+  async setStageProgress(missionId: string, stageId: string, progress: number): Promise<WorkflowStage | null> {
+    const stages = this.stages.get(missionId) ?? [];
+    const index = stages.findIndex((stage) => stage.id === stageId && stage.status === 'running');
+    if (index < 0) return null;
+    const updated = { ...stages[index], progress: Math.max(stages[index].progress, Math.min(100, progress)) };
+    const next = [...stages];
+    next[index] = updated;
+    this.stages.set(missionId, next);
+    return copy(updated);
+  }
+
+  async resetWorkflowNodes(missionId: string, stageIds: string[], gateId?: string): Promise<void> {
+    const ids = new Set([...stageIds, ...(gateId ? [gateId] : [])]);
+    const stages = this.stages.get(missionId) ?? [];
+    this.stages.set(missionId, stages.map((stage) => ids.has(stage.id)
+      ? { ...stage, status: 'queued' as const, progress: 0, output: null }
+      : stage));
+  }
+
+  async updateMissionWorkflowState(missionId: string, progress: number, currentStage: string): Promise<Mission | null> {
+    const mission = this.missions.get(missionId);
+    if (!mission) return null;
+    const updated = { ...mission, progress: Math.max(0, Math.min(100, progress)), currentStage, updatedAt: new Date().toISOString() };
+    this.missions.set(missionId, updated);
+    return copy(updated);
+  }
+
+  async enqueueDispatches(missionId: string, stageIds: string[], now: string): Promise<DispatchOutboxItem[]> {
+    const queued: DispatchOutboxItem[] = [];
+    const expiresAt = new Date(Date.parse(now) + 2 * 60 * 60 * 1_000).toISOString();
+    for (const stageId of stageIds) {
+      const existing = [...this.dispatchOutbox.values()].find((item) => item.missionId === missionId && item.stageId === stageId);
+      const item = existing
+        ? {
+          ...existing,
+          status: existing.status === 'done' ? 'pending' as const : existing.status,
+          runId: existing.status === 'done' ? crypto.randomUUID() : existing.runId,
+          expiresAt: existing.status === 'done' ? expiresAt : existing.expiresAt,
+          nextAttemptAt: now,
+          updatedAt: now,
+        }
+        : {
+          id: `OUTBOX-${crypto.randomUUID()}`,
+          missionId,
+          stageId,
+          runId: crypto.randomUUID(),
+          expiresAt,
+          status: 'pending' as const,
+          attempts: 0,
+          nextAttemptAt: now,
+          createdAt: now,
+          updatedAt: now,
+        };
+      this.dispatchOutbox.set(item.id, item);
+      queued.push(copy(item));
+    }
+    return queued;
+  }
+
+  async listPendingDispatches(limit: number, now: string): Promise<DispatchOutboxItem[]> {
+    for (const [id, item] of this.dispatchOutbox) {
+      if (item.status === 'processing' && Date.parse(item.updatedAt) <= Date.parse(now) - 2 * 60 * 1_000) {
+        this.dispatchOutbox.set(id, { ...item, status: 'pending', nextAttemptAt: now, updatedAt: now });
+      }
+    }
+    return copy([...this.dispatchOutbox.values()]
+      .filter((item) => item.status === 'pending' && Date.parse(item.nextAttemptAt) <= Date.parse(now))
+      .sort((left, right) => left.nextAttemptAt.localeCompare(right.nextAttemptAt) || left.createdAt.localeCompare(right.createdAt))
+      .slice(0, limit));
+  }
+
+  async claimDispatch(id: string, now: string): Promise<boolean> {
+    const item = this.dispatchOutbox.get(id);
+    if (!item || item.status !== 'pending' || Date.parse(item.nextAttemptAt) > Date.parse(now)) return false;
+    this.dispatchOutbox.set(id, { ...item, status: 'processing', attempts: item.attempts + 1, updatedAt: now });
+    return true;
+  }
+
+  async completeDispatch(id: string, status: 'done' | 'pending', now: string, nextAttemptAt = now): Promise<void> {
+    const item = this.dispatchOutbox.get(id);
+    if (!item || item.status !== 'processing') return;
+    this.dispatchOutbox.set(id, { ...item, status, nextAttemptAt, updatedAt: now });
   }
 
   async updateStage(
@@ -424,6 +570,7 @@ export class MemoryPlatformStore implements PlatformStore {
     const updated: WorkflowStage = {
       ...stages[index],
       status,
+      progress: status === 'done' ? 100 : status === 'queued' ? 0 : stages[index].progress,
       ...(output === undefined ? {} : { output: copy(output) }),
     };
     const next = [...stages];
@@ -447,6 +594,7 @@ export class MemoryPlatformStore implements PlatformStore {
     const updated: WorkflowStage = {
       ...stages[index],
       status,
+      progress: status === 'done' ? 100 : stages[index].progress,
       ...(output === undefined ? {} : { output: copy(output) }),
     };
     const next = [...stages];
@@ -515,8 +663,12 @@ export class MemoryPlatformStore implements PlatformStore {
 
   async listDisputes(user: UserContext): Promise<Dispute[]> {
     const all = [...this.disputes.values()].flat();
-    if (user.role === 'admin') return copy(all);
-    return copy(all.filter((dispute) => this.missions.get(dispute.missionId)?.requesterId === user.id || dispute.openedBy === user.id));
+    if (user.role === 'admin' || this.arbitrationMembers.get(user.id)?.status === 'active') return copy(all);
+    return copy(all.filter((dispute) => {
+      if (this.missions.get(dispute.missionId)?.requesterId === user.id || dispute.openedBy === user.id) return true;
+      const proposal = this.disputeProposals.get(dispute.id);
+      return proposal ? (this.disputeElectorate.get(proposal.id) ?? []).some((elector) => elector.userId === user.id) : false;
+    }));
   }
 
   async getDisputes(missionId: string): Promise<Dispute[]> {
@@ -537,35 +689,180 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(dispute);
   }
 
-  async startDisputeReview(id: string, actorId: string): Promise<Dispute | null> {
+  async startDisputeReview(id: string, actorId: string, startedAt = new Date().toISOString()): Promise<Dispute | null> {
     for (const [missionId, disputes] of this.disputes) {
       const index = disputes.findIndex((dispute) => dispute.id === id);
       if (index < 0) continue;
       const existing = disputes[index];
-      if (existing.status !== 'open') return copy(existing);
-      const createdAt = new Date().toISOString();
+      if (!['open', 'reviewing'].includes(existing.status)) return copy(existing);
+      if (this.disputeProposals.has(id)) {
+        if (existing.status === 'open') {
+          const next = [...disputes];
+          next[index] = { ...existing, status: 'reviewing' };
+          this.disputes.set(missionId, next);
+          return copy(next[index]);
+        }
+        return copy(existing);
+      }
+      if (this.arbitrationMembers.size === 0) {
+        for (const profile of this.profiles.values()) {
+          if (profile.role !== 'admin') continue;
+          this.arbitrationMembers.set(profile.id, {
+            userId: profile.id,
+            displayName: profile.displayName,
+            email: profile.email,
+            role: profile.role,
+            status: 'active',
+            power: 1,
+            appointedBy: profile.id,
+            appointedAt: startedAt,
+            updatedAt: startedAt,
+          });
+        }
+      }
+      const mission = this.missions.get(missionId);
+      const conflictIds = new Set<string>([existing.openedBy]);
+      if (mission) conflictIds.add(mission.requesterId);
+      for (const stage of this.stages.get(missionId) ?? []) {
+        const ownerId = stage.agentId ? this.agents.get(stage.agentId)?.ownerId : null;
+        if (ownerId) conflictIds.add(ownerId);
+      }
+      const eligibleMembers = [...this.arbitrationMembers.values()]
+        .filter((member) => member.status === 'active' && !conflictIds.has(member.userId))
+        .sort((left, right) => left.userId.localeCompare(right.userId));
+      if (eligibleMembers.length === 0) throw new Error('ARBITRATION_NO_ELIGIBLE_MEMBERS');
+      const proposalId = `PROP-${crypto.randomUUID()}`;
+      const proposal: ArbitrationProposal = {
+        id: proposalId,
+        disputeId: id,
+        proposerId: actorId,
+        status: 'active',
+        weightMode: 'one_person_one_vote',
+        votingStartsAt: startedAt,
+        votingEndsAt: arbitrationVotingEndsAt(startedAt),
+        quorumRequired: arbitrationQuorum(eligibleMembers.length),
+        eligibleWeight: eligibleMembers.length,
+        supportVotes: 0,
+        opposeVotes: 0,
+        abstainVotes: 0,
+        outcome: null,
+        finalizedAt: null,
+        finalizedBy: null,
+        executedAt: null,
+        executedBy: null,
+        createdAt: startedAt,
+      };
+      this.disputeProposals.set(id, proposal);
+      this.disputeElectorate.set(proposalId, eligibleMembers.map((member) => ({
+        userId: member.userId,
+        displayName: member.displayName,
+        powerSnapshot: member.power,
+        voteWeight: 1,
+      })));
+      this.disputeVotes.set(proposalId, []);
       const updated = { ...existing, status: 'reviewing' as const };
       const next = [...disputes];
       next[index] = updated;
       this.disputes.set(missionId, next);
       this.disputeActions.set(id, [...(this.disputeActions.get(id) ?? []), {
-        id: `${id}:review_started`, disputeId: id, actorId, action: 'review_started', note: null, createdAt,
+        id: `${id}:review_started`, disputeId: id, actorId, action: 'review_started',
+        note: `DAO proposal ${proposalId} created with ${eligibleMembers.length} eligible voters`, createdAt: startedAt,
       }]);
       return copy(updated);
     }
     return null;
   }
 
+  async getDisputeGovernance(id: string, userId: string, now = new Date().toISOString()): Promise<DisputeGovernance | null> {
+    const dispute = [...this.disputes.values()].flat().find((item) => item.id === id);
+    if (!dispute) return null;
+    const proposal = this.disputeProposals.get(id) ?? null;
+    if (!proposal) {
+      return { proposal: null, electorate: [], votes: [], currentUser: { eligible: false, canVote: false, hasVoted: false, choice: null } };
+    }
+    const electorate = this.disputeElectorate.get(proposal.id) ?? [];
+    const votes = this.disputeVotes.get(proposal.id) ?? [];
+    const currentVote = votes.find((vote) => vote.voterId === userId);
+    const eligible = electorate.some((elector) => elector.userId === userId);
+    return copy({
+      proposal,
+      electorate,
+      votes,
+      currentUser: {
+        eligible,
+        canVote: eligible && !currentVote && proposal.status === 'active'
+          && Date.parse(now) >= Date.parse(proposal.votingStartsAt)
+          && Date.parse(now) < Date.parse(proposal.votingEndsAt),
+        hasVoted: Boolean(currentVote),
+        choice: currentVote?.choice ?? null,
+      },
+    });
+  }
+
+  async castDisputeVote(id: string, voterId: string, choice: DisputeVoteChoice, reason: string, votedAt: string): Promise<DisputeVoteMutationResult> {
+    const governance = await this.getDisputeGovernance(id, voterId, votedAt);
+    if (!governance?.proposal) return { state: 'missing' };
+    if (governance.proposal.status !== 'active') return { state: 'closed' };
+    if (Date.parse(votedAt) < Date.parse(governance.proposal.votingStartsAt)) return { state: 'closed' };
+    if (Date.parse(votedAt) >= Date.parse(governance.proposal.votingEndsAt)) return { state: 'expired' };
+    if (!governance.currentUser.eligible) return { state: 'not_eligible' };
+    if (governance.currentUser.hasVoted) return { state: 'already_voted' };
+    const elector = governance.electorate.find((item) => item.userId === voterId)!;
+    const profile = this.profiles.get(voterId);
+    const vote: DisputeVote = {
+      id: `VOTE-${crypto.randomUUID()}`,
+      proposalId: governance.proposal.id,
+      voterId,
+      voterDisplayName: profile?.displayName ?? voterId,
+      choice,
+      reason,
+      voteWeight: elector.voteWeight,
+      createdAt: votedAt,
+    };
+    this.disputeVotes.set(governance.proposal.id, [...governance.votes, vote]);
+    const proposal = this.disputeProposals.get(id)!;
+    this.disputeProposals.set(id, {
+      ...proposal,
+      supportVotes: proposal.supportVotes + (choice === 'support_refund' ? elector.voteWeight : 0),
+      opposeVotes: proposal.opposeVotes + (choice === 'oppose_refund' ? elector.voteWeight : 0),
+      abstainVotes: proposal.abstainVotes + (choice === 'abstain' ? elector.voteWeight : 0),
+    });
+    const finalized = await this.finalizeDisputeProposal(id, voterId, votedAt);
+    if (finalized.state === 'missing') return { state: 'missing' };
+    return { state: 'applied', governance: finalized.governance };
+  }
+
+  async finalizeDisputeProposal(id: string, actorId: string, finalizedAt: string): Promise<DisputeFinalizeResult> {
+    const governance = await this.getDisputeGovernance(id, actorId, finalizedAt);
+    if (!governance?.proposal) return { state: 'missing' };
+    if (governance.proposal.status !== 'active') return { state: 'finalized', governance };
+    const evaluation = evaluateArbitrationProposal(governance.proposal, finalizedAt);
+    if (!evaluation.finalizable) return { state: 'not_ready', governance };
+    this.disputeProposals.set(id, {
+      ...governance.proposal,
+      status: evaluation.status,
+      outcome: evaluation.outcome,
+      finalizedAt,
+      finalizedBy: actorId,
+    });
+    return { state: 'finalized', governance: (await this.getDisputeGovernance(id, actorId, finalizedAt))! };
+  }
+
   async resolveDispute(id: string, resolution: string, status: 'resolved' | 'rejected', actorId: string, resolutionTxHash: string | null) {
     for (const [missionId, disputes] of this.disputes) {
       const index = disputes.findIndex((dispute) => dispute.id === id);
       if (index < 0) continue;
-      if (disputes[index].status !== 'reviewing') return { dispute: copy(disputes[index]), applied: false };
+      const proposal = this.disputeProposals.get(id);
+      const authorized = status === 'resolved'
+        ? proposal?.status === 'succeeded' && proposal.outcome === 'refund_requester'
+        : proposal?.status === 'defeated' && proposal.outcome === 'reject_dispute';
+      if (disputes[index].status !== 'reviewing' || !authorized) return { dispute: copy(disputes[index]), applied: false };
       const resolvedAt = new Date().toISOString();
       const updated = { ...disputes[index], status, resolution, resolutionTxHash, resolvedAt };
       const next = [...disputes];
       next[index] = updated;
       this.disputes.set(missionId, next);
+      this.disputeProposals.set(id, { ...proposal!, status: 'executed', executedAt: resolvedAt, executedBy: actorId });
       const escrow = this.escrows.get(missionId);
       if (escrow?.status === 'frozen') {
         this.escrows.set(missionId, { ...escrow, status: status === 'resolved' ? 'refunded' : 'held', resolutionTxHash });
@@ -599,6 +896,7 @@ export class MemoryPlatformStore implements PlatformStore {
   }
 
   async createAgentDispatch(dispatch: AgentDispatch): Promise<void> {
+    if (this.agentDispatches.has(dispatch.runId)) return;
     this.agentDispatches.set(dispatch.runId, { ...copy(dispatch), completedAt: null, callbackIds: new Set() });
   }
 
@@ -623,6 +921,7 @@ export class MemoryPlatformStore implements PlatformStore {
     const stage: WorkflowStage = {
       ...stages[index],
       status: update.status,
+      progress: update.status === 'done' ? 100 : update.progress === undefined ? stages[index].progress : Math.max(stages[index].progress, update.progress),
       ...(update.output === undefined ? {} : { output: copy(update.output) }),
       updatedAt: update.now,
     };
@@ -631,6 +930,12 @@ export class MemoryPlatformStore implements PlatformStore {
     this.stages.set(update.missionId, nextStages);
     if (update.status === 'done' || update.status === 'failed') this.recordAgentPerformance(update.stageId, update.agentId, update.status);
     this.events.set(update.missionId, [...(this.events.get(update.missionId) ?? []), copy(update.event)]);
+    if (update.artifacts?.length) {
+      this.deliverables.set(update.missionId, [
+        ...(this.deliverables.get(update.missionId) ?? []),
+        ...update.artifacts.map(copy),
+      ]);
+    }
     this.missions.set(update.missionId, {
       ...mission,
       progress: update.progress === undefined ? mission.progress : Math.max(mission.progress, update.progress),
@@ -638,7 +943,11 @@ export class MemoryPlatformStore implements PlatformStore {
       updatedAt: update.now,
     });
     dispatch.callbackIds.add(update.callbackId);
-    if (update.status === 'done' || update.status === 'failed') dispatch.completedAt = update.now;
+    if (update.status === 'done' || update.status === 'failed') {
+      dispatch.completedAt = update.now;
+      const outbox = [...this.dispatchOutbox.values()].find((item) => item.runId === update.runId);
+      if (outbox) this.dispatchOutbox.set(outbox.id, { ...outbox, status: 'done', updatedAt: update.now });
+    }
     return { state: 'applied' as const, stage: copy(stage) };
   }
 
@@ -680,9 +989,41 @@ export class MemoryPlatformStore implements PlatformStore {
 
   async listAdminUsers(limit: number): Promise<AdminUser[]> {
     return copy([...this.profiles.values()]
-      .map((profile) => ({ ...profile, createdAt: '', updatedAt: '' }))
+      .map((profile) => {
+        const member = this.arbitrationMembers.get(profile.id);
+        return {
+          ...profile,
+          createdAt: '',
+          updatedAt: '',
+          arbitration: member ? { status: member.status, power: member.power } : null,
+        };
+      })
       .sort((left, right) => left.displayName.localeCompare(right.displayName))
       .slice(0, limit));
+  }
+
+  async listArbitrationMembers(): Promise<ArbitrationMember[]> {
+    return copy([...this.arbitrationMembers.values()]
+      .sort((left, right) => left.status.localeCompare(right.status) || left.displayName.localeCompare(right.displayName)));
+  }
+
+  async setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string): Promise<ArbitrationMember | null> {
+    const profile = this.profiles.get(userId);
+    if (!profile) return null;
+    const existing = this.arbitrationMembers.get(userId);
+    const member: ArbitrationMember = {
+      userId,
+      displayName: profile.displayName,
+      email: profile.email,
+      role: profile.role,
+      status: active ? 'active' : 'inactive',
+      power: existing?.power ?? 1,
+      appointedBy: existing?.appointedBy ?? actorId,
+      appointedAt: existing?.appointedAt ?? updatedAt,
+      updatedAt,
+    };
+    this.arbitrationMembers.set(userId, member);
+    return copy(member);
   }
 
   async countProfilesByRole(role: UserContext['role']): Promise<number> {
@@ -692,7 +1033,14 @@ export class MemoryPlatformStore implements PlatformStore {
   async updateAdminUserRole(targetId: string, role: UserContext['role'], actorId: string, createdAt: string): Promise<{ profile: AdminUser; action: AdminAction | null } | null> {
     const existing = this.profiles.get(targetId);
     if (!existing) return null;
-    const profile: AdminUser = { ...existing, role, createdAt: '', updatedAt: createdAt };
+    const member = this.arbitrationMembers.get(targetId);
+    const profile: AdminUser = {
+      ...existing,
+      role,
+      createdAt: '',
+      updatedAt: createdAt,
+      arbitration: member ? { status: member.status, power: member.power } : null,
+    };
     this.profiles.set(targetId, profile);
     if (existing.role === role) return { profile: copy(profile), action: null };
     const action: AdminAction = {
