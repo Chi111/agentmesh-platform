@@ -1,5 +1,9 @@
 import type {
   Agent,
+  AgentFeedback,
+  AgentQualityStats,
+  AgentQualityPublicDetail,
+  AdminAgentQualityRow,
   AdminAction,
   AdminUser,
   ArbitrationMember,
@@ -11,6 +15,9 @@ import type {
   DisputeGovernance,
   DisputeVoteChoice,
   ExecutionEvent,
+  EcosystemGovernanceDetail,
+  EcosystemProposalType,
+  EcosystemVoteChoice,
   Mission,
   MissionDetail,
   NewAgentInput,
@@ -22,6 +29,10 @@ import type {
   UserPreferences,
   UserRole,
   WalletAccount,
+  YdChainConfig,
+  YdFinanceOverview,
+  RewardEpoch,
+  RewardAllocation,
   WorkflowStage,
   WorkflowEdge,
   WorkflowViewport,
@@ -137,6 +148,7 @@ async function request<T>(
 
 export const api = {
   listAgents: () => request<Agent[]>('/api/agents'),
+  getAgentQuality: (agentId: string) => request<AgentQualityPublicDetail>(`/api/agents/${encodeURIComponent(agentId)}/quality`),
   register: (input: { email: string; password: string; displayName?: string }) =>
     request<{ user: unknown; emailVerificationRequired: boolean }>('/api/auth/register', {
       method: 'POST',
@@ -171,6 +183,53 @@ export const api = {
   }),
   getWalletAccount: () => request<WalletAccount>('/api/wallet', { authenticated: true }),
   claimTestCredit: () => request<{ account: WalletAccount; credited: boolean }>('/api/wallet/test-topup', {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  getYdConfig: () => request<YdChainConfig & { phase: string; escrowSeparated: boolean; earnVaultEnabled: boolean; warnings: string[] }>('/api/yd/config'),
+  getYdOverview: () => request<YdFinanceOverview>('/api/yd/overview', { authenticated: true }),
+  syncYdClaim: (epochId: string, txHash: string) => request<{ claim: unknown; applied: boolean }>('/api/yd/claims/sync', {
+    method: 'POST', authenticated: true, body: JSON.stringify({ epochId, txHash }),
+  }),
+  syncYdStaking: (txHash: string) => request<YdFinanceOverview['staking']>('/api/yd/staking/sync', {
+    method: 'POST', authenticated: true, body: JSON.stringify({ txHash }),
+  }),
+  createRewardEpoch: (input: {
+    epochNumber: number;
+    startsAt: string;
+    endsAt: string;
+    claimEndsAt: string;
+    totalRewardUnits: string;
+    accountScoreCap: number;
+    rules?: Record<string, unknown>;
+  }) => request<RewardEpoch>('/api/yd/admin/epochs', {
+    method: 'POST', authenticated: true, body: JSON.stringify(input),
+  }),
+  computeRewardEpoch: (epochId: string) => request<{ state: 'computed'; epoch: RewardEpoch; allocations: RewardAllocation[] }>(`/api/yd/admin/epochs/${encodeURIComponent(epochId)}/compute`, {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  publishRewardEpoch: (epochId: string, txHash: string) => request<RewardEpoch>(`/api/yd/admin/epochs/${encodeURIComponent(epochId)}/publish`, {
+    method: 'POST', authenticated: true, body: JSON.stringify({ txHash }),
+  }),
+  expireRewardEpoch: (epochId: string, txHash: string) => request<RewardEpoch>(`/api/yd/admin/epochs/${encodeURIComponent(epochId)}/expire`, {
+    method: 'POST', authenticated: true, body: JSON.stringify({ txHash }),
+  }),
+  listYdGovernance: () => request<EcosystemGovernanceDetail[]>('/api/yd/governance/proposals', { authenticated: true }),
+  createYdProposal: (input: {
+    proposalType: EcosystemProposalType;
+    title: string;
+    description: string;
+    payload?: Record<string, unknown>;
+    endsAt: string;
+    quorumBps: number;
+    approvalBps: number;
+    snapshotBlock?: string;
+  }) => request<EcosystemGovernanceDetail>('/api/yd/admin/governance/proposals', {
+    method: 'POST', authenticated: true, body: JSON.stringify(input),
+  }),
+  castYdVote: (proposalId: string, choice: EcosystemVoteChoice, reason: string) => request<EcosystemGovernanceDetail>(`/api/yd/governance/proposals/${encodeURIComponent(proposalId)}/votes`, {
+    method: 'POST', authenticated: true, body: JSON.stringify({ choice, reason }),
+  }),
+  finalizeYdProposal: (proposalId: string) => request<EcosystemGovernanceDetail>(`/api/yd/governance/proposals/${encodeURIComponent(proposalId)}/finalize`, {
     method: 'POST', authenticated: true, body: '{}',
   }),
   testNotificationEmail: () => request<{ ok: boolean; recipient: string }>('/api/notifications/test-email', {
@@ -275,6 +334,17 @@ export const api = {
   }),
   updateAgentStatus: (agentId: string, status: 'active' | 'paused') => request<Agent>(`/api/agents/${encodeURIComponent(agentId)}/status`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ status }),
+  }),
+  getAgentFeedback: (missionId: string, stageId: string) => request<AgentFeedback | null>(`/api/missions/${encodeURIComponent(missionId)}/stages/${encodeURIComponent(stageId)}/feedback`, { authenticated: true }),
+  saveAgentFeedback: (missionId: string, stageId: string, input: { deliveryQuality: number; requirementsFit: number; communication: number; onTime: boolean; reuse: boolean; comment: string }) => request<{ feedback: AgentFeedback }>(`/api/missions/${encodeURIComponent(missionId)}/stages/${encodeURIComponent(stageId)}/feedback`, {
+    method: 'PUT', authenticated: true, idempotencyKey: `feedback-${missionId}-${stageId}-${crypto.randomUUID()}`, body: JSON.stringify(input),
+  }),
+  listAdminAgentQuality: () => request<AdminAgentQualityRow[]>('/api/admin/agent-quality', { authenticated: true }),
+  recomputeAgentQuality: (agentId: string) => request<AgentQualityStats>(`/api/admin/agents/${encodeURIComponent(agentId)}/quality/recompute`, {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  recordAdminAgentQualityEvent: (agentId: string, input: { type: 'security_incident' | 'security_resolved' | 'admin_adjustment'; reason: string; value?: number; severe?: boolean }) => request<{ applied: boolean; stats: AgentQualityStats | null }>(`/api/admin/agents/${encodeURIComponent(agentId)}/quality/events`, {
+    method: 'POST', authenticated: true, idempotencyKey: `agent-quality-${agentId}-${crypto.randomUUID()}`, body: JSON.stringify(input),
   }),
   getDeveloperLedger: (limit = 50, cursor?: string | null, token = 'CREDIT') => request<DeveloperLedger>(`/api/developer/ledger?limit=${encodeURIComponent(String(limit))}&token=${encodeURIComponent(token)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, {
     authenticated: true,

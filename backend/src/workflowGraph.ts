@@ -4,6 +4,12 @@ import { paymentBudgetPrecision } from './payments';
 export const MAX_WORKFLOW_NODES = 30;
 export const MAX_WORKFLOW_EDGES = 80;
 export const DEFAULT_WORKFLOW_VIEWPORT: WorkflowViewport = { x: 0, y: 0, zoom: 1 };
+export const WORKFLOW_LAYOUT_NODE_WIDTH = 250;
+export const WORKFLOW_LAYOUT_NODE_HEIGHT = 184;
+
+const WORKFLOW_LAYOUT_COLUMN_GAP = 120;
+const WORKFLOW_LAYOUT_ROW_GAP = 72;
+const WORKFLOW_LAYOUT_MARGIN = 40;
 
 export class WorkflowValidationError extends Error {
   constructor(public readonly code: string, message: string) {
@@ -75,6 +81,42 @@ export function topologicalOrder(stages: WorkflowStage[], edges: WorkflowEdge[])
   }
   if (ordered.length !== stages.length) throw new WorkflowValidationError('WORKFLOW_CYCLE', 'Workflow must be a directed acyclic graph');
   return ordered;
+}
+
+export function layoutWorkflowStages(stages: WorkflowStage[], edges: WorkflowEdge[]): WorkflowStage[] {
+  if (!stages.length) return [];
+  const ordered = topologicalOrder(stages, edges);
+  const rankById = new Map<string, number>();
+  const columns = new Map<number, WorkflowStage[]>();
+
+  for (const stage of ordered) {
+    const rank = incomingStageIds(stage.id, edges).reduce(
+      (highest, sourceId) => Math.max(highest, (rankById.get(sourceId) ?? -1) + 1),
+      0,
+    );
+    rankById.set(stage.id, rank);
+    columns.set(rank, [...(columns.get(rank) ?? []), stage]);
+  }
+
+  const rowPitch = WORKFLOW_LAYOUT_NODE_HEIGHT + WORKFLOW_LAYOUT_ROW_GAP;
+  const columnPitch = WORKFLOW_LAYOUT_NODE_WIDTH + WORKFLOW_LAYOUT_COLUMN_GAP;
+  const largestColumn = Math.max(...[...columns.values()].map((column) => column.length));
+  const positionById = new Map<string, { x: number; y: number }>();
+
+  for (const [rank, column] of columns) {
+    const centeredOffset = ((largestColumn - column.length) * rowPitch) / 2;
+    column.forEach((stage, index) => {
+      positionById.set(stage.id, {
+        x: WORKFLOW_LAYOUT_MARGIN + rank * columnPitch,
+        y: WORKFLOW_LAYOUT_MARGIN + centeredOffset + index * rowPitch,
+      });
+    });
+  }
+
+  return stages.map((stage) => {
+    const position = positionById.get(stage.id)!;
+    return { ...stage, positionX: position.x, positionY: position.y };
+  });
 }
 
 function assertWeaklyConnected(stages: WorkflowStage[], edges: WorkflowEdge[]): void {

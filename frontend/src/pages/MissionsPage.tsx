@@ -27,7 +27,7 @@ export function MissionsPage() {
   }), [missions, query, status]);
 
   return (
-    <div className="space-y-7">
+    <div className="page-stack space-y-8">
       <PageHeader eyebrow="Mission Portfolio" title="我的任务" description="从目标规格到最终结算，查看每项任务的团队、进度、预算和证据状态。" actions={<Link className="btn-primary" to="/missions/new"><Plus size={17} />发布任务</Link>} />
 
       <section className="panel p-4">

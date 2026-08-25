@@ -27,6 +27,7 @@ function initialAuthValue(provider: AuthProviderName): AuthContextValue {
     linkedWalletAddress: null,
     walletAddress: null,
     onchainSettlement: false,
+    ydWalletEnabled: false,
     loginWithEmail: initializing,
     loginWithGoogle: initializing,
     loginWithPrivy: initializing,
@@ -37,6 +38,7 @@ function initialAuthValue(provider: AuthProviderName): AuthContextValue {
     freezeEscrow: initializing,
     unfreezeEscrow: initializing,
     refundEscrow: initializing,
+    submitYdAction: initializing,
     signOut: async () => undefined,
     refreshProfile: async () => null,
   };

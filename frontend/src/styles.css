@@ -9,10 +9,15 @@
 
   html {
     color-scheme: light;
+    background: #f1f3ee;
   }
 
   body {
     @apply m-0 min-w-[320px] bg-canvas font-sans text-ink antialiased;
+    background-image:
+      radial-gradient(circle at 78% -10%, rgba(8, 170, 196, 0.09), transparent 28rem),
+      radial-gradient(circle at 16% 105%, rgba(196, 243, 90, 0.10), transparent 30rem);
+    background-attachment: fixed;
   }
 
   button,
@@ -36,20 +41,54 @@
 }
 
 @layer components {
+  .app-shell {
+    isolation: isolate;
+  }
+
+  .app-sidebar {
+    background:
+      radial-gradient(circle at 5% 0%, rgba(8, 170, 196, 0.18), transparent 16rem),
+      radial-gradient(circle at 105% 86%, rgba(196, 243, 90, 0.10), transparent 15rem),
+      linear-gradient(165deg, #12171d 0%, #0b0f13 76%);
+    box-shadow: 20px 0 60px rgba(16, 19, 24, 0.08);
+  }
+
+  .app-sidebar::after {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background-image: radial-gradient(circle, rgba(255, 255, 255, 0.08) 0.7px, transparent 0.8px);
+    background-size: 18px 18px;
+    content: '';
+    mask-image: linear-gradient(to bottom, black, transparent 34%);
+    pointer-events: none;
+  }
+
+  .app-sidebar > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  .app-topbar {
+    background: rgba(251, 252, 249, 0.84);
+    box-shadow: 0 10px 40px rgba(16, 19, 24, 0.06);
+  }
+
   .panel {
-    @apply rounded-2xl border border-line bg-panel shadow-card;
+    @apply rounded-[20px] border border-line bg-panel shadow-card;
+    background-image: linear-gradient(145deg, rgba(255, 255, 255, 0.82), rgba(251, 252, 249, 0.96));
   }
 
   .btn-primary {
-    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-ink px-4 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-45;
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-ink px-4 py-2 text-sm font-semibold text-white transition duration-200 hover:-translate-y-0.5 hover:bg-ink/90 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:translate-y-0;
   }
 
   .btn-secondary {
-    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-line bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/30 hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-45;
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-line bg-white/80 px-4 py-2 text-sm font-semibold text-ink transition duration-200 hover:-translate-y-0.5 hover:border-ink/25 hover:bg-white hover:shadow-md disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:translate-y-0;
   }
 
   .btn-signal {
-    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-cyan px-4 py-2 text-sm font-semibold text-ink transition hover:bg-cyan/85 disabled:cursor-not-allowed disabled:opacity-45;
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-cyan px-4 py-2 text-sm font-semibold text-ink transition duration-200 hover:-translate-y-0.5 hover:bg-cyan/85 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:translate-y-0;
   }
 
   .field {
@@ -61,7 +100,14 @@
   }
 
   .eyebrow {
-    @apply font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-muted;
+    @apply inline-flex items-center gap-2 font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-muted;
+  }
+
+  .eyebrow::before {
+    width: 22px;
+    height: 1px;
+    background: #08aac4;
+    content: '';
   }
 
   .metric-value {
@@ -75,6 +121,194 @@
   .mesh-grid {
     background-image: radial-gradient(circle, rgba(102, 112, 120, 0.22) 1px, transparent 1px);
     background-size: 18px 18px;
+  }
+
+  .page-stack {
+    animation: page-enter 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  .page-hero {
+    position: relative;
+  }
+
+  .page-hero::after {
+    position: absolute;
+    right: 0;
+    bottom: -1.5rem;
+    left: 0;
+    height: 1px;
+    background: linear-gradient(90deg, rgba(16, 19, 24, 0.14), transparent 74%);
+    content: '';
+  }
+
+  .metric-card {
+    position: relative;
+    overflow: hidden;
+    transition: transform 200ms ease, border-color 200ms ease, box-shadow 200ms ease;
+  }
+
+  .metric-card::after {
+    position: absolute;
+    right: -2.5rem;
+    bottom: -3.5rem;
+    width: 8rem;
+    height: 8rem;
+    border-radius: 999px;
+    background: radial-gradient(circle, rgba(8, 170, 196, 0.08), transparent 68%);
+    content: '';
+    pointer-events: none;
+  }
+
+  .metric-card:hover {
+    border-color: rgba(8, 170, 196, 0.25);
+    box-shadow: 0 18px 46px rgba(16, 19, 24, 0.09);
+    transform: translateY(-2px);
+  }
+
+  .mission-hero {
+    background:
+      radial-gradient(circle at 78% 24%, rgba(8, 170, 196, 0.18), transparent 23rem),
+      radial-gradient(circle at 22% 130%, rgba(196, 243, 90, 0.11), transparent 24rem),
+      linear-gradient(145deg, #11171d, #090d11 72%);
+  }
+
+  .home-entry-hero {
+    background:
+      radial-gradient(circle at 84% 12%, rgba(8, 170, 196, 0.20), transparent 26rem),
+      radial-gradient(circle at 18% 116%, rgba(196, 243, 90, 0.13), transparent 30rem),
+      linear-gradient(145deg, #11171d, #090d11 72%);
+  }
+
+  .home-entry-hero::before {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(120deg, transparent 46%, rgba(255, 255, 255, 0.025) 46.2%, transparent 46.5%);
+    content: '';
+    pointer-events: none;
+  }
+
+  .yd-signal-card {
+    @apply relative rounded-2xl border border-white/10 bg-[#111820]/80 p-4;
+    box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
+  }
+
+  .yd-token-orbit {
+    position: relative;
+    display: flex;
+    width: 126px;
+    height: 126px;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .yd-token-orbit::before,
+  .yd-token-orbit::after {
+    position: absolute;
+    border-radius: 999px;
+    content: '';
+  }
+
+  .yd-token-orbit::before {
+    inset: 3px;
+    border: 1px solid rgba(8, 170, 196, 0.28);
+    border-top-color: rgba(196, 243, 90, 0.8);
+    animation: yd-orbit-spin 10s linear infinite;
+  }
+
+  .yd-token-orbit::after {
+    inset: 16px;
+    border: 1px dashed rgba(255, 255, 255, 0.14);
+    animation: yd-orbit-spin 16s linear infinite reverse;
+  }
+
+  .yd-token-core {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    width: 76px;
+    height: 76px;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    border-radius: 999px;
+    background: linear-gradient(145deg, #d8ff7e, #9fdb32);
+    box-shadow: 0 0 50px rgba(196, 243, 90, 0.22), 0 18px 34px rgba(0, 0, 0, 0.24);
+  }
+
+  .yd-home-panel {
+    background:
+      radial-gradient(circle at 88% 18%, rgba(8, 170, 196, 0.13), transparent 19rem),
+      linear-gradient(135deg, #d8ff83 0%, #c4f35a 48%, #b5e947 100%);
+  }
+
+  .yd-home-panel::before {
+    position: absolute;
+    inset: 0;
+    background-image: radial-gradient(circle, rgba(16, 19, 24, 0.13) 0.7px, transparent 0.8px);
+    background-size: 18px 18px;
+    content: '';
+    mask-image: linear-gradient(90deg, transparent, black 80%);
+    pointer-events: none;
+  }
+
+  @keyframes yd-orbit-spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .mission-hero::before {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(115deg, transparent 48%, rgba(255, 255, 255, 0.025) 48.2%, transparent 48.5%);
+    content: '';
+    pointer-events: none;
+  }
+
+  .mission-stage-lane {
+    position: relative;
+  }
+
+  .mission-stage-lane:not(:last-child)::after {
+    display: none;
+    position: absolute;
+    top: 28px;
+    left: 28px;
+    width: calc(100% + 0.75rem);
+    height: 1px;
+    background: linear-gradient(90deg, rgba(8, 170, 196, 0.7), rgba(255, 255, 255, 0.12));
+    content: '';
+  }
+
+  @media (min-width: 640px) {
+    .mission-stage-lane:not(:last-child)::after {
+      display: block;
+    }
+  }
+
+  .agent-card {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .agent-card::before {
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 0;
+    height: 2px;
+    background: linear-gradient(90deg, #08aac4, rgba(196, 243, 90, 0.75), transparent 78%);
+    content: '';
+    opacity: 0;
+    transition: opacity 180ms ease;
+  }
+
+  .agent-card:hover::before {
+    opacity: 1;
+  }
+
+  @keyframes page-enter {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 
   .contract-hero-glow::before {
@@ -116,8 +350,18 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .page-stack,
+    .yd-token-orbit::before,
+    .yd-token-orbit::after,
     .contract-orbit::after {
       animation: none;
+    }
+
+    .metric-card,
+    .btn-primary,
+    .btn-secondary,
+    .btn-signal {
+      transition: none;
     }
   }
 

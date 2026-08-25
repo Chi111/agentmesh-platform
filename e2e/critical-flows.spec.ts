@@ -90,6 +90,15 @@ test('public Agent directory remains available when private workspace hydration 
     status: 'active', trustScore: 9.1, successRate: 91, responseTime: '1.2s', price: 12, jobs: 0, volume: 0,
     author: 'AgentMesh Official', version: 'v1.0.0', official: true, wallet: '0x2200000000000000000000000000000000000a11',
     endpoint: 'https://agentmesh-platform-74a3.api.pinme.pro/api/agents/official-evidence-scout/invoke', authType: 'bearer',
+    quality: {
+      agentId: 'official-evidence-scout', marketplaceStatus: 'listed', reputation: 91.5,
+      breakdown: { reliability: 33, quality: 27, delivery: 14, response: 9.5, history: 8, riskPenalty: 0 },
+      confidence: 'high', settledJobs: 24, successfulJobs: 23, failedJobs: 1, refundedJobs: 0,
+      trialPassed: true, endpointHealthy: true, payoutValid: true, unresolvedSevereRisks: 0,
+      premium: true, newAgent: false, eligibilityReasons: [], formulaVersion: 'agentmesh-quality-v1',
+      lastTrialAt: '2026-08-20T00:00:00.000Z', lastHealthCheckAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:00:00.000Z',
+      gateMode: 'enforce', eligible: true, wouldBeEligible: true,
+    },
   };
   await page.unroute('**/api/agents');
   await page.route('**/api/agents', (route) => route.fulfill({
@@ -106,6 +115,15 @@ test('public Agent directory remains available when private workspace hydration 
     status: 200,
     contentType: 'application/json',
     body: JSON.stringify({ data: [] }),
+  }));
+  await page.route('**/api/agents/official-evidence-scout/quality', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ data: {
+      agent: officialAgent,
+      feedback: [{ id: 'feedback-e2e', agentId: officialAgent.id, missionId: 'TASK-E2E', stageId: 'STAGE-E2E', version: 1, deliveryQuality: 5, requirementsFit: 5, communication: 4, onTime: true, reuse: true, comment: '证据清晰，交付可直接用于后续决策。', effective: true, createdAt: '2026-08-23T00:00:00.000Z' }],
+      snapshots: [],
+    } }),
   }));
 
   await page.goto('/#/agents');
@@ -124,13 +142,49 @@ test('public Agent directory remains available when private workspace hydration 
 
   await expect(page.getByRole('heading', { name: 'Evidence Scout' })).toBeVisible();
   await expect(page.getByText('1 AGENTS AVAILABLE')).toBeVisible();
+  await expect(page.getByText('91.5')).toBeVisible();
+  await expect(page.getByText('高质量')).toBeVisible();
 
   await page.goto('/#/agents/official-evidence-scout');
   await expect(page.getByText('Agent Endpoint', { exact: true })).toBeVisible();
+  await expect(page.getByText('91.5 / 100', { exact: true })).toBeVisible();
+  await expect(page.getByText('证据清晰，交付可直接用于后续决策。')).toBeVisible();
   await expect(page.getByRole('link', { name: '打开 Endpoint' })).toHaveAttribute(
     'href',
     'https://agentmesh-platform-74a3.api.pinme.pro/api/agents/official-evidence-scout/invoke',
   );
+});
+
+test('an unlisted Agent keeps a public quality detail page outside the market directory', async ({ page }) => {
+  const hiddenAgent = {
+    id: 'quality-paused-agent', ownerId: 'developer-hidden', name: 'Paused Quality Agent', category: '软件开发',
+    summary: '该 Agent 已暂停新接单，但历史质量档案仍保持公开可验证。', tags: ['代码', '审查'],
+    status: 'active', trustScore: 8.2, successRate: 84, responseTime: '2.1s', price: 30, jobs: 8, volume: 1200,
+    author: 'Hidden Developer', version: 'v1.0.0', official: false, wallet: '0x2200000000000000000000000000000000000b11',
+    endpoint: 'https://agents.example.test/quality-paused-agent', authType: 'bearer', inputSchema: {}, outputSchema: {},
+    quality: {
+      agentId: 'quality-paused-agent', marketplaceStatus: 'suspended', reputation: 48,
+      breakdown: { reliability: 17, quality: 16, delivery: 8, response: 7, history: 5, riskPenalty: 5 },
+      confidence: 'medium', settledJobs: 8, successfulJobs: 5, failedJobs: 2, refundedJobs: 1,
+      trialPassed: true, endpointHealthy: true, payoutValid: true, unresolvedSevereRisks: 0,
+      premium: false, newAgent: false, eligibilityReasons: ['信誉分 48 低于 75', '市场状态为 suspended'],
+      formulaVersion: 'agentmesh-quality-v1', lastTrialAt: '2026-08-20T00:00:00.000Z',
+      lastHealthCheckAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:00:00.000Z',
+      gateMode: 'enforce', eligible: false, wouldBeEligible: false,
+    },
+  };
+  await page.route('**/api/agents/quality-paused-agent/quality', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ data: { agent: hiddenAgent, feedback: [], snapshots: [] } }),
+  }));
+
+  await page.goto('/#/agents/quality-paused-agent');
+  await expect(page.getByRole('heading', { name: 'Paused Quality Agent' })).toBeVisible();
+  await expect(page.getByText('市场暂停')).toBeVisible();
+  await expect(page.getByText('48 / 100', { exact: true })).toBeVisible();
+  await expect(page.getByText('暂停新接单', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: '用于新任务' })).toHaveCount(0);
 });
 
 test('operational errors use a localized top-right notification', async ({ page }) => {

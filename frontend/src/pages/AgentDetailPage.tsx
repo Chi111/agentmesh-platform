@@ -1,13 +1,33 @@
 import { ArrowLeft, ArrowRight, BarChart3, CheckCircle2, Clock3, Code2, ExternalLink, ShieldCheck, Sparkles, WalletCards } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { AgentAvatar } from '../components/ui/AgentCard';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { useAppStore } from '../store/useAppStore';
+import { api } from '../services/api';
+import type { AgentQualityPublicDetail } from '../types/domain';
 
 export function AgentDetailPage() {
   const { agentId } = useParams();
   const agents = useAppStore((state) => state.agents);
-  const agent = agents.find((item) => item.id === agentId);
+  const [qualityDetail, setQualityDetail] = useState<AgentQualityPublicDetail | null>(null);
+  const [qualityResolved, setQualityResolved] = useState(false);
+  const agent = agents.find((item) => item.id === agentId) ?? qualityDetail?.agent;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!agentId) return () => { cancelled = true; };
+    setQualityResolved(false);
+    void api.getAgentQuality(agentId)
+      .then((detail) => { if (!cancelled) setQualityDetail(detail); })
+      .catch(() => undefined)
+      .finally(() => { if (!cancelled) setQualityResolved(true); });
+    return () => { cancelled = true; };
+  }, [agentId]);
+
+  if (!agent && !qualityResolved) {
+    return <section className="panel py-16 text-center"><p className="text-sm text-muted">正在读取公开质量档案…</p></section>;
+  }
 
   if (!agent) {
     return <section className="panel py-16 text-center"><h1 className="text-lg font-semibold">Agent 不存在或尚未上线</h1><p className="mt-2 text-sm text-muted">公开目录中没有这个 Agent。</p><Link className="btn-primary mt-5" to="/agents">返回 Agent 市场</Link></section>;
@@ -15,6 +35,8 @@ export function AgentDetailPage() {
 
   const inputSchema = agent.inputSchema ?? { task: 'string', context: 'object', request_id: 'uuid' };
   const outputSchema = agent.outputSchema ?? { status: 'string', result: 'object', evidence_hash: 'string' };
+  const quality = qualityDetail?.agent.quality ?? agent.quality;
+  const acceptsNewWork = quality?.eligible ?? agent.status === 'active';
 
   return (
     <div className="space-y-6">
@@ -26,9 +48,9 @@ export function AgentDetailPage() {
           <div className="relative flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
             <div className="flex flex-col gap-5 sm:flex-row sm:items-center">
               <AgentAvatar agent={agent} size="lg" />
-              <div><div className="flex flex-wrap items-center gap-2"><h1 className="text-3xl font-semibold tracking-tight">{agent.name}</h1>{agent.official ? <StatusBadge tone="info">官方认证</StatusBadge> : null}<StatusBadge tone={agent.status === 'active' ? 'success' : 'warning'}>{agent.status === 'active' ? '可接单' : '试炼中'}</StatusBadge></div><p className="mt-2 text-sm text-muted">{agent.category} · {agent.author} · {agent.version}</p><div className="mt-3 flex flex-wrap items-center gap-4 text-xs"><span className="inline-flex items-center gap-1"><ShieldCheck size={14} className="text-cyan" />信任分 {agent.trustScore || '待生成'}</span><span className="inline-flex items-center gap-1"><CheckCircle2 size={14} className="text-lime" />成功率 {agent.successRate || '—'}%</span><span className="inline-flex items-center gap-1"><Clock3 size={14} />{agent.responseTime}</span></div></div>
+              <div><div className="flex flex-wrap items-center gap-2"><h1 className="text-3xl font-semibold tracking-tight">{agent.name}</h1>{agent.official ? <StatusBadge tone="info">官方认证</StatusBadge> : null}{quality?.premium ? <StatusBadge tone="success">高质量 Agent</StatusBadge> : null}<StatusBadge tone={quality?.marketplaceStatus === 'listed' ? 'success' : quality?.marketplaceStatus === 'suspended' ? 'danger' : 'warning'}>{quality?.marketplaceStatus === 'listed' ? '市场已准入' : quality?.marketplaceStatus === 'degraded' ? '质量降级' : quality?.marketplaceStatus === 'suspended' ? '市场暂停' : '试炼 / 观察期'}</StatusBadge></div><p className="mt-2 text-sm text-muted">{agent.category} · {agent.author} · {agent.version}</p><div className="mt-3 flex flex-wrap items-center gap-4 text-xs"><span className="inline-flex items-center gap-1"><ShieldCheck size={14} className="text-cyan" />信誉 {quality?.reputation ?? '待生成'} / 100</span><span className="inline-flex items-center gap-1"><CheckCircle2 size={14} className="text-lime" />{quality?.confidence ? `${quality.confidence.toUpperCase()} 置信度` : '暂无置信度'}</span><span className="inline-flex items-center gap-1"><Clock3 size={14} />{quality ? quality.endpointHealthy ? 'Endpoint 健康' : 'Endpoint 待检查' : agent.responseTime}</span></div></div>
             </div>
-            <Link className="btn-primary self-start" to="/missions/new">用于新任务 <ArrowRight size={16} /></Link>
+            {acceptsNewWork ? <Link className="btn-primary self-start" to="/missions/new">用于新任务 <ArrowRight size={16} /></Link> : <span className="inline-flex min-h-11 items-center rounded-xl border border-warning/25 bg-warning/10 px-4 text-sm font-semibold text-warning">暂停新接单</span>}
           </div>
         </div>
         <div className="grid gap-6 p-6 md:p-8 xl:grid-cols-[minmax(0,1fr)_340px]">
@@ -52,8 +74,19 @@ export function AgentDetailPage() {
       </section>
 
       <section className="panel p-6">
-        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between"><div><p className="eyebrow">Trust Model</p><h2 className="mt-2 text-xl font-semibold">平台可验证指标</h2></div><div className="flex items-center gap-2"><BarChart3 size={17} className="text-cyan" /><span className="font-mono text-xl font-semibold">{agent.trustScore || '—'} / 10</span></div></div>
-        <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">{[['信任分', agent.trustScore ? `${agent.trustScore} / 10` : '待试炼'], ['成功率', agent.successRate ? `${agent.successRate}%` : '暂无样本'], ['累计任务', `${agent.jobs} 单`], ['累计成交', `${agent.volume.toLocaleString()} USDC`]].map(([label, value]) => <article className="rounded-xl border border-line bg-canvas/35 p-4" key={label}><p className="text-xs text-muted">{label}</p><p className="mt-3 font-mono text-xl font-semibold">{value}</p></article>)}</div>
+        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between"><div><p className="eyebrow">Verifiable Reputation</p><h2 className="mt-2 text-xl font-semibold">可重算质量档案</h2><p className="mt-2 text-xs text-muted">由 Trial、Endpoint、已结算履约、交付证据、争议与有效反馈组成，不以单次模型评价替代真实历史。</p></div><div className="flex items-center gap-2"><BarChart3 size={17} className="text-cyan" /><span className="font-mono text-xl font-semibold">{quality?.reputation ?? '—'} / 100</span></div></div>
+        <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">{[
+          ['可靠性', quality?.breakdown.reliability ?? '—', '35'], ['交付质量', quality?.breakdown.quality ?? '—', '30'],
+          ['制品交付', quality?.breakdown.delivery ?? '—', '15'], ['响应健康', quality?.breakdown.response ?? '—', '10'],
+          ['历史深度', quality?.breakdown.history ?? '—', '10'],
+        ].map(([label, value, total]) => <article className="rounded-xl border border-line bg-canvas/35 p-4" key={label}><p className="text-xs text-muted">{label}</p><p className="mt-3 font-mono text-xl font-semibold">{value} <span className="text-[10px] text-muted">/ {total}</span></p></article>)}</div>
+        {quality?.eligibilityReasons.length ? <div className="mt-4 rounded-xl border border-warning/25 bg-warning/10 p-4 text-xs leading-5 text-muted"><strong className="text-ink">当前准入提示：</strong>{quality.eligibilityReasons.join(' · ')}</div> : null}
+        <div className="mt-5 border-t border-line pt-5"><div className="flex items-center justify-between"><p className="text-sm font-semibold">近期评分快照</p><span className="mono-chip">{qualityDetail?.snapshots.length ?? 0} SNAPSHOTS</span></div>{qualityDetail?.snapshots.length ? <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">{qualityDetail.snapshots.slice(0, 6).map((snapshot) => <article className="flex items-center justify-between rounded-xl border border-line bg-canvas/30 px-4 py-3" key={snapshot.id}><div><p className="font-mono text-base font-semibold">{snapshot.reputation}</p><p className="mt-1 text-[10px] text-muted">{new Date(snapshot.evaluatedAt).toLocaleString('zh-CN', { hour12: false })}</p></div><div className="text-right"><p className="text-[10px] font-semibold uppercase">{snapshot.marketplaceStatus}</p><p className="mt-1 text-[9px] text-muted">{snapshot.eventCount} EVENTS · {snapshot.formulaVersion}</p></div></article>)}</div> : <p className="mt-3 rounded-xl border border-dashed border-line px-4 py-6 text-center text-xs text-muted">尚无可公开的历史评分快照。</p>}</div>
+      </section>
+
+      <section className="panel p-6">
+        <div className="flex items-center justify-between"><div><p className="eyebrow">Settled Feedback</p><h2 className="mt-2 text-xl font-semibold">已结算任务反馈</h2></div><span className="mono-chip">{qualityDetail?.feedback.length ?? 0} VERIFIED</span></div>
+        {qualityDetail?.feedback.length ? <div className="mt-5 grid gap-3 md:grid-cols-2">{qualityDetail.feedback.slice(0, 6).map((item) => <article className="rounded-xl border border-line p-4" key={item.id}><div className="flex items-center justify-between"><p className="text-xs font-semibold">交付 {item.deliveryQuality}/5 · 符合度 {item.requirementsFit}/5</p><span className="font-mono text-[9px] text-muted">V{item.version}</span></div><p className="mt-2 text-xs leading-5 text-muted">{item.comment || '任务方未填写公开文字说明。'}</p><p className="mt-3 text-[10px] text-muted">{item.onTime ? '准时交付' : '存在延期'} · {item.reuse ? '愿意再次使用' : '暂不复用'}</p></article>)}</div> : <p className="mt-5 rounded-xl border border-dashed border-line p-8 text-center text-xs text-muted">暂无符合结算与反作弊条件的公开反馈。</p>}
       </section>
 
       <section className="flex flex-col gap-4 rounded-2xl border border-lime/40 bg-lime/10 p-5 md:flex-row md:items-center md:justify-between"><div className="flex gap-3"><WalletCards size={20} /><div><p className="text-sm font-semibold">平台协议调度</p><p className="mt-1 text-xs leading-5 text-muted">Agent 由任务匹配引擎调用，付款、证据和争议均通过统一协议处理。</p></div></div><Link className="btn-primary" to="/missions/new">创建任务</Link></section>

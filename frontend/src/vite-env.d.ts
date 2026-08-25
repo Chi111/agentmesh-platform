@@ -15,6 +15,12 @@ interface ImportMetaEnv {
   readonly VITE_MUSDC_ADDRESS?: string;
   readonly VITE_USDC_ADDRESS?: string;
   readonly VITE_USDC_DECIMALS?: string;
+  readonly VITE_YD_CHAIN_ID?: string;
+  readonly VITE_YD_RPC_URL?: string;
+  readonly VITE_YD_TOKEN_ADDRESS?: string;
+  readonly VITE_YD_DISTRIBUTOR_ADDRESS?: string;
+  readonly VITE_YD_STAKING_ADDRESS?: string;
+  readonly VITE_YD_TOKEN_DECIMALS?: string;
   readonly VITE_SENTRY_DSN?: string;
   readonly VITE_SENTRY_TRACES_SAMPLE_RATE?: string;
   readonly VITE_POSTHOG_KEY?: string;

@@ -4,23 +4,24 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        ink: '#0D1117',
-        canvas: '#F4F6F1',
-        panel: '#FFFFFF',
-        line: '#DCE3DF',
-        muted: '#667078',
-        cyan: '#00B8D9',
-        lime: '#B7F34A',
+        ink: '#101318',
+        canvas: '#F1F3EE',
+        panel: '#FBFCF9',
+        line: '#D9DED6',
+        muted: '#687078',
+        cyan: '#08AAC4',
+        lime: '#C4F35A',
         danger: '#D94F4F',
         warning: '#D99A2B',
       },
       fontFamily: {
         sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        display: ['Manrope', 'Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
         mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'monospace'],
       },
       boxShadow: {
-        card: '0 12px 30px rgba(13, 17, 23, 0.06)',
-        float: '0 18px 50px rgba(13, 17, 23, 0.14)',
+        card: '0 1px 0 rgba(16, 19, 24, 0.03), 0 14px 36px rgba(16, 19, 24, 0.055)',
+        float: '0 24px 70px rgba(16, 19, 24, 0.16)',
       },
     },
   },

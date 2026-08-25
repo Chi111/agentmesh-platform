@@ -152,21 +152,26 @@ export function matchCandidates(mission: Mission, stages: WorkflowStage[], agent
       const tagHits = missionTags.filter((tag) => agentTags.some((agentTag) => agentTag.includes(tag) || tag.includes(agentTag))).length;
       const categoryScore = exactCategory ? 35 : fuzzyCategory ? 24 : 4;
       const tagScore = Math.min(25, tagHits * 8);
-      const trustScore = Math.min(20, agent.trustScore * 2);
-      const qualityScore = Math.min(10, agent.successRate / 10);
+      const reputation = agent.quality?.reputation;
+      const trustScore = Math.min(20, reputation === undefined ? agent.trustScore * 2 : reputation / 5);
+      const qualityScore = Math.min(10, agent.quality ? agent.quality.breakdown.quality / 3 : agent.successRate / 10);
       const hasComparableReferencePrice = mission.paymentMethod !== 'web3_seth';
       const priceScore = hasComparableReferencePrice
         ? agent.price <= stage.budget ? 10 : Math.max(0, 10 - ((agent.price - stage.budget) / Math.max(stage.budget, 1)) * 10)
         : 5;
       const fairness = stableNoise(`${mission.id}:${stage.id}:${agent.id}`) * 2;
-      const score = Number(Math.min(100, categoryScore + tagScore + trustScore + qualityScore + priceScore + fairness).toFixed(1));
+      const exposureAdjustment = agent.quality?.newAgent ? -6 : agent.quality?.premium ? 2 : 0;
+      const score = Number(Math.max(0, Math.min(100, categoryScore + tagScore + trustScore + qualityScore + priceScore + fairness + exposureAdjustment)).toFixed(1));
       const reasons = [
         exactCategory ? '专业分类完全匹配' : fuzzyCategory ? '专业分类相近' : '具备跨领域执行能力',
         tagHits ? `命中 ${tagHits} 个任务标签` : '依据历史质量进入候选池',
-        `信任分 ${agent.trustScore.toFixed(1)} · 成功率 ${agent.successRate.toFixed(1)}%`,
+        agent.quality
+          ? `信誉 ${agent.quality.reputation.toFixed(1)} · ${agent.quality.confidence === 'low' ? '低' : agent.quality.confidence === 'medium' ? '中' : '高'}置信度`
+          : `信任分 ${agent.trustScore.toFixed(1)} · 成功率 ${agent.successRate.toFixed(1)}%`,
         hasComparableReferencePrice
           ? agent.price <= stage.budget ? '报价处于阶段预算内' : '报价高于阶段预算'
           : 'sETH 任务不与法币参考价直接比较',
+        agent.quality?.newAgent ? '新 Agent 低置信度限量曝光' : agent.quality?.premium ? '高质量历史获得稳定曝光' : '使用标准公平曝光权重',
       ];
       return { agent, score, reasons };
     }).sort((left, right) => right.score - left.score || left.agent.id.localeCompare(right.agent.id));

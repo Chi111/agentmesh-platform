@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { exportSPKI, generateKeyPair, SignJWT } from 'jose';
-import type { Agent, CandidateMatch, Mission, PaymentMethod, UserContext, WorkflowStage } from './contracts';
+import type { Agent, CandidateMatch, Mission, PaymentMethod, RewardActivity, UserContext, WorkflowStage } from './contracts';
 import { MemoryPlatformStore } from './memoryStore';
 import { buildSettlementPlan, settlementDescriptor } from './chain';
 import { looksLikePrivyToken, verifyPrivyIdentityToken, verifyPrivyToken } from './privy';
@@ -16,6 +16,7 @@ let dispatchedAuthorization: string | null;
 let dispatchedAgentHeaders: Array<string | null>;
 let dispatchCalls: number;
 let dispatchResponder: (() => Response | Promise<Response>) | null;
+let trialResponder: ((challenge: string, agentId: string, body: JsonBody) => Response | Promise<Response>) | null;
 let deliveredEmails: Array<{ to: string; subject: string; html: string }>;
 let currentNow: string;
 let requestedLlmModels: Array<string | undefined>;
@@ -26,7 +27,26 @@ const testEnv: {
   TEST_TOPUP_ENABLED: string;
   AGENT_CREDENTIALS_JSON?: string;
   AGENT_CREDENTIALS_ENCRYPTED_JSON?: string;
-} = { API_KEY: 'test-project-secret', PROJECT_NAME: 'agentmesh-test', TEST_TOPUP_ENABLED: 'true' };
+  AGENT_QUALITY_GATE_MODE?: string;
+  YD_RPC_URL: string;
+  YD_CHAIN_ID: string;
+  YD_TOKEN_ADDRESS: string;
+  YD_DISTRIBUTOR_ADDRESS: string;
+  YD_STAKING_ADDRESS: string;
+  YD_MIN_CONFIRMATIONS: string;
+  YD_TESTNET: string;
+} = {
+  API_KEY: 'test-project-secret',
+  PROJECT_NAME: 'agentmesh-test',
+  TEST_TOPUP_ENABLED: 'true',
+  YD_RPC_URL: 'https://yd-rpc.example.test',
+  YD_CHAIN_ID: '11155111',
+  YD_TOKEN_ADDRESS: '0x1000000000000000000000000000000000000001',
+  YD_DISTRIBUTOR_ADDRESS: '0x1000000000000000000000000000000000000002',
+  YD_STAKING_ADDRESS: '0x1000000000000000000000000000000000000003',
+  YD_MIN_CONFIRMATIONS: '2',
+  YD_TESTNET: 'true',
+};
 
 const requester: UserContext = {
   id: 'requester-1',
@@ -150,11 +170,13 @@ beforeEach(() => {
   dispatchedAgentHeaders = [];
   dispatchCalls = 0;
   dispatchResponder = null;
+  trialResponder = null;
   deliveredEmails = [];
   requestedLlmModels = [];
   currentNow = '2026-08-16T00:00:00.000Z';
   delete testEnv.AGENT_CREDENTIALS_JSON;
   delete testEnv.AGENT_CREDENTIALS_ENCRYPTED_JSON;
+  delete testEnv.AGENT_QUALITY_GATE_MODE;
   store = new MemoryPlatformStore();
   store.profiles.set(requester.id, requester);
   store.profiles.set(developer.id, developer);
@@ -180,7 +202,21 @@ beforeEach(() => {
       dispatchedAuthorization = headers.get('Authorization');
       dispatchedAgentHeaders.push(headers.get('X-AgentMesh-Agent-Id'));
       const challenge = headers.get('X-AgentMesh-Trial');
-      if (challenge) return Response.json({ challenge, status: 'accepted', output: { schema: 'ok' } }, { status: 200 });
+      if (challenge) {
+        const agentId = headers.get('X-AgentMesh-Agent-Id') ?? '';
+        if (trialResponder) return trialResponder(challenge, agentId, dispatchedBody);
+        const trialCase = (dispatchedBody.case as JsonBody | undefined)?.id;
+        if (trialCase === 'error_handling') {
+          return Response.json({ challenge, agentId, status: 'rejected', error: { code: 'TRIAL_VALIDATION_ERROR' } }, { status: 422 });
+        }
+        if (trialCase === 'artifact_delivery') {
+          return Response.json({ challenge, agentId, status: 'accepted', output: { artifact: { kind: 'structured-report', mimeType: 'application/json' } } }, { status: 200 });
+        }
+        if (trialCase === 'engineering_capabilities') {
+          return Response.json({ challenge, agentId, status: 'accepted', output: { modes: ['analyze', 'implement', 'review'], verification: true } }, { status: 200 });
+        }
+        return Response.json({ challenge, agentId, status: 'accepted', output: { schema: 'ok' } }, { status: 200 });
+      }
       dispatchCalls += 1;
       if (dispatchResponder) return dispatchResponder();
       return Response.json({ accepted: true, runId: 'run-test-1' }, { status: 202 });
@@ -204,10 +240,192 @@ beforeEach(() => {
       blockNumber: '123',
       requester: '0x7100000000000000000000000000000000008F2C',
     }),
+    ydEpochPublisherVerifier: async () => ({ ok: true, blockNumber: '120', logIndex: 0, confirmations: 2 }),
+    ydEpochSweepVerifier: async () => ({ ok: true, blockNumber: '130', logIndex: 0, confirmations: 2 }),
+    ydClaimVerifier: async () => ({ ok: true, blockNumber: '121', logIndex: 1, confirmations: 2 }),
+    ydStakingSynchronizer: async (_env, txHash, userId, walletAddress, updatedAt) => ({
+      verification: { ok: true, blockNumber: '122', logIndex: 2, confirmations: 2 },
+      position: {
+        userId,
+        walletAddress: walletAddress.toLocaleLowerCase(),
+        amountUnits: '10000000000000000000',
+        unlockTime: '2027-02-12T00:00:00.000Z',
+        durationSeconds: 180 * 24 * 60 * 60,
+        reputationBps: 10_000,
+        rawPower: '3162277660',
+        delegatedTo: walletAddress.toLocaleLowerCase(),
+        votingPower: '3162277660',
+        verified: true,
+        lastTxHash: txHash,
+        lastBlockNumber: '122',
+        lastLogIndex: 2,
+        updatedAt,
+      },
+    }),
+    ydPowerSnapshotReader: async (_env, proposalId, candidates, requestedBlock, createdAt) => {
+      const electorate = candidates.map((candidate) => ({
+        proposalId,
+        userId: candidate.userId,
+        walletAddress: candidate.walletAddress,
+        power: '100',
+        delegateSources: [],
+        createdAt,
+      }));
+      return { electorate, eligiblePower: String(electorate.length * 100), snapshotBlock: (requestedBlock ?? 100n).toString() };
+    },
   });
 });
 
 describe('AgentMesh Worker', () => {
+  it('runs the YD reward, claim, staking and Power-governance workflow without touching escrow', async () => {
+    const linkedWallet = '0x7100000000000000000000000000000000008f2c';
+    store.profiles.set(requester.id, { ...requester, walletAddress: linkedWallet });
+
+    const publicConfig = await api('/api/yd/config');
+    expect(publicConfig.response.status).toBe(200);
+    expect(publicConfig.body.data).toMatchObject({ configured: true, escrowSeparated: true, earnVaultEnabled: false });
+
+    const forbidden = await api('/api/yd/admin/epochs', {
+      method: 'POST', body: JSON.stringify({}),
+    }, requester.id);
+    expect(forbidden.response.status).toBe(403);
+
+    const epochCreated = await api('/api/yd/admin/epochs', {
+      method: 'POST',
+      body: JSON.stringify({
+        epochNumber: 1,
+        startsAt: '2026-08-01T00:00:00.000Z',
+        endsAt: '2026-08-15T00:00:00.000Z',
+        claimEndsAt: '2026-09-01T00:00:00.000Z',
+        totalRewardUnits: '100000000000000000000',
+        accountScoreCap: 2_000_000_000,
+        rules: { settlementRequired: true },
+      }),
+    }, admin.id);
+    expect(epochCreated.response.status).toBe(201);
+    const epochId = epochCreated.body.data.id as string;
+
+    const activity: RewardActivity = {
+      id: 'YDACTIVITY-test-requester',
+      sourceKey: 'mission:test:settlement:requester',
+      userId: requester.id,
+      missionId: 'TASK-TEST-REWARD',
+      disputeId: null,
+      role: 'requester',
+      formulaVersion: 'agentmesh-yd-v1',
+      asset: 'mUSDC',
+      settledAmount: 100,
+      qualityBps: 10_000,
+      penaltyBps: 0,
+      scoreMicros: 2_500_000,
+      eligible: true,
+      detail: { settlement: 'released' },
+      occurredAt: '2026-08-10T00:00:00.000Z',
+      createdAt: '2026-08-10T00:00:00.000Z',
+    };
+    expect(await store.recordRewardActivity(activity)).toBe(true);
+    expect(await store.recordRewardActivity(activity)).toBe(false);
+
+    const computed = await api(`/api/yd/admin/epochs/${epochId}/compute`, { method: 'POST', body: '{}' }, admin.id);
+    expect(computed.response.status).toBe(200);
+    expect(computed.body.data).toMatchObject({ state: 'computed' });
+    expect(computed.body.data.allocations).toHaveLength(1);
+    expect(computed.body.data.allocations[0].amountUnits).toBe('100000000000000000000');
+    const publicManifest = await api(`/api/yd/epochs/${epochId}/allocations`);
+    expect(publicManifest.response.status).toBe(200);
+    expect(publicManifest.body.data.allocations[0]).toMatchObject({
+      walletAddress: linkedWallet,
+      effectiveScore: 2_500_000,
+      amountUnits: '100000000000000000000',
+    });
+    expect(publicManifest.body.data.allocations[0].userId).toBeUndefined();
+
+    const publishTx = `0x${'a'.repeat(64)}`;
+    const published = await api(`/api/yd/admin/epochs/${epochId}/publish`, {
+      method: 'POST', body: JSON.stringify({ txHash: publishTx }),
+    }, admin.id);
+    expect(published.response.status).toBe(200);
+    expect(published.body.data.status).toBe('published');
+
+    const overview = await api('/api/yd/overview', {}, requester.id);
+    expect(overview.response.status).toBe(200);
+    expect(overview.body.data.allocations[0]).toMatchObject({ status: 'unclaimed', walletAddress: linkedWallet });
+    expect(overview.body.data.allocations[0].proof).toEqual([]);
+
+    const stakingTx = `0x${'c'.repeat(64)}`;
+    const staking = await api('/api/yd/staking/sync', {
+      method: 'POST', body: JSON.stringify({ txHash: stakingTx }),
+    }, requester.id);
+    expect(staking.response.status).toBe(200);
+    expect(staking.body.data).toMatchObject({ verified: true, votingPower: '3162277660' });
+
+    const proposalCreated = await api('/api/yd/admin/governance/proposals', {
+      method: 'POST',
+      body: JSON.stringify({
+        proposalType: 'development',
+        title: '资助下一版贡献证明工具',
+        description: '用生态开发预算完善贡献证明清单和公开验证工具，且不改变任务托管参数。',
+        payload: { budget: 'test-only' },
+        endsAt: '2026-08-17T12:00:00.000Z',
+        quorumBps: 2_000,
+        approvalBps: 5_001,
+      }),
+    }, admin.id);
+    expect(proposalCreated.response.status).toBe(201);
+    const proposalId = proposalCreated.body.data.proposal.id as string;
+    expect(proposalCreated.body.data.currentUser.eligible).toBe(false);
+    const publicGovernance = await api('/api/yd/governance/public');
+    expect(publicGovernance.response.status).toBe(200);
+    expect(publicGovernance.body.data[0].electorate[0]).toMatchObject({ walletAddress: linkedWallet, power: '100' });
+    expect(publicGovernance.body.data[0].electorate[0].userId).toBeUndefined();
+
+    store.profiles.set(requester.id, { ...requester, walletAddress: '0x7200000000000000000000000000000000008f2c' });
+    const mismatchedWalletVote = await api(`/api/yd/governance/proposals/${proposalId}/votes`, {
+      method: 'POST', body: JSON.stringify({ choice: 'for', reason: '更换绑定钱包后不能代表快照钱包投票。' }),
+    }, requester.id);
+    expect(mismatchedWalletVote.response.status).toBe(409);
+    expect(mismatchedWalletVote.body.error.code).toBe('YD_SNAPSHOT_WALLET_MISMATCH');
+    store.profiles.set(requester.id, { ...requester, walletAddress: linkedWallet });
+
+    const voted = await api(`/api/yd/governance/proposals/${proposalId}/votes`, {
+      method: 'POST', body: JSON.stringify({ choice: 'for', reason: '该提案只使用生态预算并改善公开验证能力。' }),
+    }, requester.id);
+    expect(voted.response.status).toBe(201);
+    expect(voted.body.data.proposal.forPower).toBe('100');
+    const duplicateVote = await api(`/api/yd/governance/proposals/${proposalId}/votes`, {
+      method: 'POST', body: JSON.stringify({ choice: 'against', reason: '重复投票必须被拒绝并保持原计票不变。' }),
+    }, requester.id);
+    expect(duplicateVote.response.status).toBe(409);
+
+    const finalized = await api(`/api/yd/governance/proposals/${proposalId}/finalize`, {
+      method: 'POST', body: '{}',
+    }, admin.id);
+    expect(finalized.response.status).toBe(200);
+    expect(finalized.body.data.proposal.status).toBe('succeeded');
+
+    currentNow = '2026-09-02T00:00:00.000Z';
+    const sweepTx = `0x${'d'.repeat(64)}`;
+    const expired = await api(`/api/yd/admin/epochs/${epochId}/expire`, {
+      method: 'POST', body: JSON.stringify({ txHash: sweepTx }),
+    }, admin.id);
+    expect(expired.response.status).toBe(200);
+    expect(expired.body.data.status).toBe('expired');
+
+    const claimTx = `0x${'b'.repeat(64)}`;
+    const delayedClaimSync = await api('/api/yd/claims/sync', {
+      method: 'POST', body: JSON.stringify({ epochId, txHash: claimTx }),
+    }, requester.id);
+    expect(delayedClaimSync.response.status).toBe(201);
+    expect(delayedClaimSync.body.data.claim.txHash).toBe(claimTx);
+    const replayedClaim = await api('/api/yd/claims/sync', {
+      method: 'POST', body: JSON.stringify({ epochId, txHash: claimTx }),
+    }, requester.id);
+    expect(replayedClaim.response.status).toBe(200);
+    expect(replayedClaim.body.meta.replayed).toBe(true);
+    const reconciledOverview = await api('/api/yd/overview', {}, requester.id);
+    expect(reconciledOverview.body.data.allocations[0].status).toBe('claimed');
+  });
+
   it('uses the deployed Sepolia contract defaults only for the AgentMesh test project', () => {
     expect(settlementDescriptor({ PROJECT_NAME: 'agentmesh-test' }).mode).toBe('offchain_ledger_with_chain_references');
     expect(settlementDescriptor({ PROJECT_NAME: 'agentmesh-platform-74a3' })).toMatchObject({
@@ -524,8 +742,12 @@ describe('AgentMesh Worker', () => {
     const repeated = await api(`/api/disputes/${disputeId}/resolve`, {
       method: 'POST', body: JSON.stringify({ resolution, status: 'resolved' }),
     }, admin.id);
-    expect(repeated.response.status).toBe(409);
-    expect(repeated.body.error.code).toBe('DISPUTE_ALREADY_RESOLVED');
+    expect(repeated.response.status).toBe(200);
+    expect(repeated.body.meta.replayed).toBe(true);
+    const assignedAgents = [...new Set((store.stages.get(mission.id) ?? []).map((stage) => stage.agentId).filter(Boolean))] as string[];
+    const disputeMetrics = (await Promise.all(assignedAgents.map((agentId) => store.listAgentMetricEvents(agentId)))).flat();
+    expect(disputeMetrics.filter((event) => event.sourceId === disputeId && event.type === 'mission_refunded')).toHaveLength(matches.length);
+    expect(disputeMetrics.filter((event) => event.sourceId === disputeId && event.type === 'dispute_lost')).toHaveLength(matches.length);
   });
 
   it('lets only administrators manage the arbitration council', async () => {
@@ -630,6 +852,9 @@ describe('AgentMesh Worker', () => {
     expect(second.mission.id).toBe(first.mission.id);
     expect(store.missions.size).toBe(1);
     expect(first.stages.reduce((sum, stage) => sum + stage.budget, 0)).toBe(300);
+    expect(first.mission.compiledSpec?.compiler).toMatchObject({ engine: 'langgraph' });
+    const event = (await store.listEvents(first.mission.id)).find((item) => item.type === 'mission.created');
+    expect(event?.payload).toMatchObject({ source: 'adaptive-fallback', compiler: { engine: 'langgraph' } });
   });
 
   it('compiles a complex mission through LangGraph and reports adaptive fallback metadata', async () => {
@@ -1476,6 +1701,9 @@ describe('AgentMesh Worker', () => {
         });
         expect(missingArtifact.response.status).toBe(422);
         expect(missingArtifact.body.error.code).toBe('ARTIFACT_REQUIRED');
+        expect((await store.listAgentMetricEvents(dispatched.body.data.agent.id)).filter((event) => (
+          event.type === 'artifact_invalid' && event.detail.runId === callback.runId
+        ))).toHaveLength(1);
       }
       const completed = await api(`/api/hooks/agents/${dispatched.body.data.agent.id}/events`, {
         method: 'POST',
@@ -1713,6 +1941,11 @@ describe('AgentMesh Worker', () => {
     );
     expect((await store.getWalletAccount(developer.id)).transactions.filter((item) => item.type === 'agent_payout' && item.missionId === mission.id)).toHaveLength(1);
     expect((store.notifications.get(developer.id) ?? []).filter((item) => item.title === '任务已验收并结算')).toHaveLength(1);
+    const assignedAgents = [...new Set((store.stages.get(mission.id) ?? []).map((stage) => stage.agentId).filter(Boolean))] as string[];
+    const settlementMetrics = (await Promise.all(assignedAgents.map((agentId) => store.listAgentMetricEvents(agentId)))).flat();
+    expect(settlementMetrics.filter((event) => event.sourceId === mission.id && event.type === 'mission_settled_success')).toHaveLength(
+      (store.stages.get(mission.id) ?? []).filter((stage) => stage.nodeType === 'task' && stage.agentId).length,
+    );
   });
 
   it('registers an Agent without accepting credentials into D1', async () => {
@@ -1744,6 +1977,81 @@ describe('AgentMesh Worker', () => {
     }, developer.id);
     expect(bypass.response.status).toBe(409);
     expect(bypass.body.error.code).toBe('AGENT_TRIAL_REQUIRED');
+  });
+
+  it('uses one shadow/enforce quality gate for the public market and mission candidates', async () => {
+    const evaluatedAt = '2026-08-16T00:00:00.000Z';
+    for (const [id, type, value] of [
+      ['quality-trial', 'trial_passed', 98],
+      ['quality-health', 'endpoint_healthy', 99],
+    ] as const) {
+      await store.recordAgentMetricEvent({
+        id, idempotencyKey: id, agentId: 'research-agent', type, value, weight: 1, severity: 'info',
+        sourceType: type === 'trial_passed' ? 'trial' : 'health', sourceId: id, detail: {}, occurredAt: evaluatedAt, createdAt: evaluatedAt,
+      }, evaluatedAt);
+    }
+    testEnv.AGENT_QUALITY_GATE_MODE = 'enforce';
+    const market = await api('/api/agents');
+    expect(market.response.status).toBe(200);
+    expect(market.body.data.map((item: Agent) => item.id)).toEqual(['research-agent']);
+    expect(market.body.data[0].quality).toMatchObject({ eligible: true, wouldBeEligible: true, marketplaceStatus: 'listed' });
+
+    const { mission } = await createMission();
+    const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    expect(candidates.response.status).toBe(200);
+    const candidateIds = (candidates.body.data as CandidateMatch[]).flatMap((match) => match.candidates.map((candidate) => candidate.agent.id));
+    expect(new Set(candidateIds)).toEqual(new Set(['research-agent']));
+
+    delete testEnv.AGENT_QUALITY_GATE_MODE;
+    const shadowMarket = await api('/api/agents');
+    expect(shadowMarket.body.data.map((item: Agent) => item.id).sort()).toEqual(['analysis-agent', 'research-agent', 'writer-agent']);
+  });
+
+  it('records an admin quality adjustment only once when the request is replayed', async () => {
+    const input = {
+      type: 'admin_adjustment',
+      value: -5,
+      reason: 'Repeated endpoint timeouts require a temporary quality adjustment.',
+    };
+    const headers = { 'Idempotency-Key': 'admin-quality-adjustment-1' };
+    const first = await api('/api/admin/agents/research-agent/quality/events', {
+      method: 'POST', headers, body: JSON.stringify(input),
+    }, admin.id);
+    const replay = await api('/api/admin/agents/research-agent/quality/events', {
+      method: 'POST', headers, body: JSON.stringify(input),
+    }, admin.id);
+
+    expect(first.response.status, JSON.stringify(first.body)).toBe(201);
+    expect(replay.response.status, JSON.stringify(replay.body)).toBe(201);
+    expect(replay.body.meta.replayed).toBe(true);
+    expect((await store.listAgentMetricEvents('research-agent')).filter((event) => event.type === 'admin_adjustment')).toHaveLength(1);
+  });
+
+  it('accepts only versioned requester feedback for completed and released task stages', async () => {
+    const { mission, stages } = await createMission();
+    const task = { ...stages[0], status: 'done' as const, agentId: 'research-agent', output: { summary: 'verified' } };
+    store.stages.set(mission.id, [task]);
+    store.missions.set(mission.id, { ...mission, status: 'completed', progress: 100, currentStage: '已结算' });
+    const escrow = store.escrows.get(mission.id)!;
+    store.escrows.set(mission.id, { ...escrow, status: 'released', releasedAt: currentNow });
+    const input = { deliveryQuality: 5, requirementsFit: 4, communication: 5, onTime: true, reuse: true, comment: '交付完整，证据清晰，符合任务验收标准。' };
+    const headers = { 'Idempotency-Key': 'quality-feedback-v1' };
+    const first = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers, body: JSON.stringify(input) }, requester.id);
+    const replay = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers, body: JSON.stringify(input) }, requester.id);
+    expect(first.response.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body.data.feedback.version).toBe(1);
+    expect(replay.body.data.feedback.id).toBe(first.body.data.feedback.id);
+    const forbidden = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers: { 'Idempotency-Key': 'quality-feedback-forbidden' }, body: JSON.stringify(input) }, developer.id);
+    expect(forbidden.response.status).toBe(403);
+    const updated = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers: { 'Idempotency-Key': 'quality-feedback-v2' }, body: JSON.stringify({ ...input, deliveryQuality: 4 }) }, requester.id);
+    expect(updated.body.data.feedback.version).toBe(2);
+    expect(await store.listAgentFeedback('research-agent')).toHaveLength(1);
+    const sensitive = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, {
+      method: 'PUT', headers: { 'Idempotency-Key': 'quality-feedback-sensitive' },
+      body: JSON.stringify({ ...input, comment: 'Bearer sensitive-token-value-must-not-be-public' }),
+    }, requester.id);
+    expect(sensitive.response.status).toBe(400);
+    expect(sensitive.body.error.code).toBe('SENSITIVE_CONTENT_REJECTED');
   });
 
   it('reports a missing Worker credential instead of masking it as an unreachable Agent', async () => {
@@ -1783,6 +2091,37 @@ describe('AgentMesh Worker', () => {
     }, developer.id);
     expect(trial.response.status).toBe(200);
     expect(dispatchedAuthorization).toBe('Bearer encrypted-agent-token');
+    expect(dispatchedAgentHeaders).toContain(created.body.data.id);
+    expect(dispatchedAgentHeaders.filter((agentId) => agentId === created.body.data.id)).toHaveLength(4);
+    expect(trial.body.data.trial).toMatchObject({ suiteVersion: 'agentmesh.trial.v3', status: 'passed' });
+    expect(trial.body.data.trial.checks.map((check: { key: string }) => check.key)).toEqual(expect.arrayContaining([
+      'case_structured_execution', 'case_error_handling', 'case_artifact_delivery', 'case_engineering_capabilities',
+    ]));
+  });
+
+  it('fails and suspends a trial Agent whose response exposes its Worker credential', async () => {
+    const created = await api('/api/agents', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'Leaking Credential Agent', category: '软件开发', summary: '用于验证 Trial 响应凭据泄漏会立即触发暂停的 Agent。',
+        tags: ['代码', '审查'], endpoint: 'https://agents.example.com/leaking-credential', authType: 'bearer', price: 10,
+        wallet: '0x3300000000000000000000000000000000009A11',
+        inputSchema: { type: 'object' }, outputSchema: { type: 'object' },
+      }),
+    }, developer.id);
+    expect(created.response.status).toBe(201);
+    testEnv.AGENT_CREDENTIALS_ENCRYPTED_JSON = await encryptedCredentialBinding(created.body.data.id, 'credential-that-must-remain-secret');
+    trialResponder = (challenge, agentId) => Response.json({
+      challenge, agentId, status: 'accepted', output: { authorization: 'Bearer credential-that-must-remain-secret' },
+    });
+
+    const trial = await api(`/api/agents/${created.body.data.id}/trial`, { method: 'POST', body: '{}' }, developer.id);
+    expect(trial.response.status).toBe(502);
+    expect(trial.body.error.code).toBe('AGENT_TRIAL_SECRET_LEAK');
+    expect((await store.listAgentMetricEvents(created.body.data.id))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'security_incident', severity: 'severe' }),
+    ]));
+    expect((await store.getAgentQualityStats(created.body.data.id))?.marketplaceStatus).toBe('suspended');
   });
 
   it('rejects loopback IPv6 Agent endpoints at registration', async () => {

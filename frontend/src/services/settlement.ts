@@ -44,7 +44,7 @@ export interface SettlementTransaction {
   gasLimit?: bigint;
 }
 
-type SendTransaction = (input: SettlementTransaction) => Promise<{ hash: Hex }>;
+export type SendTransaction = (input: SettlementTransaction) => Promise<{ hash: Hex }>;
 
 export interface SettlementRecipient {
   address: string;

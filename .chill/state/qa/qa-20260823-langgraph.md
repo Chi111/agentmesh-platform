@@ -1,6 +1,6 @@
 # LangGraph workflow compiler QA
 
-Status: PASS  
+Status: PASS
 Date: 2026-08-23
 
 - `npm test --workspace backend`: 5 files, 71 tests passed.

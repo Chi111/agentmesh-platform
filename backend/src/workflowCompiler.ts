@@ -5,7 +5,7 @@ import {
   parseLlmCompilation,
   type WorkflowCompilation,
 } from './logic';
-import { incomingStageIds, validateWorkflowGraph } from './workflowGraph';
+import { incomingStageIds, layoutWorkflowStages, validateWorkflowGraph } from './workflowGraph';
 
 export type WorkflowComplexity = 'simple' | 'moderate' | 'complex';
 
@@ -394,7 +394,10 @@ export function adaptiveFallbackCompilation(
     edges,
   }), mission);
   if (!parsed) throw new Error('Adaptive workflow fallback could not be normalized');
-  parsed.stages = validateWorkflowGraph({ mission, stages: parsed.stages, edges: parsed.edges });
+  parsed.stages = layoutWorkflowStages(
+    validateWorkflowGraph({ mission, stages: parsed.stages, edges: parsed.edges }),
+    parsed.edges,
+  );
   parsed.spec = {
     ...parsed.spec,
     source: 'adaptive-fallback',
@@ -694,6 +697,7 @@ export async function compileWorkflowWithLangGraph(
     ? state.fallbackReason ?? (state.validationErrors.join(' ').slice(0, 1_000) || 'Workflow compilation failed.')
     : null;
   const compilation = state.compilation ?? adaptiveFallbackCompilation(mission, analysis);
+  compilation.stages = layoutWorkflowStages(compilation.stages, compilation.edges);
   const metadata: WorkflowCompilerMetadata = {
     engine: 'langgraph',
     version: 1,

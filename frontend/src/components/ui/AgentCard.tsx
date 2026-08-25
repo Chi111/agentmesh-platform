@@ -19,8 +19,18 @@ export function AgentAvatar({ agent, size = 'md' }: { agent: Agent; size?: 'sm' 
 }
 
 export function AgentCard({ agent, compact = false }: { agent: Agent; compact?: boolean }) {
+  const quality = agent.quality;
+  const settledSuccessRate = quality?.settledJobs
+    ? Math.round((quality.successfulJobs / quality.settledJobs) * 100)
+    : null;
+  const marketLabel = quality?.marketplaceStatus === 'listed' ? '已准入'
+    : quality?.marketplaceStatus === 'degraded' ? '已降级'
+      : quality?.marketplaceStatus === 'suspended' ? '已暂停'
+        : quality?.gateMode === 'shadow' && quality.eligible ? '影子接单' : quality?.trialPassed ? '观察期' : agent.status === 'active' ? '接单中' : '试炼中';
+  const marketTone = quality?.marketplaceStatus === 'listed' ? 'success'
+    : quality?.marketplaceStatus === 'suspended' ? 'danger' : 'warning';
   return (
-    <article className="panel group flex h-full flex-col p-5 transition hover:-translate-y-0.5 hover:border-cyan/40 hover:shadow-float">
+    <article className="panel agent-card group flex h-full flex-col p-5 transition duration-200 hover:-translate-y-1 hover:border-cyan/35 hover:shadow-float">
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <AgentAvatar agent={agent} />
@@ -32,23 +42,27 @@ export function AgentCard({ agent, compact = false }: { agent: Agent; compact?: 
             <p className="mt-1 text-xs text-muted">{agent.category} · {agent.version}</p>
           </div>
         </div>
-        <StatusBadge tone={agent.status === 'active' ? 'success' : 'warning'}>{agent.status === 'active' ? '可接单' : '试炼中'}</StatusBadge>
+        <StatusBadge tone={marketTone}>{marketLabel}</StatusBadge>
       </div>
 
       <p className={`mt-4 text-sm leading-6 text-muted ${compact ? 'line-clamp-2' : 'line-clamp-3'}`}>{agent.summary}</p>
 
       <div className="mt-4 flex flex-wrap gap-2">
+        {quality?.premium ? <span className="mono-chip !border-lime/40 !bg-lime/15">高质量</span> : null}
+        {quality?.newAgent ? <span className="mono-chip">NEW · 限量曝光</span> : null}
+        {quality?.gateMode === 'shadow' && !quality.wouldBeEligible ? <span className="mono-chip !border-warning/30 !bg-warning/10">SHADOW</span> : null}
+        {quality?.trialPassed ? <span className="mono-chip">TRIAL ✓</span> : null}
         {agent.tags.slice(0, 3).map((tag) => <span className="mono-chip" key={tag}>#{tag}</span>)}
       </div>
 
       <div className="mt-5 grid grid-cols-3 gap-3 border-y border-line py-4 text-center">
         <div>
-          <p className="font-mono text-sm font-semibold">{agent.trustScore || '—'}</p>
-          <p className="mt-1 text-[10px] text-muted">信任分</p>
+          <p className="font-mono text-sm font-semibold">{quality?.reputation ?? '—'}</p>
+          <p className="mt-1 text-[10px] text-muted">信誉 / 100</p>
         </div>
         <div>
-          <p className="font-mono text-sm font-semibold">{agent.successRate || '—'}{agent.successRate ? '%' : ''}</p>
-          <p className="mt-1 text-[10px] text-muted">成功率</p>
+          <p className="font-mono text-sm font-semibold">{quality ? quality.confidence.toUpperCase() : '—'}</p>
+          <p className="mt-1 text-[10px] text-muted">置信度</p>
         </div>
         <div>
           <p className="font-mono text-sm font-semibold">{agent.price}</p>
@@ -58,8 +72,9 @@ export function AgentCard({ agent, compact = false }: { agent: Agent; compact?: 
 
       <div className="mt-auto flex items-center justify-between gap-4 pt-4">
         <div className="flex items-center gap-3 text-[11px] text-muted">
-          <span className="inline-flex items-center gap-1"><CheckCircle2 size={13} />{agent.jobs} 单</span>
-          <span className="inline-flex items-center gap-1"><Clock3 size={13} />{agent.responseTime}</span>
+          <span className="inline-flex items-center gap-1"><CheckCircle2 size={13} />{quality?.settledJobs ?? agent.jobs} 单</span>
+          {settledSuccessRate === null ? null : <span>{settledSuccessRate}% 履约</span>}
+          <span className="inline-flex items-center gap-1"><Clock3 size={13} />{quality ? quality.endpointHealthy ? '健康' : '待检查' : agent.responseTime}</span>
         </div>
         <Link to={`/agents/${agent.id}`} className="inline-flex items-center gap-1 text-xs font-semibold text-ink transition group-hover:text-cyan">
           查看详情 <ArrowRight size={14} />

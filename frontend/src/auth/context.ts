@@ -1,5 +1,6 @@
 import { createContext } from 'react';
 import type { SettlementRecipient } from '../services/settlement';
+import type { YdWalletAction } from '../services/ydFinance';
 import type { PaymentMethod, UserProfile } from '../types/domain';
 
 export type AuthStatus = 'loading' | 'anonymous' | 'authenticated' | 'error';
@@ -13,6 +14,7 @@ export interface AuthContextValue {
   linkedWalletAddress: string | null;
   walletAddress: string | null;
   onchainSettlement: boolean;
+  ydWalletEnabled: boolean;
   loginWithEmail: (email: string, password: string) => Promise<void>;
   loginWithGoogle: () => Promise<void>;
   loginWithPrivy: () => Promise<void>;
@@ -23,6 +25,7 @@ export interface AuthContextValue {
   freezeEscrow: (missionId: string) => Promise<string | null>;
   unfreezeEscrow: (missionId: string) => Promise<string | null>;
   refundEscrow: (missionId: string) => Promise<string | null>;
+  submitYdAction: (action: YdWalletAction) => Promise<string>;
   signOut: () => Promise<void>;
   refreshProfile: () => Promise<UserProfile | null>;
 }

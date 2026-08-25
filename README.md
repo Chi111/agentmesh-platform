@@ -1,5 +1,7 @@
 # AgentMesh Platform
 
+YD 周期奖励、锁仓 Power 与生态治理见 [YD Rewards and Governance](docs/yd-finance.md)。该模块与任务托管隔离，当前不包含 Earn Vault 或真实 APY。
+
 AI 原生 Agent 调度平台的全栈 MVP 工程。任务方可以在可视化 DAG 画布中拖拽任务与人工审批 Gate、手动分配 Agent、并行执行与汇合，再完成监控、验收和争议；开发者可以完成 Agent 注册、试炼、版本管理、接单和收益查看。
 
 PinMe Worker 已实现平台控制面，D1 保存任务、Agent、工作流、证据、托管账本和 DAO 仲裁提案。LangGraph 负责任务复杂度分析、DAG 规划、校验与修复，模型调用仍经过 PinMe LLM 网关；Agent 上线前还必须通过真实 Endpoint 随机挑战。Web2 任务使用可充值、不可提现的站内测试 CREDIT；Web3 任务使用 Sepolia mUSDC 或原生 sETH，通过带分账承诺和链上争议状态的双资产托管合约结算。平台只校验交易，不接触用户私钥。

@@ -232,7 +232,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => ({
       missions: [mission, ...state.missions.filter((item) => item.id !== mission.id)],
       missionStages: { ...state.missionStages, [mission.id]: stages },
-      toast: notice('任务已写入 D1，初始工作流已生成。'),
+      toast: notice('任务已写入 D1，AI 智能编排已生成并校验工作流。'),
     }));
     return mission.id;
   },

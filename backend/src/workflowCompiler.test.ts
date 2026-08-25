@@ -6,7 +6,11 @@ import {
   estimateWorkflowAnalysis,
   workflowHasParallelism,
 } from './workflowCompiler';
-import { validateWorkflowGraph } from './workflowGraph';
+import {
+  validateWorkflowGraph,
+  WORKFLOW_LAYOUT_NODE_HEIGHT,
+  WORKFLOW_LAYOUT_NODE_WIDTH,
+} from './workflowGraph';
 
 function mission(overrides: Partial<Mission> = {}): Mission {
   return {
@@ -74,6 +78,21 @@ function rawCompilation(missionValue: Mission): string {
   });
 }
 
+function nodesOverlap(left: WorkflowStage, right: WorkflowStage): boolean {
+  return left.positionX < right.positionX + WORKFLOW_LAYOUT_NODE_WIDTH
+    && left.positionX + WORKFLOW_LAYOUT_NODE_WIDTH > right.positionX
+    && left.positionY < right.positionY + WORKFLOW_LAYOUT_NODE_HEIGHT
+    && left.positionY + WORKFLOW_LAYOUT_NODE_HEIGHT > right.positionY;
+}
+
+function expectNoNodeOverlap(stages: WorkflowStage[]): void {
+  for (let leftIndex = 0; leftIndex < stages.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < stages.length; rightIndex += 1) {
+      expect(nodesOverlap(stages[leftIndex], stages[rightIndex])).toBe(false);
+    }
+  }
+}
+
 describe('LangGraph workflow compiler', () => {
   it('adapts fallback size and topology to actual mission complexity', () => {
     const simple = mission();
@@ -95,7 +114,9 @@ describe('LangGraph workflow compiler', () => {
 
   it('repairs one invalid planner result and saves the corrected graph', async () => {
     const target = complexMission();
-    const valid = rawCompilation(target);
+    const validGraph = JSON.parse(rawCompilation(target)) as { nodes: Array<Record<string, unknown>> };
+    validGraph.nodes = validGraph.nodes.map((node) => ({ ...node, positionX: 0, positionY: 0 }));
+    const valid = JSON.stringify(validGraph);
     const responses = [
       JSON.stringify({
         complexity: 'complex', score: 9, rationale: 'Multiple high-risk engineering workstreams.',
@@ -117,6 +138,7 @@ describe('LangGraph workflow compiler', () => {
     expect(result.metadata.repairAttempts).toBe(1);
     expect(result.compilation.stages.filter((stage) => stage.nodeType === 'task').length).toBeGreaterThanOrEqual(6);
     expect(workflowHasParallelism(result.compilation.stages, result.compilation)).toBe(true);
+    expectNoNodeOverlap(result.compilation.stages);
     expect(prompts[2]).toContain('repair node');
     expect(result.compilation.spec.compiler).toMatchObject({ engine: 'langgraph', repairAttempts: 1 });
   });

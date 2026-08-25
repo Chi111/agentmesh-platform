@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, History, LoaderCircle, Search, ShieldCheck, UserCog, Users, Vote, type LucideIcon } from 'lucide-react';
+import { Activity, AlertTriangle, Bot, History, LoaderCircle, RefreshCw, Search, ShieldCheck, UserCog, Users, Vote, type LucideIcon } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
@@ -6,7 +6,7 @@ import { Modal } from '../components/ui/Modal';
 import { PageHeader } from '../components/ui/PageHeader';
 import { api } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
-import type { AdminAction, AdminUser, UserProfile } from '../types/domain';
+import type { AdminAction, AdminAgentQualityRow, AdminUser, AgentQualityStats, UserProfile } from '../types/domain';
 
 const roleMeta: Record<UserProfile['role'], { label: string; className: string }> = {
   requester: { label: '任务方', className: 'bg-cyan/10 text-cyan' },
@@ -19,9 +19,33 @@ interface PendingRoleChange {
   role: UserProfile['role'];
 }
 
+interface PendingQualityEvent {
+  agentId: string;
+  agentName: string;
+  type: 'security_incident' | 'security_resolved';
+}
+
 function formatTime(value: string) {
   if (!value) return '尚无记录';
   return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
+function withQualityStats(row: AdminAgentQualityRow, stats: AgentQualityStats): AdminAgentQualityRow {
+  const gateMode = row.agent.quality?.gateMode ?? 'shadow';
+  const wouldBeEligible = stats.marketplaceStatus === 'listed' && stats.eligibilityReasons.length === 0;
+  return {
+    ...row,
+    agent: {
+      ...row.agent,
+      quality: {
+        ...stats,
+        gateMode,
+        wouldBeEligible,
+        eligible: gateMode === 'shadow' ? row.agent.status === 'active' : wouldBeEligible,
+      },
+    },
+    reasons: stats.eligibilityReasons,
+  };
 }
 
 export function AdminPage() {
@@ -35,17 +59,22 @@ export function AdminPage() {
   const [error, setError] = useState('');
   const [pending, setPending] = useState<PendingRoleChange | null>(null);
   const [committeeBusyId, setCommitteeBusyId] = useState('');
+  const [qualityRows, setQualityRows] = useState<AdminAgentQualityRow[]>([]);
+  const [qualityBusyId, setQualityBusyId] = useState('');
+  const [qualityEvent, setQualityEvent] = useState<PendingQualityEvent | null>(null);
+  const [qualityReason, setQualityReason] = useState('');
 
   useEffect(() => {
     let cancelled = false;
     if (profile?.role !== 'admin') return () => { cancelled = true; };
     setLoading(true);
     setError('');
-    void Promise.all([api.listAdminUsers(), api.listAdminActions()])
-      .then(([nextUsers, nextActions]) => {
+    void Promise.all([api.listAdminUsers(), api.listAdminActions(), api.listAdminAgentQuality()])
+      .then(([nextUsers, nextActions, nextQualityRows]) => {
         if (cancelled) return;
         setUsers(nextUsers);
         setActions(nextActions);
+        setQualityRows(nextQualityRows);
       })
       .catch((loadError) => { if (!cancelled) setError(loadError instanceof Error ? loadError.message : '运营数据加载失败。'); })
       .finally(() => { if (!cancelled) setLoading(false); });
@@ -107,6 +136,37 @@ export function AdminPage() {
     }
   };
 
+  const recomputeQuality = async (agentId: string) => {
+    setQualityBusyId(agentId); setError('');
+    try {
+      const stats = await api.recomputeAgentQuality(agentId);
+      setQualityRows((current) => current.map((row) => row.agent.id === agentId ? withQualityStats(row, stats) : row));
+      showToast('Agent 质量分已按完整事件历史重新计算。', 'success');
+    } catch (qualityError) {
+      setError(qualityError instanceof Error ? qualityError.message : '质量分重算失败。');
+    } finally { setQualityBusyId(''); }
+  };
+
+  const submitQualityEvent = async () => {
+    if (!qualityEvent || qualityReason.trim().length < 12) return;
+    setQualityBusyId(qualityEvent.agentId); setError('');
+    try {
+      const result = await api.recordAdminAgentQualityEvent(qualityEvent.agentId, {
+        type: qualityEvent.type,
+        reason: qualityReason.trim(),
+        ...(qualityEvent.type === 'security_incident' ? { severe: true } : {}),
+      });
+      if (result.stats) {
+        const stats = result.stats;
+        setQualityRows((current) => current.map((row) => row.agent.id === qualityEvent.agentId ? withQualityStats(row, stats) : row));
+      }
+      showToast(qualityEvent.type === 'security_incident' ? '严重风险事件已记录，Agent 已进入暂停判定。' : '风险解除事件已写入，恢复仍需满足连续履约条件。', 'success');
+      setQualityEvent(null); setQualityReason('');
+    } catch (qualityActionError) {
+      setError(qualityActionError instanceof Error ? qualityActionError.message : '质量事件写入失败。');
+    } finally { setQualityBusyId(''); }
+  };
+
   if (profile?.role !== 'admin') {
     return <div className="space-y-7"><PageHeader eyebrow="Platform Operations" title="平台运营" description="该工作区仅向平台管理员开放。所有角色变更均由 Worker 鉴权并写入审计轨迹。" /><section className="panel flex flex-col items-center px-6 py-16 text-center"><span className="flex size-14 items-center justify-center rounded-2xl bg-warning/15 text-warning"><ShieldCheck size={24} /></span><h2 className="mt-5 text-xl font-semibold">需要管理员权限</h2><p className="mt-2 max-w-md text-sm leading-6 text-muted">当前账户没有平台运营权限。管理员角色只能由现有管理员在服务端授予，不能通过浏览器自行提升。</p><Link className="btn-secondary mt-6" to="/settings">查看当前身份</Link></section></div>;
   }
@@ -121,6 +181,8 @@ export function AdminPage() {
 
       {error ? <p className="rounded-xl border border-danger/25 bg-danger/10 p-4 text-sm text-danger" role="alert">{error}</p> : null}
 
+      <section className="panel overflow-hidden"><div className="flex flex-col gap-3 border-b border-line p-5 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-xl bg-cyan/10 text-cyan"><Bot size={18} /></span><div><h2 className="font-semibold">Agent 市场质量</h2><p className="mt-1 text-xs text-muted">正式 Trial、Endpoint、已结算履约、交付与争议共同形成可重算信誉；shadow 不会直接下架现有 Agent。</p></div></div><span className="mono-chip">{qualityRows.filter((row) => row.agent.quality?.wouldBeEligible).length} READY / {qualityRows.length}</span></div><div className="grid gap-3 p-5 md:grid-cols-2 xl:grid-cols-3">{qualityRows.map(({ agent, reasons }) => <article className="rounded-2xl border border-line bg-canvas/30 p-4" key={agent.id}><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{agent.name}</p><p className="mt-1 font-mono text-[9px] text-muted">{agent.id}</p></div><span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${agent.quality?.marketplaceStatus === 'listed' ? 'bg-lime/20 text-ink' : agent.quality?.marketplaceStatus === 'suspended' ? 'bg-danger/10 text-danger' : 'bg-warning/10 text-warning'}`}>{agent.quality?.marketplaceStatus ?? 'unrated'}</span></div><div className="mt-4 grid grid-cols-3 gap-2"><div><p className="text-[9px] text-muted">信誉</p><p className="mt-1 font-mono text-lg font-semibold">{agent.quality?.reputation ?? '—'}</p></div><div><p className="text-[9px] text-muted">置信度</p><p className="mt-1 font-mono text-xs font-semibold">{agent.quality?.confidence?.toUpperCase() ?? '—'}</p></div><div><p className="text-[9px] text-muted">Endpoint</p><p className="mt-1 font-mono text-xs font-semibold">{agent.quality?.endpointHealthy ? 'OK' : 'CHECK'}</p></div></div><p className="mt-3 line-clamp-2 min-h-10 text-[10px] leading-5 text-muted">{reasons.length ? reasons.join(' · ') : '满足强制市场准入条件'}</p><div className="mt-3 grid grid-cols-2 gap-2"><button type="button" className="btn-secondary" disabled={Boolean(qualityBusyId)} onClick={() => void recomputeQuality(agent.id)}>{qualityBusyId === agent.id ? <LoaderCircle size={14} className="animate-spin" /> : <RefreshCw size={14} />}重算</button><button type="button" className={agent.quality?.unresolvedSevereRisks ? 'btn-secondary' : 'inline-flex min-h-10 items-center justify-center rounded-xl border border-danger/25 px-3 text-xs font-semibold text-danger transition hover:bg-danger/5'} disabled={Boolean(qualityBusyId)} onClick={() => { setQualityReason(''); setQualityEvent({ agentId: agent.id, agentName: agent.name, type: agent.quality?.unresolvedSevereRisks ? 'security_resolved' : 'security_incident' }); }}>{agent.quality?.unresolvedSevereRisks ? '解除风险' : '记录风险'}</button></div></article>)}</div></section>
+
       <div className="grid gap-5 2xl:grid-cols-[minmax(0,1.55fr)_minmax(360px,.75fr)]">
         <section className="panel overflow-hidden">
           <div className="flex flex-col gap-4 border-b border-line p-5 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="font-semibold">成员与治理权限</h2><p className="mt-1 text-xs text-muted">仲裁委员身份独立于平台角色；首版一人一票，Power 固定为 1。</p></div><label className="relative w-full sm:w-64"><Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" size={15} /><input className="field h-10 pl-9" aria-label="搜索成员" placeholder="搜索姓名、邮箱或 ID" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
@@ -132,6 +194,10 @@ export function AdminPage() {
 
       <Modal open={Boolean(pending)} onClose={() => { if (!busy) setPending(null); }} title="确认角色调整" description="角色变更会立即影响该成员可访问的数据与操作，并写入平台审计轨迹。">
         {pending ? <div><div className="flex items-start gap-3 rounded-xl border border-warning/25 bg-warning/10 p-4"><AlertTriangle className="mt-0.5 shrink-0 text-warning" size={17} /><p className="text-sm leading-6">将 <strong>{pending.user.displayName}</strong> 从“{roleMeta[pending.user.role].label}”调整为“{roleMeta[pending.role].label}”。</p></div><div className="mt-5 flex justify-end gap-3"><button type="button" className="btn-secondary" disabled={busy} onClick={() => setPending(null)}>取消</button><button type="button" className="btn-primary" disabled={busy} onClick={() => void confirmRoleChange()}>{busy ? <LoaderCircle className="animate-spin" size={15} /> : null}{busy ? '写入中…' : '确认并写入审计'}</button></div></div> : null}
+      </Modal>
+
+      <Modal open={Boolean(qualityEvent)} onClose={() => { if (!qualityBusyId) { setQualityEvent(null); setQualityReason(''); } }} title={qualityEvent?.type === 'security_incident' ? '记录严重风险' : '解除风险标记'} description="操作不会直接改写信誉分，只会向不可变质量账本追加带原因的审计事件。">
+        {qualityEvent ? <div><div className={`flex items-start gap-3 rounded-xl border p-4 ${qualityEvent.type === 'security_incident' ? 'border-danger/25 bg-danger/10' : 'border-cyan/25 bg-cyan/10'}`}><AlertTriangle className={`mt-0.5 shrink-0 ${qualityEvent.type === 'security_incident' ? 'text-danger' : 'text-cyan'}`} size={17} /><p className="text-sm leading-6"><strong>{qualityEvent.agentName}</strong>：{qualityEvent.type === 'security_incident' ? '提交后将立即进入 suspended 判定并停止新接单。' : '解除严重风险后仍需满足分数、Endpoint 和最近 3 单连续成功的恢复条件。'}</p></div><label className="mt-5 block text-xs font-semibold">操作原因<textarea className="field mt-2 min-h-28 resize-y py-3" maxLength={2000} placeholder="至少 12 个字符，说明证据来源和处理依据" value={qualityReason} onChange={(event) => setQualityReason(event.target.value)} /></label><div className="mt-5 flex justify-end gap-3"><button type="button" className="btn-secondary" disabled={Boolean(qualityBusyId)} onClick={() => { setQualityEvent(null); setQualityReason(''); }}>取消</button><button type="button" className={qualityEvent.type === 'security_incident' ? 'btn-primary bg-danger hover:bg-danger/90' : 'btn-primary'} disabled={Boolean(qualityBusyId) || qualityReason.trim().length < 12} onClick={() => void submitQualityEvent()}>{qualityBusyId ? <LoaderCircle className="animate-spin" size={15} /> : null}{qualityBusyId ? '写入中…' : '确认写入质量账本'}</button></div></div> : null}
       </Modal>
     </div>
   );

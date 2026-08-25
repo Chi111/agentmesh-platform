@@ -1,5 +1,26 @@
 export type UserRole = 'requester' | 'developer' | 'admin';
 export type AgentStatus = 'trial' | 'active' | 'paused';
+export type AgentMarketplaceStatus = 'registered' | 'verifying' | 'trial' | 'listed' | 'degraded' | 'suspended' | 'retired';
+export type AgentQualityConfidence = 'low' | 'medium' | 'high';
+export type AgentQualityGateMode = 'shadow' | 'enforce';
+export type AgentMetricSeverity = 'info' | 'warning' | 'severe';
+export type AgentMetricEventType =
+  | 'trial_passed'
+  | 'trial_failed'
+  | 'endpoint_healthy'
+  | 'endpoint_unreachable'
+  | 'artifact_verified'
+  | 'artifact_invalid'
+  | 'mission_settled_success'
+  | 'mission_failed'
+  | 'mission_timeout'
+  | 'mission_refunded'
+  | 'dispute_won'
+  | 'dispute_lost'
+  | 'feedback_received'
+  | 'security_incident'
+  | 'security_resolved'
+  | 'admin_adjustment';
 export type MissionStatus = 'draft' | 'matching' | 'running' | 'review' | 'completed' | 'cancelled';
 export type StageStatus = 'queued' | 'running' | 'done' | 'failed';
 export type WorkflowNodeType = 'task' | 'approval';
@@ -45,6 +66,142 @@ export interface Agent {
   official: boolean;
   createdAt: string;
   updatedAt: string;
+  quality?: AgentQualityProfile;
+}
+
+export interface AgentVersion {
+  id: string;
+  agentId: string;
+  version: string;
+  endpoint: string;
+  authType: Agent['authType'];
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown>;
+  capabilities: string[];
+  createdAt: string;
+}
+
+export interface AgentTrial {
+  id: string;
+  agentId: string;
+  agentVersionId: string | null;
+  suiteVersion: string;
+  status: 'running' | 'passed' | 'failed';
+  score: number;
+  responseTimeMs: number;
+  checks: Array<{ key: string; passed: boolean; score: number; summary: string }>;
+  summary: string;
+  evidence: Record<string, unknown>;
+  startedAt: string;
+  completedAt: string | null;
+  createdBy: string;
+}
+
+export interface AgentHealthCheck {
+  id: string;
+  agentId: string;
+  status: 'healthy' | 'unreachable' | 'invalid';
+  responseTimeMs: number | null;
+  httpStatus: number | null;
+  errorCode: string | null;
+  checkedAt: string;
+}
+
+export interface AgentMetricEvent {
+  id: string;
+  idempotencyKey: string;
+  agentId: string;
+  type: AgentMetricEventType;
+  value: number;
+  weight: number;
+  severity: AgentMetricSeverity;
+  sourceType: 'registration' | 'trial' | 'health' | 'stage' | 'settlement' | 'dispute' | 'feedback' | 'admin';
+  sourceId: string;
+  detail: Record<string, unknown>;
+  occurredAt: string;
+  createdAt: string;
+}
+
+export interface AgentQualityBreakdown {
+  reliability: number;
+  quality: number;
+  delivery: number;
+  response: number;
+  history: number;
+  riskPenalty: number;
+}
+
+export interface AgentQualityStats {
+  agentId: string;
+  marketplaceStatus: AgentMarketplaceStatus;
+  reputation: number;
+  breakdown: AgentQualityBreakdown;
+  confidence: AgentQualityConfidence;
+  settledJobs: number;
+  successfulJobs: number;
+  failedJobs: number;
+  refundedJobs: number;
+  trialPassed: boolean;
+  endpointHealthy: boolean;
+  payoutValid: boolean;
+  unresolvedSevereRisks: number;
+  premium: boolean;
+  newAgent: boolean;
+  eligibilityReasons: string[];
+  formulaVersion: string;
+  lastTrialAt: string | null;
+  lastHealthCheckAt: string | null;
+  updatedAt: string;
+}
+
+export interface AgentQualityProfile extends AgentQualityStats {
+  gateMode: AgentQualityGateMode;
+  eligible: boolean;
+  wouldBeEligible: boolean;
+}
+
+export interface AgentReputationSnapshot {
+  id: string;
+  agentId: string;
+  evaluatedAt: string;
+  formulaVersion: string;
+  eventCount: number;
+  reputation: number;
+  breakdown: AgentQualityBreakdown;
+  confidence: AgentQualityConfidence;
+  marketplaceStatus: AgentMarketplaceStatus;
+  eligibilityReasons: string[];
+  createdAt: string;
+}
+
+export interface AgentFeedback {
+  id: string;
+  agentId: string;
+  missionId: string;
+  stageId: string;
+  requesterId: string;
+  version: number;
+  deliveryQuality: number;
+  requirementsFit: number;
+  communication: number;
+  onTime: boolean;
+  reuse: boolean;
+  comment: string;
+  effective: boolean;
+  createdAt: string;
+}
+
+export interface AgentQualityDetail {
+  stats: AgentQualityStats;
+  trials: AgentTrial[];
+  healthChecks: AgentHealthCheck[];
+  feedback: AgentFeedback[];
+  snapshots: AgentReputationSnapshot[];
+}
+
+export interface AgentMetricRecordResult {
+  applied: boolean;
+  stats: AgentQualityStats | null;
 }
 
 export interface Mission {
@@ -270,6 +427,176 @@ export type DisputeFinalizeResult =
   | { state: 'finalized' | 'not_ready'; governance: DisputeGovernance }
   | { state: 'missing' };
 
+export type RewardEpochStatus = 'draft' | 'computed' | 'published' | 'expired';
+export type RewardActivityRole = 'requester' | 'agent_owner' | 'arbitrator';
+export type RewardAllocationStatus = 'unclaimed' | 'claimed' | 'expired';
+
+export interface RewardEpoch {
+  id: string;
+  epochNumber: number;
+  status: RewardEpochStatus;
+  startsAt: string;
+  endsAt: string;
+  claimEndsAt: string;
+  totalRewardUnits: string;
+  accountScoreCap: number;
+  formulaVersion: string;
+  rules: Record<string, unknown>;
+  chainId: number;
+  distributorAddress: string;
+  merkleRoot: string | null;
+  manifestHash: string | null;
+  publishTxHash: string | null;
+  computedAt: string | null;
+  publishedAt: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RewardActivity {
+  id: string;
+  sourceKey: string;
+  userId: string;
+  missionId: string | null;
+  disputeId: string | null;
+  role: RewardActivityRole;
+  formulaVersion: string;
+  asset: string;
+  settledAmount: number;
+  qualityBps: number;
+  penaltyBps: number;
+  scoreMicros: number;
+  eligible: boolean;
+  detail: Record<string, unknown>;
+  occurredAt: string;
+  createdAt: string;
+}
+
+export interface RewardAllocation {
+  id: string;
+  epochId: string;
+  userId: string;
+  walletAddress: string;
+  effectiveScore: number;
+  amountUnits: string;
+  leafHash: string;
+  proof: string[];
+  status: RewardAllocationStatus;
+  claimTxHash: string | null;
+  claimedAt: string | null;
+  createdAt: string;
+}
+
+export interface RewardClaim {
+  id: string;
+  epochId: string;
+  userId: string;
+  walletAddress: string;
+  amountUnits: string;
+  txHash: string;
+  blockNumber: string;
+  logIndex: number;
+  claimedAt: string;
+}
+
+export interface YdStakingPosition {
+  userId: string;
+  walletAddress: string;
+  amountUnits: string;
+  unlockTime: string | null;
+  durationSeconds: number;
+  reputationBps: number;
+  rawPower: string;
+  delegatedTo: string | null;
+  votingPower: string;
+  verified: boolean;
+  lastTxHash: string | null;
+  lastBlockNumber: string | null;
+  lastLogIndex: number | null;
+  updatedAt: string;
+}
+
+export type EcosystemProposalType = 'reward_release' | 'reward_weights' | 'ecosystem_grant' | 'development' | 'platform_parameter';
+export type EcosystemProposalStatus = 'active' | 'succeeded' | 'defeated' | 'quorum_failed' | 'cancelled';
+export type EcosystemVoteChoice = 'for' | 'against' | 'abstain';
+
+export interface EcosystemProposal {
+  id: string;
+  proposalNumber: number;
+  proposerId: string;
+  proposalType: EcosystemProposalType;
+  title: string;
+  description: string;
+  payload: Record<string, unknown>;
+  status: EcosystemProposalStatus;
+  snapshotBlock: string;
+  startsAt: string;
+  endsAt: string;
+  quorumBps: number;
+  approvalBps: number;
+  eligiblePower: string;
+  forPower: string;
+  againstPower: string;
+  abstainPower: string;
+  finalizedAt: string | null;
+  finalizedBy: string | null;
+  createdAt: string;
+}
+
+export interface GovernancePowerSnapshot {
+  proposalId: string;
+  userId: string;
+  walletAddress: string;
+  power: string;
+  delegateSources: string[];
+  createdAt: string;
+}
+
+export interface EcosystemVote {
+  id: string;
+  proposalId: string;
+  voterId: string;
+  walletAddress: string;
+  choice: EcosystemVoteChoice;
+  power: string;
+  reason: string;
+  createdAt: string;
+}
+
+export interface EcosystemGovernanceDetail {
+  proposal: EcosystemProposal;
+  electorate: GovernancePowerSnapshot[];
+  votes: EcosystemVote[];
+  currentUser: {
+    eligible: boolean;
+    canVote: boolean;
+    hasVoted: boolean;
+    power: string;
+    choice: EcosystemVoteChoice | null;
+  };
+}
+
+export interface YdFinanceOverview {
+  epochs: RewardEpoch[];
+  allocations: RewardAllocation[];
+  activities: RewardActivity[];
+  staking: YdStakingPosition | null;
+  governance: EcosystemGovernanceDetail[];
+}
+
+export type RewardEpochComputeResult =
+  | { state: 'computed'; epoch: RewardEpoch; allocations: RewardAllocation[] }
+  | { state: 'missing' | 'not_draft' | 'no_eligible_accounts' };
+
+export type EcosystemVoteResult =
+  | { state: 'applied'; governance: EcosystemGovernanceDetail }
+  | { state: 'missing' | 'not_eligible' | 'already_voted' | 'closed' | 'expired' };
+
+export type EcosystemFinalizeResult =
+  | { state: 'finalized' | 'not_ready'; governance: EcosystemGovernanceDetail }
+  | { state: 'missing' };
+
 export interface Notification {
   id: string;
   userId: string;
@@ -464,6 +791,19 @@ export interface PlatformStore {
   createAgent(agent: Agent): Promise<Agent>;
   updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs?: number): Promise<Agent | null>;
   updateAgentStatus(id: string, status: AgentStatus): Promise<Agent | null>;
+  getAgentQualityStats(agentId: string): Promise<AgentQualityStats | null>;
+  listAgentQualityStats(): Promise<AgentQualityStats[]>;
+  recordAgentTrial(trial: AgentTrial): Promise<AgentTrial>;
+  listAgentTrials(agentId: string, limit?: number): Promise<AgentTrial[]>;
+  recordAgentHealthCheck(check: AgentHealthCheck): Promise<AgentHealthCheck>;
+  listAgentHealthChecks(agentId: string, limit?: number): Promise<AgentHealthCheck[]>;
+  recordAgentMetricEvent(event: AgentMetricEvent, evaluatedAt: string): Promise<AgentMetricRecordResult>;
+  recomputeAgentQuality(agentId: string, evaluatedAt: string): Promise<AgentQualityStats | null>;
+  listAgentMetricEvents(agentId: string): Promise<AgentMetricEvent[]>;
+  listAgentReputationSnapshots(agentId: string, limit?: number): Promise<AgentReputationSnapshot[]>;
+  saveAgentFeedback(feedback: AgentFeedback, evaluatedAt: string): Promise<{ feedback: AgentFeedback; stats: AgentQualityStats | null }>;
+  getAgentFeedback(missionId: string, stageId: string, agentId: string): Promise<AgentFeedback | null>;
+  listAgentFeedback(agentId: string, limit?: number): Promise<AgentFeedback[]>;
 
   listMissions(user: UserContext): Promise<Mission[]>;
   getMission(id: string): Promise<Mission | null>;
@@ -536,6 +876,23 @@ export interface PlatformStore {
   listAdminActions(limit: number): Promise<AdminAction[]>;
   getDeveloperSummary(ownerId: string): Promise<{ jobs: number; activeAgents: number; volume: number; pending: number }>;
   getDeveloperLedger(ownerId: string, limit: number, cursor: LedgerCursor | null, token: string): Promise<DeveloperLedger>;
+
+  recordRewardActivity(activity: RewardActivity): Promise<boolean>;
+  createRewardEpoch(epoch: RewardEpoch): Promise<RewardEpoch>;
+  listRewardEpochs(): Promise<RewardEpoch[]>;
+  getRewardEpoch(id: string): Promise<RewardEpoch | null>;
+  listRewardAllocations(epochId: string): Promise<RewardAllocation[]>;
+  computeRewardEpoch(id: string, computedAt: string, actorId: string): Promise<RewardEpochComputeResult>;
+  markRewardEpochPublished(id: string, txHash: string, publishedAt: string, actorId: string): Promise<RewardEpoch | null>;
+  markRewardEpochExpired(id: string, txHash: string, expiredAt: string, actorId: string): Promise<RewardEpoch | null>;
+  getYdFinanceOverview(userId: string, now?: string): Promise<YdFinanceOverview>;
+  recordRewardClaim(claim: RewardClaim): Promise<{ claim: RewardClaim; applied: boolean } | null>;
+  syncYdStakingPosition(position: YdStakingPosition): Promise<YdStakingPosition>;
+  listGovernanceCandidates(): Promise<Array<{ userId: string; walletAddress: string }>>;
+  createEcosystemProposal(proposal: EcosystemProposal, electorate: GovernancePowerSnapshot[]): Promise<EcosystemGovernanceDetail>;
+  listEcosystemGovernance(userId: string, now?: string): Promise<EcosystemGovernanceDetail[]>;
+  castEcosystemVote(id: string, voterId: string, choice: EcosystemVoteChoice, reason: string, votedAt: string): Promise<EcosystemVoteResult>;
+  finalizeEcosystemProposal(id: string, actorId: string, finalizedAt: string): Promise<EcosystemFinalizeResult>;
 
   claimIdempotent(userId: string, key: string, method: string, path: string, requestHash: string): Promise<IdempotencyClaim>;
   completeIdempotent(userId: string, key: string, result: IdempotentResult): Promise<void>;

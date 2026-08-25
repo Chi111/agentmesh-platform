@@ -179,7 +179,7 @@ test('funded workflow locks graph mutation including keyboard deletion', async (
   await mockWorkspace(page, detail);
   await page.goto(`/#/missions/${baseMission.id}/workflow`);
 
-  await expect(page.getByRole('button', { name: 'AI 生成' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'AI 智能编排' })).toBeDisabled();
   await page.getByText('架构分析', { exact: true }).first().click();
   await page.keyboard.press('Delete');
   await expect(page.locator('.react-flow__node')).toHaveCount(3);
@@ -227,9 +227,9 @@ test('compact desktop docks node configuration on the right', async ({ page }) =
 test('AI compile replaces the draft graph without assigning an Agent', async ({ page }) => {
   const detail = { mission: baseMission, stages: draftStages, edges: draftEdges, offers: [], events: [], deliverables: [], escrow: { status: 'pending', amount: 300, token: 'CREDIT', network: 'web2' }, disputes: [] };
   const compiledStages = [
-    { ...draftStages[0], name: 'AI 需求分析', positionX: 100, positionY: 60, agentId: null },
-    { ...draftStages[1], name: 'AI 并行实现', positionX: 460, positionY: 60, agentId: null },
-    { ...draftStages[2], name: 'AI 人工验收', positionX: 820, positionY: 60, agentId: null },
+    { ...draftStages[0], name: 'AI 需求分析', positionX: 0, positionY: 0, agentId: null },
+    { ...draftStages[1], name: 'AI 并行实现', positionX: 0, positionY: 0, agentId: null },
+    { ...draftStages[2], name: 'AI 人工验收', positionX: 0, positionY: 0, agentId: null },
   ];
   let compiled = false;
   await mockWorkspace(page, detail, async (route) => {
@@ -243,9 +243,20 @@ test('AI compile replaces the draft graph without assigning an Agent', async ({ 
   });
 
   await page.goto(`/#/missions/${baseMission.id}/workflow`);
-  await page.getByRole('button', { name: 'AI 生成' }).click();
+  await page.getByRole('button', { name: 'AI 智能编排' }).click();
   await expect.poll(() => compiled).toBe(true);
   await expect(page.getByText('AI 需求分析', { exact: true }).first()).toBeVisible();
+  const boxes = await page.locator('.react-flow__node').evaluateAll((nodes) => nodes.map((node) => {
+    const box = node.getBoundingClientRect();
+    return { left: box.left, right: box.right, top: box.top, bottom: box.bottom };
+  }));
+  for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
+      const left = boxes[leftIndex];
+      const right = boxes[rightIndex];
+      expect(left.right <= right.left || right.right <= left.left || left.bottom <= right.top || right.bottom <= left.top).toBe(true);
+    }
+  }
   await page.getByText('AI 需求分析', { exact: true }).first().click();
   await expect(page.getByLabel('Agent（不自动选择）')).toHaveValue('');
 });

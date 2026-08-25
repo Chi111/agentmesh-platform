@@ -6,6 +6,7 @@ import {
   BriefcaseBusiness,
   Check,
   CircleDollarSign,
+  Coins,
   Compass,
   Gauge,
   Info,
@@ -42,6 +43,7 @@ const requesterNav: NavItem[] = [
   { label: '发布任务', to: '/missions/new', icon: Plus },
   { label: '我的任务', to: '/missions', icon: ListTodo },
   { label: '测试充值', to: '/wallet/test-funds', icon: WalletCards },
+  { label: 'YD Finance', to: '/yd-finance', icon: Coins },
   { label: 'Agent 市场', to: '/agents', icon: Compass },
   { label: '仲裁中心', to: '/arbitration', icon: Scale },
 ];
@@ -52,6 +54,7 @@ const developerNav: NavItem[] = [
   { label: '注册 Agent', to: '/developer/agents/new', icon: Plus },
   { label: '接单记录', to: '/developer/jobs', icon: BriefcaseBusiness },
   { label: '收益中心', to: '/developer/earnings', icon: CircleDollarSign },
+  { label: 'YD Finance', to: '/yd-finance', icon: Coins },
   { label: '仲裁中心', to: '/arbitration', icon: Scale },
 ];
 
@@ -119,7 +122,7 @@ function Sidebar({
         id="app-sidebar"
         ref={sidebarRef}
         aria-hidden={interactive ? undefined : true}
-        className={`fixed inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[264px] shrink-0 flex-col overflow-hidden bg-ink px-4 py-5 text-white transition-transform duration-200 [@media(max-height:520px)]:py-3 lg:sticky lg:top-0 lg:z-auto lg:translate-x-0 ${open ? 'translate-x-0' : '-translate-x-full'}`}
+        className={`app-sidebar fixed inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[252px] shrink-0 flex-col overflow-hidden bg-ink px-4 py-5 text-white transition-transform duration-200 [@media(max-height:520px)]:py-3 lg:sticky lg:bottom-auto lg:ml-3 lg:my-3 lg:h-[calc(100dvh-1.5rem)] lg:rounded-[24px] lg:border lg:border-white/10 lg:top-3 lg:z-auto lg:translate-x-0 ${open ? 'translate-x-0' : '-translate-x-full'}`}
       >
         <div className="flex items-center justify-between px-2">
           <Link to="/contract" className="flex items-center gap-3" onClick={onClose} aria-label="查看 AgentMesh 合约公开信息" title="合约公开信息">
@@ -159,11 +162,11 @@ function Sidebar({
               to={to}
               aria-current={isActive ? 'page' : undefined}
               onClick={onClose}
-              className={`group relative flex min-h-11 items-center gap-3 rounded-lg border border-transparent px-3 text-sm transition-colors ${isActive ? 'bg-white/[0.07] text-white before:absolute before:inset-y-2.5 before:left-0 before:w-0.5 before:rounded-full before:bg-cyan' : 'text-white/55 hover:bg-white/[0.05] hover:text-white'}`}
+              className={`group relative flex min-h-11 items-center gap-3 rounded-xl border px-3 text-sm transition-all ${isActive ? 'border-white/80 bg-white text-ink shadow-[0_10px_30px_rgba(0,0,0,.2)]' : 'border-transparent text-white/55 hover:border-white/5 hover:bg-white/[0.06] hover:text-white'}`}
             >
               <Icon size={18} className={isActive ? 'text-cyan' : undefined} aria-hidden="true" />
               <span className={isActive ? 'font-semibold' : 'font-medium'}>{itemLabel}</span>
-              {isActive ? <span className="ml-auto size-1.5 rounded-full bg-lime shadow-[0_0_8px_rgba(183,243,74,.55)]" aria-hidden="true" /> : null}
+              {isActive ? <span className="ml-auto size-1.5 rounded-full bg-cyan shadow-[0_0_8px_rgba(8,170,196,.55)]" aria-hidden="true" /> : null}
             </Link>;
           })}
           {profile?.role === 'admin' ? <NavLink
@@ -179,7 +182,7 @@ function Sidebar({
           </NavLink> : null}
         </nav>
 
-        <div className="shrink-0 bg-ink pt-2">
+        <div className="shrink-0 bg-transparent pt-2">
           <NavLink to="/settings" onClick={onClose} className={({ isActive }: { isActive: boolean }) => `flex min-h-11 items-center gap-3 rounded-xl px-3 text-sm transition ${isActive ? 'bg-white/10 text-white' : 'text-white/45 hover:bg-white/[0.05] hover:text-white'}`}>
             <Settings size={18} />
             设置
@@ -304,7 +307,7 @@ function Topbar({
   };
 
   return (
-    <header className="sticky top-0 z-30 flex h-16 shrink-0 items-center border-b border-line bg-white/90 px-4 backdrop-blur-xl md:px-7">
+    <header className="app-topbar sticky top-3 z-30 mx-3 mt-3 flex h-14 shrink-0 items-center rounded-2xl border border-white/70 px-3 backdrop-blur-xl md:px-5">
       <button ref={menuButtonRef} type="button" className="mr-3 rounded-lg p-2 text-muted hover:bg-canvas lg:hidden" onClick={onOpenMenu} aria-label="打开菜单" aria-controls="app-sidebar" aria-expanded={mobileMenuOpen}>
         <Menu size={20} />
       </button>
@@ -516,7 +519,7 @@ export function AppShell() {
   };
 
   return (
-    <div className="flex min-h-screen bg-canvas">
+    <div className="app-shell flex min-h-screen bg-transparent">
       <Sidebar open={mobileOpen} interactive={desktopSidebar || mobileOpen} sidebarRef={sidebarRef} onClose={closeMobileMenu} onOpenAuth={openAuth} />
       <div className={`min-w-0 flex-1 ${isWorkflowWorkspace ? 'flex h-dvh min-h-0 flex-col overflow-hidden' : isExecutionWorkspace ? 'xl:flex xl:h-dvh xl:min-h-0 xl:flex-col xl:overflow-hidden' : ''}`}>
         <Topbar mobileMenuOpen={mobileOpen} menuButtonRef={menuButtonRef} onOpenMenu={openMobileMenu} />

@@ -15,6 +15,8 @@
 2. 在 Worker Secret `AGENT_CREDENTIALS_JSON` 中按 Agent ID 配置私有 Endpoint 凭据；不要通过注册 API 或 D1 保存密钥。
 3. Endpoint 必须支持公网 HTTPS 443、回显试炼随机挑战、按 `X-AgentMesh-Task-Id` 幂等处理，并在回调中带回 `runId`、`expiresAt` 和唯一 `callbackId`。
 4. 建议配置 `AGENT_ENDPOINT_ALLOWLIST`。上线前跑通私网/回环/DNS 非公网拒绝、一次 5xx 重试、并发派单、重复回调、过期回调、错误签名拒绝、终态不可回退、冻结后回调拒绝和交付回写。
+5. 首次发布质量体系时保持 `AGENT_QUALITY_GATE_MODE=shadow`，先升级 PinMe、DS Endpoint 使其支持 `agentmesh.trial.v3`，再对生产 Agent 逐个补跑正式 Trial，观察 Endpoint 健康、信誉分、置信度和 `wouldBeEligible`。确认市场、候选与历史执行无异常后，另行审批切为 `enforce`；不得在未补 Trial 时直接强制，避免全部 Agent 被隐藏。
+6. 每分钟 cron 同时排空 DAG outbox，并以 15 分钟窗口限量检查最多 3 个到期 Endpoint。生产需监控健康失败和质量降级；Worker Secret 缺失会记录受限错误码，但 Bearer、原始响应和密钥不得进入 D1 或日志。
 
 ## 3. Sepolia 双资产合约模式
 

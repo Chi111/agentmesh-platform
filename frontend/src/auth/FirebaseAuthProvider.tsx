@@ -56,6 +56,7 @@ export function FirebaseAuthController({ onChange }: { onChange: (value: AuthCon
     linkedWalletAddress: null,
     walletAddress: null,
     onchainSettlement: false,
+    ydWalletEnabled: false,
     loginWithEmail: async (email, password) => {
       setError(null);
       const credential = await signInWithEmailAndPassword(getProjectAuth(), email, password);
@@ -79,6 +80,7 @@ export function FirebaseAuthController({ onChange }: { onChange: (value: AuthCon
     freezeEscrow: unavailableWallet,
     unfreezeEscrow: unavailableWallet,
     refundEscrow: unavailableWallet,
+    submitYdAction: unavailableWallet,
     signOut: async () => {
       await firebaseSignOut(getProjectAuth());
       setApiTokenProvider(null);

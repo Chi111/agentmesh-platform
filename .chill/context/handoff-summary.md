@@ -3,18 +3,21 @@
 ## 状态
 
 - 工作流：completed
-- 任务：11/11
-- 评审：PASSED；无阻断项或 P0
-- QA：PASSED
+- 功能：`specs/006-agent-market-quality`
+- 当前任务：T9 Review/QA 通过
+- 部署：未授权
 
-## 结果
+## 已固定
 
-- 完成 `specs/002-market-foundation`：阶段级接单邀请、所有者响应、全员接受启动门禁、真实履约成功率和七天验收期限。
-- 修复 D1 重新邀请的审计外键问题，以及 Web2 钱包交易冲突策略导致的余额未更新问题。
-- D1 迁移 `010_market_foundation.sql`、43 项后端/SQLite 测试、7 项浏览器 E2E、前端生产构建和 Worker dry-run 均通过。
+- 首发实现附件 Phase 1–5：账本、Trial、评分、市场闸门和结构化反馈。
+- 保留 legacy Agent 执行状态，新增独立市场质量生命周期。
+- 统一准入函数覆盖市场、候选、邀请与确认；默认 shadow，避免现有 Agent 突然下架。
+- 评分为确定性可重算、事件只追加、反馈版本化；任务结算成功后才记成功事件。
+- Trial 已升级为 v3 多场景协议，PinMe/DS Bridge 需先部署新版 Endpoint 才能跑生产 Trial。
+- 管理员风险操作只追加带原因事件；响应泄密会形成严重安全事件并暂停 Agent。
 
-## 剩余外部事项
+## 下一步
 
-- 本轮未部署；上线仍须使用项目规定的 `pinme save`，并先完成环境配置核对。
-- 6% 质押、罚没和无人验收自动链上释放需要托管合约 v2、独立威胁建模与审计，不在本阶段冒进实现。
-- 前端生产构建仍有既有的大 chunk 警告，后续可单独做包体优化。
+- 获得单独授权后使用 `pinme save` 部署迁移、Worker 与前端，并同步部署 PinMe/DS Trial v3 Endpoint。
+- 保持 shadow，分别为 PinMe 和 DS 跑正式 Trial，观察影子评分与任务结果。
+- 运营确认后再单独审批切换 enforce；Vectorize/LTR 留到真实数据量充足后。

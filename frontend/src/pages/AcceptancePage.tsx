@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, ExternalLink, FileCheck2, FileQuestion, Link2, LoaderCircle, LockKeyhole, Scale, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, ExternalLink, FileCheck2, FileQuestion, Link2, LoaderCircle, LockKeyhole, MessageSquareText, Scale, ShieldCheck } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
@@ -9,6 +9,43 @@ import { useAppStore } from '../store/useAppStore';
 import { formatPaymentAmount, isWeb3Payment, paymentToken } from '../utils/payments';
 import { deliveryReadiness } from '../utils/delivery';
 import { missionStatusMeta } from '../utils/missionState';
+import { api } from '../services/api';
+
+function StageFeedbackCard({ missionId, stageId, stageName, agentName }: { missionId: string; stageId: string; stageName: string; agentName: string }) {
+  const [deliveryQuality, setDeliveryQuality] = useState(5);
+  const [requirementsFit, setRequirementsFit] = useState(5);
+  const [communication, setCommunication] = useState(5);
+  const [onTime, setOnTime] = useState(true);
+  const [reuse, setReuse] = useState(true);
+  const [comment, setComment] = useState('');
+  const [version, setVersion] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.getAgentFeedback(missionId, stageId).then((feedback) => {
+      if (cancelled || !feedback) return;
+      setDeliveryQuality(feedback.deliveryQuality); setRequirementsFit(feedback.requirementsFit); setCommunication(feedback.communication);
+      setOnTime(feedback.onTime); setReuse(feedback.reuse); setComment(feedback.comment); setVersion(feedback.version);
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [missionId, stageId]);
+
+  const submit = async () => {
+    setBusy(true); setError('');
+    try {
+      const result = await api.saveAgentFeedback(missionId, stageId, { deliveryQuality, requirementsFit, communication, onTime, reuse, comment });
+      setVersion(result.feedback.version);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : '反馈保存失败。');
+    } finally { setBusy(false); }
+  };
+
+  return <article className="rounded-2xl border border-line bg-canvas/35 p-5"><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{stageName}</p><p className="mt-1 text-xs text-muted">{agentName} · 仅已结算反馈进入信誉分</p></div>{version ? <StatusBadge tone="success">已保存 V{version}</StatusBadge> : <StatusBadge tone="neutral">待评价</StatusBadge>}</div><div className="mt-4 grid gap-3 sm:grid-cols-3">{[
+    ['交付质量', deliveryQuality, setDeliveryQuality], ['需求符合度', requirementsFit, setRequirementsFit], ['沟通质量', communication, setCommunication],
+  ].map(([label, value, setter]) => <label key={String(label)}><span className="field-label">{String(label)}</span><select className="field" value={Number(value)} onChange={(event) => (setter as (next: number) => void)(Number(event.target.value))}>{[5, 4, 3, 2, 1].map((score) => <option value={score} key={score}>{score} / 5</option>)}</select></label>)}</div><div className="mt-4 flex flex-wrap gap-5 text-xs"><label className="inline-flex items-center gap-2"><input type="checkbox" checked={onTime} onChange={(event) => setOnTime(event.target.checked)} />准时交付</label><label className="inline-flex items-center gap-2"><input type="checkbox" checked={reuse} onChange={(event) => setReuse(event.target.checked)} />愿意再次使用</label></div><label className="mt-4 block"><span className="field-label">公开说明（可选）</span><textarea className="field min-h-24" value={comment} maxLength={1000} onChange={(event) => setComment(event.target.value)} placeholder="说明交付亮点、偏差或改进建议；不要填写密钥和隐私信息。" /></label><div className="mt-4 flex items-center justify-between gap-3">{error ? <p className="text-xs text-danger">{error}</p> : <p className="text-[10px] text-muted">修改会生成新版本，旧版本保留在审计历史中。</p>}<button type="button" className="btn-secondary shrink-0" disabled={busy} onClick={() => void submit()}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <MessageSquareText size={14} />}{version ? '更新反馈' : '提交反馈'}</button></div></article>;
+}
 
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -164,6 +201,8 @@ export function AcceptancePage() {
         <div className="flex items-center justify-between"><div><h2 className="font-semibold">Evidence Chain</h2><p className="mt-1 text-xs text-muted">每个阶段的状态、输出和可追溯执行事件。</p></div><StatusBadge tone={evidenceCount ? 'success' : 'neutral'}>{evidenceCount} 个事件</StatusBadge></div>
         <div className="mt-6 grid gap-4 md:grid-cols-3">{stages.map((stage, index) => <article className="rounded-xl border border-line bg-canvas/40 p-4" key={stage.id}><div className="flex items-center justify-between"><span className={`flex size-8 items-center justify-center rounded-full ${stage.status === 'done' ? 'bg-lime/20 text-lime-700' : stage.status === 'running' ? 'bg-cyan/15 text-cyan' : stage.status === 'failed' ? 'bg-danger/10 text-danger' : 'bg-canvas text-muted'}`}><ShieldCheck size={16} /></span><StatusBadge tone={stage.status === 'done' ? 'success' : stage.status === 'running' ? 'info' : stage.status === 'failed' ? 'danger' : 'neutral'}>{stage.status === 'done' ? '完成' : stage.status === 'running' ? '执行中' : stage.status === 'failed' ? '失败' : '等待'}</StatusBadge></div><p className="mt-3 font-mono text-[9px] text-muted">STAGE {String(index + 1).padStart(2, '0')}</p><h3 className="mt-2 text-sm font-semibold">{stage.name}</h3><p className="mt-2 text-xs leading-5 text-muted">{stage.status === 'done' ? stage.output ? 'Agent 输出与阶段状态已写入证据链。' : '阶段已完成，等待或已提交最终交付。' : stage.status === 'running' ? 'Agent 正在执行，等待签名回调。' : stage.status === 'failed' ? '节点未产生有效交付，等待任务方处理后重试。' : '等待上游依赖满足后派发。'}</p><span className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-cyan"><Link2 size={13} />{detail?.events.filter((event) => event.stageId === stage.id).length ?? 0} 个阶段事件</span></article>)}</div>
       </section>
+
+      {mission.status === 'completed' && role === 'requester' && !detail?.disputes.some((item) => item.status === 'resolved') ? <section className="panel p-5 md:p-6"><div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-xl bg-cyan/10 text-cyan"><MessageSquareText size={18} /></span><div><h2 className="font-semibold">Agent 结构化反馈</h2><p className="mt-1 text-xs text-muted">每个已结算任务节点可评价一次；更新会版本化，退款或有效争议不会进入信誉分。</p></div></div><div className="mt-5 grid gap-4 xl:grid-cols-2">{stages.filter((stage) => stage.nodeType === 'task' && stage.status === 'done' && stage.agentId).map((stage) => <StageFeedbackCard missionId={mission.id} stageId={stage.id} stageName={stage.name} agentName={agents.find((agent) => agent.id === stage.agentId)?.name ?? stage.agentId!} key={stage.id} />)}</div></section> : null}
 
       <Modal open={releaseOpen} onClose={() => setReleaseOpen(false)} title="确认交付并释放资金" description={usesWeb3 ? `钱包将调用 Sepolia 托管合约完成 ${token} 分账；Worker 验证释放事件后更新任务状态。` : '确认后会从 Web2 托管余额结算给开发者，并生成平台费账目。'}>
         <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {deliverables.length} 个 URI 交付物 · {completedStageOutputs.length} 个签名阶段输出</div></div>

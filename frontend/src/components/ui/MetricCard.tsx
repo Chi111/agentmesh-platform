@@ -16,10 +16,10 @@ export function MetricCard({
   const iconStyle = signal === 'cyan' ? 'bg-cyan/10 text-cyan' : signal === 'lime' ? 'bg-lime/20 text-ink' : 'bg-canvas text-muted';
 
   return (
-    <article className="panel p-5">
+    <article className="panel metric-card p-5">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <p className="text-sm text-muted">{label}</p>
+          <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted">{label}</p>
           <p className="metric-value">{value}</p>
           <p className="mt-2 text-xs text-muted">{detail}</p>
         </div>

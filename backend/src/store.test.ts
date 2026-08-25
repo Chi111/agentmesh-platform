@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { Dispute } from './contracts';
+import type { AgentFeedback, AgentMetricEvent, Dispute, EcosystemProposal, GovernancePowerSnapshot, RewardActivity, RewardClaim, RewardEpoch, YdStakingPosition } from './contracts';
 import { D1PlatformStore, type D1Database, type D1Statement } from './store';
 
 class SqliteStatement implements D1Statement {
@@ -108,6 +108,80 @@ describe('D1PlatformStore concurrency invariants', () => {
     store = new D1PlatformStore(database);
   });
 
+  it('persists isolated YD reward, claim, staking and Power-governance ledgers atomically', async () => {
+    const wallet = '0x7100000000000000000000000000000000008f2c';
+    database.db.prepare('UPDATE profiles SET wallet_address = ? WHERE id = ?').run(wallet, 'demo-requester');
+    const epoch: RewardEpoch = {
+      id: 'YDEPOCH-D1-1', epochNumber: 1, status: 'draft',
+      startsAt: '2026-08-01T00:00:00.000Z', endsAt: '2026-08-15T00:00:00.000Z', claimEndsAt: '2026-09-01T00:00:00.000Z',
+      totalRewardUnits: '100000000000000000000', accountScoreCap: 2_000_000_000, formulaVersion: 'agentmesh-yd-v1',
+      rules: { settlementRequired: true }, chainId: 11155111,
+      distributorAddress: '0x1000000000000000000000000000000000000002',
+      merkleRoot: null, manifestHash: null, publishTxHash: null, computedAt: null, publishedAt: null,
+      createdBy: 'demo-arbitrator', createdAt: '2026-08-16T00:00:00.000Z', updatedAt: '2026-08-16T00:00:00.000Z',
+    };
+    await store.createRewardEpoch(epoch);
+    const activity: RewardActivity = {
+      id: 'YDACTIVITY-D1-1', sourceKey: 'settlement:TASK-2026-0809:requester', userId: 'demo-requester',
+      missionId: 'TASK-2026-0809', disputeId: null, role: 'requester', asset: 'CREDIT', settledAmount: 350,
+      formulaVersion: 'agentmesh-yd-v1',
+      qualityBps: 10_000, penaltyBps: 0, scoreMicros: 4_677_071, eligible: true,
+      detail: { accepted: true }, occurredAt: '2026-08-10T00:00:00.000Z', createdAt: '2026-08-10T00:00:00.000Z',
+    };
+    expect(await store.recordRewardActivity(activity)).toBe(true);
+    expect(await store.recordRewardActivity(activity)).toBe(false);
+
+    const computed = await store.computeRewardEpoch(epoch.id, '2026-08-16T00:01:00.000Z', 'demo-arbitrator');
+    expect(computed.state).toBe('computed');
+    if (computed.state !== 'computed') throw new Error('expected computed epoch');
+    expect(computed.allocations).toHaveLength(1);
+    expect(computed.allocations[0].amountUnits).toBe(epoch.totalRewardUnits);
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM yd_admin_actions WHERE action = 'reward_epoch_computed'").get()).toEqual({ count: 1 });
+
+    const publishTx = `0x${'a'.repeat(64)}`;
+    expect((await store.markRewardEpochPublished(epoch.id, publishTx, '2026-08-16T00:02:00.000Z', 'demo-arbitrator'))?.status).toBe('published');
+    const claim: RewardClaim = {
+      id: 'YDCLAIM-D1-1', epochId: epoch.id, userId: 'demo-requester', walletAddress: wallet,
+      amountUnits: epoch.totalRewardUnits, txHash: `0x${'b'.repeat(64)}`, blockNumber: '100', logIndex: 1,
+      claimedAt: '2026-08-16T00:03:00.000Z',
+    };
+    expect((await store.recordRewardClaim(claim))?.applied).toBe(true);
+    expect((await store.recordRewardClaim({ ...claim, id: 'YDCLAIM-D1-REPLAY' }))?.applied).toBe(false);
+    expect((await store.listRewardAllocations(epoch.id))[0].status).toBe('claimed');
+    expect((await store.markRewardEpochExpired(epoch.id, `0x${'d'.repeat(64)}`, '2026-09-02T00:00:00.000Z', 'demo-arbitrator'))?.status).toBe('expired');
+    expect((await store.listRewardAllocations(epoch.id))[0].status).toBe('claimed');
+
+    const position: YdStakingPosition = {
+      userId: 'demo-requester', walletAddress: wallet, amountUnits: '10000000000000000000',
+      unlockTime: '2027-02-12T00:00:00.000Z', durationSeconds: 15_552_000, reputationBps: 10_000,
+      rawPower: '3162277660', delegatedTo: wallet, votingPower: '3162277660', verified: true,
+      lastTxHash: `0x${'c'.repeat(64)}`, lastBlockNumber: '110', lastLogIndex: 2, updatedAt: '2026-08-16T00:04:00.000Z',
+    };
+    expect((await store.syncYdStakingPosition(position)).amountUnits).toBe(position.amountUnits);
+    const stale = await store.syncYdStakingPosition({ ...position, amountUnits: '1', lastBlockNumber: '109', updatedAt: '2026-08-16T00:05:00.000Z' });
+    expect(stale.amountUnits).toBe(position.amountUnits);
+
+    const proposal: EcosystemProposal = {
+      id: 'YDGOV-D1-1', proposalNumber: 1, proposerId: 'demo-arbitrator', proposalType: 'development',
+      title: 'Improve contribution verification', description: 'Fund public contribution verification tooling without changing escrow.',
+      payload: {}, status: 'active', snapshotBlock: '100', startsAt: '2026-08-16T00:00:00.000Z', endsAt: '2026-08-17T00:00:00.000Z',
+      quorumBps: 2_000, approvalBps: 5_001, eligiblePower: '100', forPower: '0', againstPower: '0', abstainPower: '0',
+      finalizedAt: null, finalizedBy: null, createdAt: '2026-08-16T00:00:00.000Z',
+    };
+    const snapshot: GovernancePowerSnapshot = {
+      proposalId: proposal.id, userId: 'demo-requester', walletAddress: wallet, power: '100', delegateSources: [], createdAt: proposal.createdAt,
+    };
+    await store.createEcosystemProposal(proposal, [snapshot]);
+    expect((await store.castEcosystemVote(proposal.id, 'demo-requester', 'for', 'Public verification improves ecosystem accountability.', '2026-08-16T01:00:00.000Z')).state).toBe('applied');
+    expect((await store.castEcosystemVote(proposal.id, 'demo-requester', 'against', 'Duplicate vote must fail.', '2026-08-16T01:01:00.000Z')).state).toBe('already_voted');
+    const finalized = await store.finalizeEcosystemProposal(proposal.id, 'demo-arbitrator', '2026-08-16T01:02:00.000Z');
+    expect(finalized.state).toBe('finalized');
+    expect(finalized.governance.proposal.status).toBe('succeeded');
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM yd_admin_actions WHERE action LIKE 'governance_%'").get()).toEqual({ count: 2 });
+
+    expect(database.db.prepare('SELECT status FROM escrows WHERE mission_id = ?').get('TASK-2026-0809')).toEqual({ status: 'held' });
+  });
+
   it('seeds the runnable official Agent market after removing historical demo data', async () => {
     const agents = await store.listAgents();
     const official = agents.filter((agent) => agent.ownerId === 'agentmesh-official');
@@ -119,6 +193,57 @@ describe('D1PlatformStore concurrency invariants', () => {
     ]);
     expect(official.every((agent) => agent.official && agent.status === 'active')).toBe(true);
     expect(official.every((agent) => agent.endpoint.startsWith('agentmesh://builtin/'))).toBe(true);
+  });
+
+  it('keeps Agent quality events idempotent, deterministically recomputable and feedback versioned', async () => {
+    const occurredAt = '2026-08-23T00:00:00.000Z';
+    const metric = (id: string, type: AgentMetricEvent['type'], value: number): AgentMetricEvent => ({
+      id, idempotencyKey: id, agentId: 'visionboard', type, value, weight: 1, severity: 'info',
+      sourceType: 'trial', sourceId: id, detail: {}, occurredAt, createdAt: occurredAt,
+    });
+    expect((await store.recordAgentMetricEvent(metric('quality-trial', 'trial_passed', 96), occurredAt)).applied).toBe(true);
+    expect((await store.recordAgentMetricEvent(metric('quality-trial', 'trial_passed', 96), occurredAt)).applied).toBe(false);
+    await store.recordAgentMetricEvent(metric('quality-health', 'endpoint_healthy', 98), occurredAt);
+    database.db.prepare('UPDATE agent_stats SET reputation = 0, endpoint_healthy = 0 WHERE agent_id = ?').run('visionboard');
+    const repaired = await store.recordAgentMetricEvent(metric('quality-health', 'endpoint_healthy', 98), occurredAt);
+    expect(repaired).toMatchObject({ applied: false, stats: { marketplaceStatus: 'listed', endpointHealthy: true } });
+    const stats = await store.recomputeAgentQuality('visionboard', occurredAt);
+    expect(stats).toMatchObject({ marketplaceStatus: 'listed', trialPassed: true, endpointHealthy: true, confidence: 'low' });
+    expect(await store.listAgentMetricEvents('visionboard')).toHaveLength(2);
+    expect(await store.listAgentReputationSnapshots('visionboard')).toMatchObject([{ eventCount: 2, reputation: stats?.reputation }]);
+
+    const feedback: AgentFeedback = {
+      id: 'FEEDBACK-D1-V1', agentId: 'analyst', missionId: 'TASK-2026-0809', stageId: 'stage-analysis', requesterId: 'demo-requester',
+      version: 1, deliveryQuality: 5, requirementsFit: 4, communication: 5, onTime: true, reuse: true,
+      comment: '交付结构清晰，并且所有结论都能回溯到任务证据。', effective: true, createdAt: '2026-08-23T01:00:00.000Z',
+    };
+    expect((await store.saveAgentFeedback(feedback, feedback.createdAt)).feedback.version).toBe(1);
+    const updated = await store.saveAgentFeedback({ ...feedback, id: 'FEEDBACK-D1-V2', deliveryQuality: 4, createdAt: '2026-08-23T02:00:00.000Z' }, '2026-08-23T02:00:00.000Z');
+    expect(updated.feedback.version).toBe(2);
+    expect(await store.listAgentFeedback('analyst')).toMatchObject([{ id: 'FEEDBACK-D1-V2', effective: true }]);
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM agent_feedback WHERE agent_id = ?').get('analyst')).toEqual({ count: 2 });
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM agent_feedback WHERE agent_id = ? AND effective = 1').get('analyst')).toEqual({ count: 1 });
+    expect(database.db.prepare('SELECT weight FROM agent_metric_events WHERE idempotency_key = ?').get('feedback:FEEDBACK-D1-V2')).toEqual({ weight: 1 });
+
+    database.db.exec(`
+      INSERT INTO missions
+        (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json)
+      VALUES
+        ('TASK-D1-FEEDBACK-2', 'demo-requester', 'Second feedback mission', 'Verifies repeated requester feedback weighting.', '商业分析', 120, '2026-09-02', 'completed', 100, 'Completed', '["analyst"]');
+      INSERT INTO workflow_stages
+        (id, mission_id, position, name, purpose, category, budget_usdc, status, agent_id, output_json)
+      VALUES
+        ('stage-feedback-2', 'TASK-D1-FEEDBACK-2', 1, 'Second analysis', 'Generate another analysis.', '商业分析', 120, 'done', 'analyst', '{"verified":true}');
+    `);
+    const repeated = await store.saveAgentFeedback({
+      ...feedback,
+      id: 'FEEDBACK-D1-REPEATED',
+      missionId: 'TASK-D1-FEEDBACK-2',
+      stageId: 'stage-feedback-2',
+      createdAt: '2026-08-23T03:00:00.000Z',
+    }, '2026-08-23T03:00:00.000Z');
+    expect(repeated.feedback.version).toBe(1);
+    expect(database.db.prepare('SELECT weight FROM agent_metric_events WHERE idempotency_key = ?').get('feedback:FEEDBACK-D1-REPEATED')).toEqual({ weight: 0.7071 });
   });
 
   it('persists a DAG draft with optimistic locking and enforces graph locks after funding', async () => {
@@ -250,6 +375,8 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect(second?.applied).toBe(false);
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM execution_events WHERE mission_id = ? AND event_type = 'mission.accepted'").get('TASK-2026-0809')).toEqual({ count: 1 });
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM wallet_transactions WHERE mission_id = ? AND transaction_type = 'agent_payout'").get('TASK-2026-0809')).toEqual({ count: 1 });
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM reward_activities WHERE mission_id = ? AND role = 'requester'").get('TASK-2026-0809')).toEqual({ count: 1 });
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM reward_activities WHERE mission_id = ? AND role = 'agent_owner'").get('TASK-2026-0809')).toEqual({ count: 1 });
     expect((await store.getWalletAccount('demo-developer')).balance).toBe(348.6);
     await expect(store.createDispute({
       id: 'DSP-AFTER-RELEASE', missionId: 'TASK-2026-0809', openedBy: 'demo-requester',
@@ -480,5 +607,6 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM wallet_transactions WHERE mission_id = ? AND transaction_type = 'refund'").get(dispute.missionId)).toEqual({ count: 1 });
     expect((await store.getWalletAccount('demo-requester')).balance).toBe(1_200);
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM dispute_actions WHERE dispute_id = ?').get(dispute.id)).toEqual({ count: 2 });
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM reward_activities WHERE dispute_id = ? AND role = 'arbitrator'").get(dispute.id)).toEqual({ count: 2 });
   });
 });

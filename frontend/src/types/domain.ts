@@ -31,6 +31,8 @@ export type SyncStatus = 'idle' | 'loading' | 'ready' | 'error';
 export type MissionStatus = 'draft' | 'matching' | 'running' | 'review' | 'completed' | 'cancelled';
 
 export type AgentStatus = 'trial' | 'active' | 'paused';
+export type AgentMarketplaceStatus = 'registered' | 'verifying' | 'trial' | 'listed' | 'degraded' | 'suspended' | 'retired';
+export type AgentQualityConfidence = 'low' | 'medium' | 'high';
 
 export type ExpertiseLevel = 'standard' | 'expert' | 'principal';
 export type PaymentMethod = 'web2_balance' | 'web3_musdc' | 'web3_seth';
@@ -58,6 +60,85 @@ export interface Agent {
   inputSchema?: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   wallet?: string;
+  quality?: AgentQualityProfile;
+}
+
+export interface AgentQualityBreakdown {
+  reliability: number;
+  quality: number;
+  delivery: number;
+  response: number;
+  history: number;
+  riskPenalty: number;
+}
+
+export interface AgentQualityProfile {
+  agentId: string;
+  marketplaceStatus: AgentMarketplaceStatus;
+  reputation: number;
+  breakdown: AgentQualityBreakdown;
+  confidence: AgentQualityConfidence;
+  settledJobs: number;
+  successfulJobs: number;
+  failedJobs: number;
+  refundedJobs: number;
+  trialPassed: boolean;
+  endpointHealthy: boolean;
+  payoutValid: boolean;
+  unresolvedSevereRisks: number;
+  premium: boolean;
+  newAgent: boolean;
+  eligibilityReasons: string[];
+  formulaVersion: string;
+  lastTrialAt: string | null;
+  lastHealthCheckAt: string | null;
+  updatedAt: string;
+  gateMode: 'shadow' | 'enforce';
+  eligible: boolean;
+  wouldBeEligible: boolean;
+}
+
+export type AgentQualityStats = Omit<AgentQualityProfile, 'gateMode' | 'eligible' | 'wouldBeEligible'>;
+
+export interface AgentFeedback {
+  id: string;
+  agentId: string;
+  missionId: string;
+  stageId: string;
+  version: number;
+  deliveryQuality: number;
+  requirementsFit: number;
+  communication: number;
+  onTime: boolean;
+  reuse: boolean;
+  comment: string;
+  effective: boolean;
+  createdAt: string;
+}
+
+export interface AgentReputationSnapshot {
+  id: string;
+  agentId: string;
+  evaluatedAt: string;
+  formulaVersion: string;
+  eventCount: number;
+  reputation: number;
+  breakdown: AgentQualityBreakdown;
+  confidence: AgentQualityConfidence;
+  marketplaceStatus: AgentMarketplaceStatus;
+  eligibilityReasons: string[];
+  createdAt: string;
+}
+
+export interface AgentQualityPublicDetail {
+  agent: Agent;
+  feedback: AgentFeedback[];
+  snapshots: AgentReputationSnapshot[];
+}
+
+export interface AdminAgentQualityRow {
+  agent: Agent;
+  reasons: string[];
 }
 
 export interface Mission {
@@ -357,6 +438,138 @@ export interface WalletAccount {
   testTopupAmount: number;
   nextTestTopupAt: string | null;
   transactions: WalletTransaction[];
+}
+
+export type RewardEpochStatus = 'draft' | 'computed' | 'published' | 'expired';
+export type RewardActivityRole = 'requester' | 'agent_owner' | 'arbitrator';
+
+export interface YdChainConfig {
+  configured: boolean;
+  chainId: number;
+  tokenAddress: string | null;
+  distributorAddress: string | null;
+  stakingAddress: string | null;
+  decimals: number;
+  confirmations: number;
+  testnet: boolean;
+  rewardLabel: string;
+  yieldLabel: string;
+}
+
+export interface RewardEpoch {
+  id: string;
+  epochNumber: number;
+  status: RewardEpochStatus;
+  startsAt: string;
+  endsAt: string;
+  claimEndsAt: string;
+  totalRewardUnits: string;
+  accountScoreCap: number;
+  formulaVersion: string;
+  rules: Record<string, unknown>;
+  chainId: number;
+  distributorAddress: string;
+  merkleRoot: string | null;
+  manifestHash: string | null;
+  publishTxHash: string | null;
+  computedAt: string | null;
+  publishedAt: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RewardActivity {
+  id: string;
+  sourceKey: string;
+  userId: string;
+  missionId: string | null;
+  disputeId: string | null;
+  role: RewardActivityRole;
+  formulaVersion: string;
+  asset: string;
+  settledAmount: number;
+  qualityBps: number;
+  penaltyBps: number;
+  scoreMicros: number;
+  eligible: boolean;
+  detail: Record<string, unknown>;
+  occurredAt: string;
+  createdAt: string;
+}
+
+export interface RewardAllocation {
+  id: string;
+  epochId: string;
+  userId: string;
+  walletAddress: string;
+  effectiveScore: number;
+  amountUnits: string;
+  leafHash: string;
+  proof: string[];
+  status: 'unclaimed' | 'claimed' | 'expired';
+  claimTxHash: string | null;
+  claimedAt: string | null;
+  createdAt: string;
+}
+
+export interface YdStakingPosition {
+  userId: string;
+  walletAddress: string;
+  amountUnits: string;
+  unlockTime: string | null;
+  durationSeconds: number;
+  reputationBps: number;
+  rawPower: string;
+  delegatedTo: string | null;
+  votingPower: string;
+  verified: boolean;
+  lastTxHash: string | null;
+  lastBlockNumber: string | null;
+  lastLogIndex: number | null;
+  updatedAt: string;
+}
+
+export type EcosystemProposalType = 'reward_release' | 'reward_weights' | 'ecosystem_grant' | 'development' | 'platform_parameter';
+export type EcosystemVoteChoice = 'for' | 'against' | 'abstain';
+
+export interface EcosystemProposal {
+  id: string;
+  proposalNumber: number;
+  proposerId: string;
+  proposalType: EcosystemProposalType;
+  title: string;
+  description: string;
+  payload: Record<string, unknown>;
+  status: 'active' | 'succeeded' | 'defeated' | 'quorum_failed' | 'cancelled';
+  snapshotBlock: string;
+  startsAt: string;
+  endsAt: string;
+  quorumBps: number;
+  approvalBps: number;
+  eligiblePower: string;
+  forPower: string;
+  againstPower: string;
+  abstainPower: string;
+  finalizedAt: string | null;
+  finalizedBy: string | null;
+  createdAt: string;
+}
+
+export interface EcosystemGovernanceDetail {
+  proposal: EcosystemProposal;
+  electorate: Array<{ proposalId: string; userId: string; walletAddress: string; power: string; delegateSources: string[]; createdAt: string }>;
+  votes: Array<{ id: string; proposalId: string; voterId: string; walletAddress: string; choice: EcosystemVoteChoice; power: string; reason: string; createdAt: string }>;
+  currentUser: { eligible: boolean; canVote: boolean; hasVoted: boolean; power: string; choice: EcosystemVoteChoice | null };
+}
+
+export interface YdFinanceOverview {
+  config: YdChainConfig;
+  epochs: RewardEpoch[];
+  allocations: RewardAllocation[];
+  activities: RewardActivity[];
+  staking: YdStakingPosition | null;
+  governance: EcosystemGovernanceDetail[];
 }
 
 export interface NewAgentInput {

@@ -246,6 +246,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const syncedWorkflowRef = useRef(`${mission.id}:${mission.workflowVersion}`);
   const fittedWorkflowRef = useRef<string | null>(null);
   const fitAfterNodeAddRef = useRef(false);
+  const layoutNextCompilationRef = useRef(false);
   const viewportInteractionRef = useRef(false);
   const hasStoredViewport = Math.abs(missionViewport.x) > 0.1
     || Math.abs(missionViewport.y) > 0.1
@@ -273,14 +274,19 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
     // Offer/candidate refreshes can replace the detail object without changing
     // the graph version. Do not let those background updates erase local edits.
     if (dirtyRef.current && !serverVersionChanged) return;
-    setNodes(stages.map((stage, index) => stageNode(stage, agents, index)));
-    setEdges(resolvedEdges.map(flowEdge));
+    const nextEdges = resolvedEdges.map(flowEdge);
+    const nextNodes = stages.map((stage, index) => stageNode(stage, agents, index));
+    setNodes(serverVersionChanged && layoutNextCompilationRef.current
+      ? autoLayout(nextNodes, nextEdges)
+      : nextNodes);
+    setEdges(nextEdges);
     setViewport(missionViewport);
     setDirty(false);
     dirtyRef.current = false;
     setHistory([]);
     setFuture([]);
     syncedWorkflowRef.current = workflowKey;
+    layoutNextCompilationRef.current = false;
   }, [agents, mission.id, mission.workflowVersion, missionViewport, resolvedEdges, setEdges, setNodes, stages]);
 
   useEffect(() => {
@@ -466,7 +472,9 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
 
   const compileDraft = async () => {
     if (dirty && !window.confirm('AI 智能编排会重新分析复杂度并替换当前尚未保存的画布，是否继续？')) return;
+    layoutNextCompilationRef.current = true;
     try { await onCompile(); } catch (reason) {
+      layoutNextCompilationRef.current = false;
       setMessage({ text: reason instanceof Error ? reason.message : 'AI 工作流生成失败。', tone: 'error' });
     }
   };

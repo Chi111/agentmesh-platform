@@ -21,6 +21,7 @@ import {
   type SettlementTransaction,
 } from '../services/settlement';
 import type { UserProfile } from '../types/domain';
+import { submitYdAction, ydWalletConfigured } from '../services/ydFinance';
 import { privyAppId, privyClientId, privyLoginMethods } from './config';
 import { type AuthContextValue, type AuthStatus, readableAuthError } from './context';
 
@@ -154,6 +155,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     linkedWalletAddress: identity?.walletAddress ?? profile?.walletAddress ?? null,
     walletAddress: connectedWallet?.address ?? null,
     onchainSettlement: chainEnabled,
+    ydWalletEnabled: ydWalletConfigured(),
     loginWithEmail: openLogin,
     loginWithGoogle: openLogin,
     loginWithPrivy: openLogin,
@@ -178,6 +180,11 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     freezeEscrow: async (missionId) => submitEscrowFreeze(sendConnectedTransaction, missionId),
     unfreezeEscrow: async (missionId) => submitEscrowUnfreeze(sendConnectedTransaction, missionId),
     refundEscrow: async (missionId) => submitEscrowRefund(sendConnectedTransaction, missionId),
+    submitYdAction: async (action) => {
+      const ydWalletAddress = connectedWallet?.address ?? identity?.walletAddress;
+      if (!ydWalletAddress) throw new Error('请先连接已验证的钱包后再提交 YD 交易。');
+      return submitYdAction(sendConnectedTransaction, ydWalletAddress, action);
+    },
     signOut: async () => {
       await logout();
       setApiTokenProvider(null);

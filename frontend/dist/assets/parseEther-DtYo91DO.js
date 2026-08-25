@@ -1,1 +1,0 @@
-import{lt as e}from"./vendor~AddFundsSelectionScreen-BLwY_zxt~AffirmativeConsentScreen-DuLoZxMh~AwaitingEvmToSolB~bu2h2gqc-Di1MaA0G.js";function t(t,n=`wei`){return e(t,n)}export{t};

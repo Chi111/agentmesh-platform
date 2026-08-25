@@ -2,7 +2,14 @@ import type {
   Agent,
   AgentCallbackUpdate,
   AgentDispatch,
+  AgentFeedback,
+  AgentHealthCheck,
+  AgentMetricEvent,
+  AgentMetricRecordResult,
+  AgentQualityStats,
+  AgentReputationSnapshot,
   AgentStatus,
+  AgentTrial,
   AdminAction,
   AdminUser,
   ArbitrationElector,
@@ -19,8 +26,15 @@ import type {
   DisputeVoteChoice,
   DisputeVoteMutationResult,
   DispatchOutboxItem,
+  EcosystemFinalizeResult,
+  EcosystemGovernanceDetail,
+  EcosystemProposal,
+  EcosystemVote,
+  EcosystemVoteChoice,
+  EcosystemVoteResult,
   Escrow,
   ExecutionEvent,
+  GovernancePowerSnapshot,
   IdempotencyClaim,
   IdempotentResult,
   LedgerCursor,
@@ -28,18 +42,28 @@ import type {
   Mission,
   Notification,
   PlatformStore,
+  RewardActivity,
+  RewardAllocation,
+  RewardClaim,
+  RewardEpoch,
+  RewardEpochComputeResult,
   StageOffer,
   UserContext,
   UserPreferences,
   WalletAccount,
   WalletTransaction,
+  YdFinanceOverview,
+  YdStakingPosition,
   WorkflowStage,
   WorkflowDraftSaveResult,
   WorkflowEdge,
   WorkflowViewport,
 } from './contracts';
+import { AGENT_QUALITY_FORMULA_VERSION, calculateAgentQuality, feedbackWeightForPriorCount } from './agentQuality';
 import { arbitrationQuorum, arbitrationVotingEndsAt, evaluateArbitrationProposal } from './arbitration';
 import { paymentConfig, TEST_TOPUP_AMOUNT } from './payments';
+import { allocateRewardEpoch, evaluateEcosystemProposal, REWARD_FORMULA_VERSION, rewardScoreMicros } from './ydFinance';
+import type { Address, Hex } from 'viem';
 
 export interface D1Statement {
   bind(...values: unknown[]): D1Statement;
@@ -157,6 +181,137 @@ function mapDisputeVote(row: Row): DisputeVote {
   };
 }
 
+function mapRewardEpoch(row: Row): RewardEpoch {
+  return {
+    id: text(row.id),
+    epochNumber: number(row.epoch_number),
+    status: text(row.status) as RewardEpoch['status'],
+    startsAt: text(row.starts_at),
+    endsAt: text(row.ends_at),
+    claimEndsAt: text(row.claim_ends_at),
+    totalRewardUnits: text(row.total_reward_units),
+    accountScoreCap: number(row.account_score_cap),
+    formulaVersion: text(row.formula_version),
+    rules: parseJson<Record<string, unknown>>(row.rules_json, {}),
+    chainId: number(row.chain_id),
+    distributorAddress: text(row.distributor_address),
+    merkleRoot: text(row.merkle_root) || null,
+    manifestHash: text(row.manifest_hash) || null,
+    publishTxHash: text(row.publish_tx_hash) || null,
+    computedAt: text(row.computed_at) || null,
+    publishedAt: text(row.published_at) || null,
+    createdBy: text(row.created_by),
+    createdAt: text(row.created_at),
+    updatedAt: text(row.updated_at),
+  };
+}
+
+function mapRewardActivity(row: Row): RewardActivity {
+  return {
+    id: text(row.id),
+    sourceKey: text(row.source_key),
+    userId: text(row.user_id),
+    missionId: text(row.mission_id) || null,
+    disputeId: text(row.dispute_id) || null,
+    role: text(row.role) as RewardActivity['role'],
+    formulaVersion: text(row.formula_version),
+    asset: text(row.asset),
+    settledAmount: number(row.settled_amount),
+    qualityBps: number(row.quality_bps),
+    penaltyBps: number(row.penalty_bps),
+    scoreMicros: number(row.score_micros),
+    eligible: boolean(row.eligible),
+    detail: parseJson<Record<string, unknown>>(row.detail_json, {}),
+    occurredAt: text(row.occurred_at),
+    createdAt: text(row.created_at),
+  };
+}
+
+function mapRewardAllocation(row: Row): RewardAllocation {
+  return {
+    id: text(row.id),
+    epochId: text(row.epoch_id),
+    userId: text(row.user_id),
+    walletAddress: text(row.wallet_address),
+    effectiveScore: number(row.effective_score),
+    amountUnits: text(row.amount_units),
+    leafHash: text(row.leaf_hash),
+    proof: parseJson<string[]>(row.proof_json, []),
+    status: text(row.status) as RewardAllocation['status'],
+    claimTxHash: text(row.claim_tx_hash) || null,
+    claimedAt: text(row.claimed_at) || null,
+    createdAt: text(row.created_at),
+  };
+}
+
+function mapStakingPosition(row: Row): YdStakingPosition {
+  return {
+    userId: text(row.user_id),
+    walletAddress: text(row.wallet_address),
+    amountUnits: text(row.amount_units) || '0',
+    unlockTime: text(row.unlock_time) || null,
+    durationSeconds: number(row.duration_seconds),
+    reputationBps: number(row.reputation_bps) || 10_000,
+    rawPower: text(row.raw_power) || '0',
+    delegatedTo: text(row.delegated_to) || null,
+    votingPower: text(row.voting_power) || '0',
+    verified: boolean(row.verified),
+    lastTxHash: text(row.last_tx_hash) || null,
+    lastBlockNumber: text(row.last_block_number) || null,
+    lastLogIndex: row.last_log_index === null || row.last_log_index === undefined ? null : number(row.last_log_index),
+    updatedAt: text(row.updated_at),
+  };
+}
+
+function mapEcosystemProposal(row: Row): EcosystemProposal {
+  return {
+    id: text(row.id),
+    proposalNumber: number(row.proposal_number),
+    proposerId: text(row.proposer_id),
+    proposalType: text(row.proposal_type) as EcosystemProposal['proposalType'],
+    title: text(row.title),
+    description: text(row.description),
+    payload: parseJson<Record<string, unknown>>(row.payload_json, {}),
+    status: text(row.status) as EcosystemProposal['status'],
+    snapshotBlock: text(row.snapshot_block),
+    startsAt: text(row.starts_at),
+    endsAt: text(row.ends_at),
+    quorumBps: number(row.quorum_bps),
+    approvalBps: number(row.approval_bps),
+    eligiblePower: text(row.eligible_power),
+    forPower: text(row.for_power) || '0',
+    againstPower: text(row.against_power) || '0',
+    abstainPower: text(row.abstain_power) || '0',
+    finalizedAt: text(row.finalized_at) || null,
+    finalizedBy: text(row.finalized_by) || null,
+    createdAt: text(row.created_at),
+  };
+}
+
+function mapGovernanceSnapshot(row: Row): GovernancePowerSnapshot {
+  return {
+    proposalId: text(row.proposal_id),
+    userId: text(row.user_id),
+    walletAddress: text(row.wallet_address),
+    power: text(row.power),
+    delegateSources: parseJson<string[]>(row.delegate_sources_json, []),
+    createdAt: text(row.created_at),
+  };
+}
+
+function mapEcosystemVote(row: Row): EcosystemVote {
+  return {
+    id: text(row.id),
+    proposalId: text(row.proposal_id),
+    voterId: text(row.voter_id),
+    walletAddress: text(row.wallet_address),
+    choice: text(row.choice) as EcosystemVote['choice'],
+    power: text(row.power),
+    reason: text(row.reason),
+    createdAt: text(row.created_at),
+  };
+}
+
 function mapAdminAction(row: Row): AdminAction {
   return {
     id: text(row.id),
@@ -196,6 +351,89 @@ function mapAgent(row: Row): Agent {
     official: boolean(row.official),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
+  };
+}
+
+function mapAgentQualityStats(row: Row): AgentQualityStats {
+  return {
+    agentId: text(row.agent_id),
+    marketplaceStatus: text(row.marketplace_status) as AgentQualityStats['marketplaceStatus'],
+    reputation: number(row.reputation),
+    breakdown: {
+      reliability: number(row.reliability_score),
+      quality: number(row.quality_score),
+      delivery: number(row.delivery_score),
+      response: number(row.response_score),
+      history: number(row.history_score),
+      riskPenalty: number(row.risk_penalty),
+    },
+    confidence: text(row.confidence) as AgentQualityStats['confidence'],
+    settledJobs: number(row.settled_jobs),
+    successfulJobs: number(row.successful_jobs),
+    failedJobs: number(row.failed_jobs),
+    refundedJobs: number(row.refunded_jobs),
+    trialPassed: boolean(row.trial_passed),
+    endpointHealthy: boolean(row.endpoint_healthy),
+    payoutValid: boolean(row.payout_valid),
+    unresolvedSevereRisks: number(row.unresolved_severe_risks),
+    premium: boolean(row.premium),
+    newAgent: boolean(row.new_agent),
+    eligibilityReasons: parseJson<string[]>(row.eligibility_reasons_json, []),
+    formulaVersion: text(row.formula_version) || AGENT_QUALITY_FORMULA_VERSION,
+    lastTrialAt: text(row.last_trial_at) || null,
+    lastHealthCheckAt: text(row.last_health_check_at) || null,
+    updatedAt: text(row.updated_at),
+  };
+}
+
+function mapAgentTrial(row: Row): AgentTrial {
+  return {
+    id: text(row.id), agentId: text(row.agent_id), agentVersionId: text(row.agent_version_id) || null,
+    suiteVersion: text(row.suite_version), status: text(row.status) as AgentTrial['status'], score: number(row.score),
+    responseTimeMs: number(row.response_time_ms), checks: parseJson<AgentTrial['checks']>(row.checks_json, []),
+    summary: text(row.summary), evidence: parseJson<Record<string, unknown>>(row.evidence_json, {}),
+    startedAt: text(row.started_at), completedAt: text(row.completed_at) || null, createdBy: text(row.created_by),
+  };
+}
+
+function mapAgentHealthCheck(row: Row): AgentHealthCheck {
+  return {
+    id: text(row.id), agentId: text(row.agent_id), status: text(row.status) as AgentHealthCheck['status'],
+    responseTimeMs: row.response_time_ms === null || row.response_time_ms === undefined ? null : number(row.response_time_ms),
+    httpStatus: row.http_status === null || row.http_status === undefined ? null : number(row.http_status),
+    errorCode: text(row.error_code) || null, checkedAt: text(row.checked_at),
+  };
+}
+
+function mapAgentMetricEvent(row: Row): AgentMetricEvent {
+  return {
+    id: text(row.id), idempotencyKey: text(row.idempotency_key), agentId: text(row.agent_id),
+    type: text(row.event_type) as AgentMetricEvent['type'], value: number(row.value), weight: number(row.weight),
+    severity: text(row.severity) as AgentMetricEvent['severity'], sourceType: text(row.source_type) as AgentMetricEvent['sourceType'],
+    sourceId: text(row.source_id), detail: parseJson<Record<string, unknown>>(row.detail_json, {}),
+    occurredAt: text(row.occurred_at), createdAt: text(row.created_at),
+  };
+}
+
+function mapAgentFeedback(row: Row): AgentFeedback {
+  return {
+    id: text(row.id), agentId: text(row.agent_id), missionId: text(row.mission_id), stageId: text(row.stage_id),
+    requesterId: text(row.requester_id), version: number(row.version), deliveryQuality: number(row.delivery_quality),
+    requirementsFit: number(row.requirements_fit), communication: number(row.communication), onTime: boolean(row.on_time),
+    reuse: boolean(row.reuse_agent), comment: text(row.comment), effective: boolean(row.effective), createdAt: text(row.created_at),
+  };
+}
+
+function mapAgentReputationSnapshot(row: Row): AgentReputationSnapshot {
+  return {
+    id: text(row.id), agentId: text(row.agent_id), evaluatedAt: text(row.evaluated_at), formulaVersion: text(row.formula_version),
+    eventCount: number(row.event_count), reputation: number(row.reputation),
+    breakdown: parseJson<AgentReputationSnapshot['breakdown']>(row.breakdown_json, {
+      reliability: 0, quality: 0, delivery: 0, response: 0, history: 0, riskPenalty: 0,
+    }),
+    confidence: text(row.confidence) as AgentReputationSnapshot['confidence'],
+    marketplaceStatus: text(row.marketplace_status) as AgentReputationSnapshot['marketplaceStatus'],
+    eligibilityReasons: parseJson<string[]>(row.reasons_json, []), createdAt: text(row.created_at),
   };
 }
 
@@ -656,7 +894,8 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async createAgent(agent: Agent): Promise<Agent> {
-    await this.db.prepare(`
+    const versionId = `AGVER-${agent.id}-${agent.version.replaceAll('.', '-')}`;
+    await this.db.batch([this.db.prepare(`
       INSERT INTO agents
         (id, owner_id, name, category, summary, tags_json, endpoint_url, auth_type, input_schema_json,
          output_schema_json, price_usdc, wallet_address, status, version, trust_score, success_rate,
@@ -667,7 +906,16 @@ export class D1PlatformStore implements PlatformStore {
       agent.endpoint, agent.authType, JSON.stringify(agent.inputSchema), JSON.stringify(agent.outputSchema),
       agent.price, agent.wallet, agent.status, agent.version, agent.trustScore, agent.successRate, 0,
       agent.jobs, agent.volume, agent.author, agent.official ? 1 : 0, agent.createdAt, agent.updatedAt,
-    ).run();
+    ), this.db.prepare(`
+      INSERT INTO agent_versions
+        (id, agent_id, version, endpoint_url, auth_type, input_schema_json, output_schema_json, capabilities_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(versionId, agent.id, agent.version, agent.endpoint, agent.authType, JSON.stringify(agent.inputSchema), JSON.stringify(agent.outputSchema), JSON.stringify(agent.tags), agent.createdAt),
+    this.db.prepare(`
+      INSERT INTO agent_stats
+        (agent_id, marketplace_status, payout_valid, eligibility_reasons_json, formula_version, updated_at)
+      VALUES (?, 'registered', ?, ?, ?, ?)
+    `).bind(agent.id, /^0x[a-fA-F0-9]{40}$/.test(agent.wallet) ? 1 : 0, JSON.stringify(['正式 Trial 尚未通过', 'Endpoint 最近 24 小时无健康记录']), AGENT_QUALITY_FORMULA_VERSION, agent.createdAt)]);
     return agent;
   }
 
@@ -686,6 +934,173 @@ export class D1PlatformStore implements PlatformStore {
   async updateAgentStatus(id: string, status: AgentStatus): Promise<Agent | null> {
     await this.db.prepare("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?").bind(status, id).run();
     return this.getAgent(id);
+  }
+
+  async getAgentQualityStats(agentId: string): Promise<AgentQualityStats | null> {
+    const row = await this.db.prepare('SELECT * FROM agent_stats WHERE agent_id = ?').bind(agentId).first<Row>();
+    return row ? mapAgentQualityStats(row) : null;
+  }
+
+  async listAgentQualityStats(): Promise<AgentQualityStats[]> {
+    const { results } = await this.db.prepare('SELECT * FROM agent_stats ORDER BY reputation DESC, agent_id ASC').all<Row>();
+    return results.map(mapAgentQualityStats);
+  }
+
+  async recordAgentTrial(trial: AgentTrial): Promise<AgentTrial> {
+    await this.db.prepare(`
+      INSERT INTO agent_trials
+        (id, agent_id, agent_version_id, suite_version, status, score, response_time_ms, checks_json, summary,
+         evidence_json, started_at, completed_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      trial.id, trial.agentId, trial.agentVersionId, trial.suiteVersion, trial.status, trial.score, trial.responseTimeMs,
+      JSON.stringify(trial.checks), trial.summary, JSON.stringify(trial.evidence), trial.startedAt, trial.completedAt, trial.createdBy,
+    ).run();
+    return trial;
+  }
+
+  async listAgentTrials(agentId: string, limit = 20): Promise<AgentTrial[]> {
+    const { results } = await this.db.prepare('SELECT * FROM agent_trials WHERE agent_id = ? ORDER BY started_at DESC, id DESC LIMIT ?')
+      .bind(agentId, Math.max(1, Math.min(100, limit))).all<Row>();
+    return results.map(mapAgentTrial);
+  }
+
+  async recordAgentHealthCheck(check: AgentHealthCheck): Promise<AgentHealthCheck> {
+    await this.db.prepare(`
+      INSERT INTO agent_health_checks (id, agent_id, status, response_time_ms, http_status, error_code, checked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(check.id, check.agentId, check.status, check.responseTimeMs, check.httpStatus, check.errorCode, check.checkedAt).run();
+    return check;
+  }
+
+  async listAgentHealthChecks(agentId: string, limit = 50): Promise<AgentHealthCheck[]> {
+    const { results } = await this.db.prepare('SELECT * FROM agent_health_checks WHERE agent_id = ? ORDER BY checked_at DESC, id DESC LIMIT ?')
+      .bind(agentId, Math.max(1, Math.min(200, limit))).all<Row>();
+    return results.map(mapAgentHealthCheck);
+  }
+
+  async listAgentMetricEvents(agentId: string): Promise<AgentMetricEvent[]> {
+    const { results } = await this.db.prepare('SELECT * FROM agent_metric_events WHERE agent_id = ? ORDER BY occurred_at ASC, id ASC').bind(agentId).all<Row>();
+    return results.map(mapAgentMetricEvent);
+  }
+
+  async recomputeAgentQuality(agentId: string, evaluatedAt: string): Promise<AgentQualityStats | null> {
+    const [agent, current, events] = await Promise.all([
+      this.getAgent(agentId), this.getAgentQualityStats(agentId), this.listAgentMetricEvents(agentId),
+    ]);
+    if (!agent) return null;
+    const stats = calculateAgentQuality(agent, events, evaluatedAt, current?.marketplaceStatus ?? 'registered');
+    const snapshotId = `AGSNAP-${crypto.randomUUID()}`;
+    await this.db.batch([
+      this.db.prepare(`
+        INSERT INTO agent_stats
+          (agent_id, marketplace_status, reputation, reliability_score, quality_score, delivery_score, response_score,
+           history_score, risk_penalty, confidence, settled_jobs, successful_jobs, failed_jobs, refunded_jobs,
+           trial_passed, endpoint_healthy, payout_valid, unresolved_severe_risks, premium, new_agent,
+           eligibility_reasons_json, formula_version, last_trial_at, last_health_check_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(agent_id) DO UPDATE SET
+          marketplace_status=excluded.marketplace_status, reputation=excluded.reputation,
+          reliability_score=excluded.reliability_score, quality_score=excluded.quality_score,
+          delivery_score=excluded.delivery_score, response_score=excluded.response_score, history_score=excluded.history_score,
+          risk_penalty=excluded.risk_penalty, confidence=excluded.confidence, settled_jobs=excluded.settled_jobs,
+          successful_jobs=excluded.successful_jobs, failed_jobs=excluded.failed_jobs, refunded_jobs=excluded.refunded_jobs,
+          trial_passed=excluded.trial_passed, endpoint_healthy=excluded.endpoint_healthy, payout_valid=excluded.payout_valid,
+          unresolved_severe_risks=excluded.unresolved_severe_risks, premium=excluded.premium, new_agent=excluded.new_agent,
+          eligibility_reasons_json=excluded.eligibility_reasons_json, formula_version=excluded.formula_version,
+          last_trial_at=excluded.last_trial_at, last_health_check_at=excluded.last_health_check_at, updated_at=excluded.updated_at
+      `).bind(
+        stats.agentId, stats.marketplaceStatus, stats.reputation, stats.breakdown.reliability, stats.breakdown.quality,
+        stats.breakdown.delivery, stats.breakdown.response, stats.breakdown.history, stats.breakdown.riskPenalty,
+        stats.confidence, stats.settledJobs, stats.successfulJobs, stats.failedJobs, stats.refundedJobs,
+        stats.trialPassed ? 1 : 0, stats.endpointHealthy ? 1 : 0, stats.payoutValid ? 1 : 0,
+        stats.unresolvedSevereRisks, stats.premium ? 1 : 0, stats.newAgent ? 1 : 0,
+        JSON.stringify(stats.eligibilityReasons), stats.formulaVersion, stats.lastTrialAt, stats.lastHealthCheckAt, stats.updatedAt,
+      ),
+      this.db.prepare(`
+        INSERT INTO agent_reputation_snapshots
+          (id, agent_id, evaluated_at, formula_version, event_count, reputation, breakdown_json, confidence,
+           marketplace_status, reasons_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(agent_id, evaluated_at, formula_version) DO UPDATE SET
+          event_count=excluded.event_count, reputation=excluded.reputation,
+          breakdown_json=excluded.breakdown_json, confidence=excluded.confidence,
+          marketplace_status=excluded.marketplace_status, reasons_json=excluded.reasons_json,
+          created_at=excluded.created_at
+      `).bind(snapshotId, agentId, evaluatedAt, stats.formulaVersion, events.length, stats.reputation,
+        JSON.stringify(stats.breakdown), stats.confidence, stats.marketplaceStatus, JSON.stringify(stats.eligibilityReasons), evaluatedAt),
+    ]);
+    return stats;
+  }
+
+  async recordAgentMetricEvent(event: AgentMetricEvent, evaluatedAt: string): Promise<AgentMetricRecordResult> {
+    const result = await this.db.prepare(`
+      INSERT OR IGNORE INTO agent_metric_events
+        (id, idempotency_key, agent_id, event_type, value, weight, severity, source_type, source_id, detail_json, occurred_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(event.id, event.idempotencyKey, event.agentId, event.type, event.value, event.weight, event.severity,
+      event.sourceType, event.sourceId, JSON.stringify(event.detail), event.occurredAt, event.createdAt).run();
+    const applied = result.meta.changes > 0;
+    return { applied, stats: await this.recomputeAgentQuality(event.agentId, evaluatedAt) };
+  }
+
+  async listAgentReputationSnapshots(agentId: string, limit = 20): Promise<AgentReputationSnapshot[]> {
+    const { results } = await this.db.prepare('SELECT * FROM agent_reputation_snapshots WHERE agent_id = ? ORDER BY evaluated_at DESC, id DESC LIMIT ?')
+      .bind(agentId, Math.max(1, Math.min(100, limit))).all<Row>();
+    return results.map(mapAgentReputationSnapshot);
+  }
+
+  async saveAgentFeedback(feedback: AgentFeedback, evaluatedAt: string): Promise<{ feedback: AgentFeedback; stats: AgentQualityStats | null }> {
+    const current = await this.getAgentFeedback(feedback.missionId, feedback.stageId, feedback.agentId);
+    const version = (current?.version ?? 0) + 1;
+    const saved = { ...feedback, version };
+    const score = ((saved.deliveryQuality + saved.requirementsFit + saved.communication + (saved.onTime ? 5 : 1) + (saved.reuse ? 5 : 1)) / 25) * 100;
+    const priorFeedback = await this.db.prepare(`
+      SELECT COUNT(*) AS count FROM agent_feedback
+      WHERE agent_id = ? AND requester_id = ? AND effective = 1
+        AND NOT (mission_id = ? AND stage_id = ?)
+    `).bind(saved.agentId, saved.requesterId, saved.missionId, saved.stageId).first<{ count: number }>();
+    const feedbackWeight = feedbackWeightForPriorCount(number(priorFeedback?.count));
+    const metric: AgentMetricEvent = {
+      id: `AGMETRIC-${crypto.randomUUID()}`, idempotencyKey: `feedback:${saved.id}`, agentId: saved.agentId,
+      type: 'feedback_received', value: score, weight: feedbackWeight, severity: 'info', sourceType: 'feedback',
+      sourceId: `${saved.missionId}:${saved.stageId}:${saved.agentId}`, detail: { feedbackId: saved.id, version, feedbackWeight },
+      occurredAt: saved.createdAt, createdAt: saved.createdAt,
+    };
+    await this.db.batch([
+      this.db.prepare('UPDATE agent_feedback SET effective = 0 WHERE mission_id = ? AND stage_id = ? AND agent_id = ? AND effective = 1')
+        .bind(saved.missionId, saved.stageId, saved.agentId),
+      this.db.prepare(`
+        INSERT INTO agent_feedback
+          (id, agent_id, mission_id, stage_id, requester_id, version, delivery_quality, requirements_fit,
+           communication, on_time, reuse_agent, comment, effective, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(saved.id, saved.agentId, saved.missionId, saved.stageId, saved.requesterId, saved.version,
+        saved.deliveryQuality, saved.requirementsFit, saved.communication, saved.onTime ? 1 : 0, saved.reuse ? 1 : 0,
+        saved.comment, saved.effective ? 1 : 0, saved.createdAt),
+      this.db.prepare(`
+        INSERT INTO agent_metric_events
+          (id, idempotency_key, agent_id, event_type, value, weight, severity, source_type, source_id, detail_json, occurred_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(metric.id, metric.idempotencyKey, metric.agentId, metric.type, metric.value, metric.weight, metric.severity,
+        metric.sourceType, metric.sourceId, JSON.stringify(metric.detail), metric.occurredAt, metric.createdAt),
+    ]);
+    return { feedback: saved, stats: await this.recomputeAgentQuality(saved.agentId, evaluatedAt) };
+  }
+
+  async getAgentFeedback(missionId: string, stageId: string, agentId: string): Promise<AgentFeedback | null> {
+    const row = await this.db.prepare(`
+      SELECT * FROM agent_feedback WHERE mission_id = ? AND stage_id = ? AND agent_id = ? AND effective = 1
+      ORDER BY version DESC LIMIT 1
+    `).bind(missionId, stageId, agentId).first<Row>();
+    return row ? mapAgentFeedback(row) : null;
+  }
+
+  async listAgentFeedback(agentId: string, limit = 50): Promise<AgentFeedback[]> {
+    const { results } = await this.db.prepare(`
+      SELECT * FROM agent_feedback WHERE agent_id = ? AND effective = 1 ORDER BY created_at DESC, id DESC LIMIT ?
+    `).bind(agentId, Math.max(1, Math.min(100, limit))).all<Row>();
+    return results.map(mapAgentFeedback);
   }
 
   async listMissions(user: UserContext): Promise<Mission[]> {
@@ -920,6 +1335,21 @@ export class D1PlatformStore implements PlatformStore {
             AND e.status = 'released' AND e.released_at = ?
         )
       `).bind(`${id}:mission.accepted`, id, actorId, JSON.stringify({ amount: escrow.amount, token: escrow.token, releaseTxHash }), now, id, now, now),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO reward_activities
+          (id, source_key, user_id, mission_id, dispute_id, role, formula_version, asset, settled_amount, quality_bps,
+           penalty_bps, score_micros, eligible, detail_json, occurred_at, created_at)
+        SELECT ?, ?, ?, ?, NULL, 'requester', ?, ?, ?, 10000, 0, ?, 1, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+          WHERE m.id = ? AND m.status = 'completed' AND m.updated_at = ?
+            AND e.status = 'released' AND e.released_at = ?
+        )
+      `).bind(
+        `YDACT-${id}-requester`, `${id}:settlement:requester`, mission.requesterId, id, REWARD_FORMULA_VERSION, escrow.token,
+        escrow.amount, rewardScoreMicros(escrow.amount, 'requester'),
+        JSON.stringify({ source: 'mission_settlement', releaseTxHash }), now, now, id, now, now,
+      ),
     ];
     const payouts = new Map<string, number>();
     for (const stage of stages) {
@@ -928,6 +1358,7 @@ export class D1PlatformStore implements PlatformStore {
       payouts.set(stage.agentId, (payouts.get(stage.agentId) ?? 0) + gross);
     }
     const walletPayouts = new Map<string, number>();
+    const ownerRewards = new Map<string, { amount: number; qualityBps: number; agentIds: string[] }>();
     for (const [agentId, gross] of payouts) {
       const amount = Number((gross * (1 - escrow.platformFeeRate)).toFixed(6));
       statements.push(this.db.prepare(`
@@ -939,9 +1370,19 @@ export class D1PlatformStore implements PlatformStore {
             AND e.status = 'released' AND e.released_at = ?
         )
       `).bind(crypto.randomUUID(), `${id}:agent:${agentId}`, id, agentId, amount, escrow.token, releaseTxHash, now, id, now, now));
-      if (escrow.paymentMethod === 'web2_balance') {
-        const agent = await this.getAgent(agentId);
-        if (agent) walletPayouts.set(agent.ownerId, (walletPayouts.get(agent.ownerId) ?? 0) + amount);
+      const agent = await this.getAgent(agentId);
+      if (agent) {
+        if (escrow.paymentMethod === 'web2_balance') {
+          walletPayouts.set(agent.ownerId, (walletPayouts.get(agent.ownerId) ?? 0) + amount);
+        }
+        const current = ownerRewards.get(agent.ownerId) ?? { amount: 0, qualityBps: 0, agentIds: [] };
+        const qualityBps = Math.max(5_000, Math.min(12_000, Math.round(agent.successRate * 100)));
+        const nextAmount = current.amount + amount;
+        ownerRewards.set(agent.ownerId, {
+          amount: nextAmount,
+          qualityBps: nextAmount > 0 ? Math.round((current.qualityBps * current.amount + qualityBps * amount) / nextAmount) : qualityBps,
+          agentIds: [...current.agentIds, agentId],
+        });
       }
     }
     for (const [ownerId, amount] of walletPayouts) {
@@ -956,6 +1397,24 @@ export class D1PlatformStore implements PlatformStore {
         )
         ON CONFLICT(settlement_key) DO NOTHING
       `).bind(crypto.randomUUID(), `${id}:wallet:payout:${ownerId}`, ownerId, amount, id, now, id, now, now));
+    }
+    for (const [ownerId, reward] of ownerRewards) {
+      statements.push(this.db.prepare(`
+        INSERT OR IGNORE INTO reward_activities
+          (id, source_key, user_id, mission_id, dispute_id, role, formula_version, asset, settled_amount, quality_bps,
+           penalty_bps, score_micros, eligible, detail_json, occurred_at, created_at)
+        SELECT ?, ?, ?, ?, NULL, 'agent_owner', ?, ?, ?, ?, 0, ?, 1, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+          WHERE m.id = ? AND m.status = 'completed' AND m.updated_at = ?
+            AND e.status = 'released' AND e.released_at = ?
+        )
+      `).bind(
+        `YDACT-${id}-agent-${ownerId}`, `${id}:settlement:agent_owner:${ownerId}`, ownerId, id,
+        REWARD_FORMULA_VERSION, escrow.token, reward.amount, reward.qualityBps, rewardScoreMicros(reward.amount, 'agent_owner', reward.qualityBps),
+        JSON.stringify({ source: 'mission_settlement', agentIds: reward.agentIds, releaseTxHash }),
+        now, now, id, now, now,
+      ));
     }
     const results = await this.db.batch(statements);
     const saved = await this.getMission(id);
@@ -1515,8 +1974,21 @@ export class D1PlatformStore implements PlatformStore {
           AND EXISTS (
             SELECT 1 FROM disputes
             WHERE id = ? AND status = ? AND resolution = ? AND resolution_tx_hash IS ? AND resolved_at = ?
-          )
+        )
       `).bind(resolvedAt, actorId, id, expectedProposalStatus, expectedOutcome, id, status, resolution, resolutionTxHash, resolvedAt),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO reward_activities
+          (id, source_key, user_id, mission_id, dispute_id, role, formula_version, asset, settled_amount, quality_bps,
+           penalty_bps, score_micros, eligible, detail_json, occurred_at, created_at)
+        SELECT 'YDACT-' || d.id || '-arb-' || v.voter_id,
+          d.id || ':arbitration:' || v.voter_id,
+          v.voter_id, d.mission_id, d.id, 'arbitrator', ?, 'YD_CONTRIBUTION', 1, 10000, 0, ?, 1,
+          json_object('source', 'executed_arbitration', 'choice', v.choice), ?, ?
+        FROM disputes d
+        JOIN dispute_proposals p ON p.dispute_id = d.id AND p.status = 'executed'
+        JOIN dispute_votes v ON v.proposal_id = p.id
+        WHERE d.id = ? AND d.status = ? AND d.resolved_at = ?
+      `).bind(REWARD_FORMULA_VERSION, rewardScoreMicros(1, 'arbitrator'), resolvedAt, resolvedAt, id, status, resolvedAt),
     ];
     if (status === 'resolved' && mission && escrow?.paymentMethod === 'web2_balance') {
       statements.push(this.db.prepare(`
@@ -1972,6 +2444,395 @@ export class D1PlatformStore implements PlatformStore {
         nextCursor: hasMore && lastEntry ? { createdAt: lastEntry.createdAt, id: lastEntry.id } : null,
       },
     };
+  }
+
+  async recordRewardActivity(activity: RewardActivity): Promise<boolean> {
+    const result = await this.db.prepare(`
+      INSERT OR IGNORE INTO reward_activities
+        (id, source_key, user_id, mission_id, dispute_id, role, formula_version, asset, settled_amount, quality_bps,
+         penalty_bps, score_micros, eligible, detail_json, occurred_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      activity.id, activity.sourceKey, activity.userId, activity.missionId, activity.disputeId,
+      activity.role, activity.formulaVersion, activity.asset, activity.settledAmount, activity.qualityBps, activity.penaltyBps,
+      activity.scoreMicros, activity.eligible ? 1 : 0, JSON.stringify(activity.detail), activity.occurredAt, activity.createdAt,
+    ).run();
+    return result.meta.changes > 0;
+  }
+
+  async createRewardEpoch(epoch: RewardEpoch): Promise<RewardEpoch> {
+    await this.db.batch([this.db.prepare(`
+      INSERT INTO reward_epochs
+        (id, epoch_number, status, starts_at, ends_at, claim_ends_at, total_reward_units,
+         account_score_cap, formula_version, rules_json, chain_id, distributor_address,
+         merkle_root, manifest_hash, publish_tx_hash, computed_at, published_at,
+         created_by, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      epoch.id, epoch.epochNumber, epoch.status, epoch.startsAt, epoch.endsAt, epoch.claimEndsAt,
+      epoch.totalRewardUnits, epoch.accountScoreCap, epoch.formulaVersion, JSON.stringify(epoch.rules),
+      epoch.chainId, epoch.distributorAddress.toLocaleLowerCase(), epoch.merkleRoot, epoch.manifestHash,
+      epoch.publishTxHash, epoch.computedAt, epoch.publishedAt, epoch.createdBy, epoch.createdAt, epoch.updatedAt,
+    ), this.db.prepare(`
+      INSERT INTO yd_admin_actions (id, actor_id, action, target_id, detail_json, created_at)
+      VALUES (?, ?, 'reward_epoch_created', ?, ?, ?)
+    `).bind(
+      `YDACTION-${crypto.randomUUID()}`, epoch.createdBy, epoch.id,
+      JSON.stringify({ epochNumber: epoch.epochNumber, totalRewardUnits: epoch.totalRewardUnits }), epoch.createdAt,
+    )]);
+    return epoch;
+  }
+
+  async listRewardEpochs(): Promise<RewardEpoch[]> {
+    const { results } = await this.db.prepare('SELECT * FROM reward_epochs ORDER BY epoch_number DESC').all<Row>();
+    return results.map(mapRewardEpoch);
+  }
+
+  async getRewardEpoch(id: string): Promise<RewardEpoch | null> {
+    const row = await this.db.prepare('SELECT * FROM reward_epochs WHERE id = ?').bind(id).first<Row>();
+    return row ? mapRewardEpoch(row) : null;
+  }
+
+  async listRewardAllocations(epochId: string): Promise<RewardAllocation[]> {
+    const { results } = await this.db.prepare(`
+      SELECT * FROM reward_allocations WHERE epoch_id = ? ORDER BY wallet_address ASC
+    `).bind(epochId).all<Row>();
+    return results.map(mapRewardAllocation);
+  }
+
+  async computeRewardEpoch(id: string, computedAt: string, actorId: string): Promise<RewardEpochComputeResult> {
+    const epoch = await this.getRewardEpoch(id);
+    if (!epoch) return { state: 'missing' };
+    if (epoch.status !== 'draft') return { state: 'not_draft' };
+    const [{ results: activityRows }, { results: profileRows }] = await Promise.all([
+      this.db.prepare(`
+        SELECT * FROM reward_activities
+        WHERE eligible = 1 AND formula_version = ?
+          AND julianday(occurred_at) >= julianday(?) AND julianday(occurred_at) < julianday(?)
+        ORDER BY occurred_at ASC, id ASC
+      `).bind(epoch.formulaVersion, epoch.startsAt, epoch.endsAt).all<Row>(),
+      this.db.prepare("SELECT id, wallet_address FROM profiles WHERE wallet_address IS NOT NULL AND wallet_address <> ''").all<Row>(),
+    ]);
+    const wallets = new Map<string, Address>();
+    for (const row of profileRows) {
+      const wallet = text(row.wallet_address).toLocaleLowerCase();
+      if (/^0x[a-f0-9]{40}$/.test(wallet)) wallets.set(text(row.id), wallet as Address);
+    }
+    let computed;
+    try {
+      computed = allocateRewardEpoch({
+        epochNumber: epoch.epochNumber,
+        chainId: epoch.chainId,
+        distributorAddress: epoch.distributorAddress as Address,
+        totalRewardUnits: BigInt(epoch.totalRewardUnits),
+        accountScoreCap: epoch.accountScoreCap,
+        activities: activityRows.map(mapRewardActivity),
+        wallets,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === 'NO_ELIGIBLE_REWARD_ACCOUNTS') return { state: 'no_eligible_accounts' };
+      throw error;
+    }
+    const allocations: RewardAllocation[] = computed.allocations.map((allocation) => ({
+      id: `YDALLOC-${epoch.id}-${allocation.userId}`,
+      epochId: epoch.id,
+      userId: allocation.userId,
+      walletAddress: allocation.walletAddress,
+      effectiveScore: allocation.effectiveScore,
+      amountUnits: allocation.amountUnits,
+      leafHash: allocation.leafHash,
+      proof: allocation.proof,
+      status: 'unclaimed',
+      claimTxHash: null,
+      claimedAt: null,
+      createdAt: computedAt,
+    }));
+    const statements: D1Statement[] = [this.db.prepare(`
+      UPDATE reward_epochs SET status = 'computed', merkle_root = ?, manifest_hash = ?, computed_at = ?, updated_at = ?
+      WHERE id = ? AND status = 'draft'
+    `).bind(computed.merkleRoot, computed.manifestHash, computedAt, computedAt, id)];
+    for (const allocation of allocations) {
+      statements.push(this.db.prepare(`
+        INSERT INTO reward_allocations
+          (id, epoch_id, user_id, wallet_address, effective_score, amount_units, leaf_hash, proof_json, status, created_at)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'unclaimed', ?
+        WHERE EXISTS (SELECT 1 FROM reward_epochs WHERE id = ? AND status = 'computed' AND computed_at = ?)
+      `).bind(
+        allocation.id, allocation.epochId, allocation.userId, allocation.walletAddress,
+        allocation.effectiveScore, allocation.amountUnits, allocation.leafHash, JSON.stringify(allocation.proof),
+        allocation.createdAt, id, computedAt,
+      ));
+    }
+    statements.push(this.db.prepare(`
+      INSERT INTO yd_admin_actions (id, actor_id, action, target_id, detail_json, created_at)
+      SELECT ?, ?, 'reward_epoch_computed', ?, ?, ?
+      WHERE EXISTS (SELECT 1 FROM reward_epochs WHERE id = ? AND status = 'computed' AND computed_at = ?)
+    `).bind(
+      `YDACTION-${crypto.randomUUID()}`, actorId, id,
+      JSON.stringify({ merkleRoot: computed.merkleRoot, manifestHash: computed.manifestHash, allocations: allocations.length }),
+      computedAt, id, computedAt,
+    ));
+    const results = await this.db.batch(statements);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return { state: 'not_draft' };
+    return { state: 'computed', epoch: (await this.getRewardEpoch(id))!, allocations };
+  }
+
+  async markRewardEpochPublished(id: string, txHash: string, publishedAt: string, actorId: string): Promise<RewardEpoch | null> {
+    await this.db.batch([this.db.prepare(`
+      UPDATE reward_epochs SET status = 'published', publish_tx_hash = ?, published_at = ?, updated_at = ?
+      WHERE id = ? AND status = 'computed' AND merkle_root IS NOT NULL
+    `).bind(txHash, publishedAt, publishedAt, id), this.db.prepare(`
+      INSERT INTO yd_admin_actions (id, actor_id, action, target_id, detail_json, created_at)
+      SELECT ?, ?, 'reward_epoch_published', ?, ?, ?
+      WHERE EXISTS (SELECT 1 FROM reward_epochs WHERE id = ? AND publish_tx_hash = ?)
+    `).bind(
+      `YDACTION-${crypto.randomUUID()}`, actorId, id, JSON.stringify({ txHash }), publishedAt, id, txHash,
+    )]);
+    return this.getRewardEpoch(id);
+  }
+
+  async markRewardEpochExpired(id: string, txHash: string, expiredAt: string, actorId: string): Promise<RewardEpoch | null> {
+    await this.db.batch([
+      this.db.prepare(`
+        UPDATE reward_epochs SET status = 'expired', updated_at = ?
+        WHERE id = ? AND status = 'published' AND julianday(claim_ends_at) < julianday(?)
+      `).bind(expiredAt, id, expiredAt),
+      this.db.prepare(`
+        UPDATE reward_allocations SET status = 'expired'
+        WHERE epoch_id = ? AND status = 'unclaimed'
+          AND EXISTS (SELECT 1 FROM reward_epochs WHERE id = ? AND status = 'expired' AND updated_at = ?)
+      `).bind(id, id, expiredAt),
+      this.db.prepare(`
+        INSERT INTO yd_admin_actions (id, actor_id, action, target_id, detail_json, created_at)
+        SELECT ?, ?, 'reward_epoch_swept', ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM reward_epochs WHERE id = ? AND status = 'expired' AND updated_at = ?)
+      `).bind(`YDACTION-${crypto.randomUUID()}`, actorId, id, JSON.stringify({ txHash }), expiredAt, id, expiredAt),
+    ]);
+    return this.getRewardEpoch(id);
+  }
+
+  async getYdFinanceOverview(userId: string, now = new Date().toISOString()): Promise<YdFinanceOverview> {
+    const [epochs, allocationRows, activityRows, stakingRow, governance] = await Promise.all([
+      this.listRewardEpochs(),
+      this.db.prepare(`
+        SELECT a.* FROM reward_allocations a JOIN reward_epochs e ON e.id = a.epoch_id
+        WHERE a.user_id = ? ORDER BY e.epoch_number DESC
+      `).bind(userId).all<Row>(),
+      this.db.prepare('SELECT * FROM reward_activities WHERE user_id = ? ORDER BY occurred_at DESC, id DESC LIMIT 100').bind(userId).all<Row>(),
+      this.db.prepare('SELECT * FROM staking_positions WHERE user_id = ?').bind(userId).first<Row>(),
+      this.listEcosystemGovernance(userId, now),
+    ]);
+    return {
+      epochs,
+      allocations: allocationRows.results.map(mapRewardAllocation),
+      activities: activityRows.results.map(mapRewardActivity),
+      staking: stakingRow ? mapStakingPosition(stakingRow) : null,
+      governance,
+    };
+  }
+
+  async recordRewardClaim(claim: RewardClaim): Promise<{ claim: RewardClaim; applied: boolean } | null> {
+    const allocation = await this.db.prepare(`
+      SELECT * FROM reward_allocations WHERE epoch_id = ? AND user_id = ? AND wallet_address = ?
+    `).bind(claim.epochId, claim.userId, claim.walletAddress.toLocaleLowerCase()).first<Row>();
+    if (!allocation || text(allocation.amount_units) !== claim.amountUnits) return null;
+    const results = await this.db.batch([
+      this.db.prepare(`
+        INSERT OR IGNORE INTO reward_claims
+          (id, epoch_id, user_id, wallet_address, amount_units, tx_hash, block_number, log_index, claimed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        claim.id, claim.epochId, claim.userId, claim.walletAddress.toLocaleLowerCase(), claim.amountUnits,
+        claim.txHash, claim.blockNumber, claim.logIndex, claim.claimedAt,
+      ),
+      this.db.prepare(`
+        UPDATE reward_allocations SET status = 'claimed', claim_tx_hash = ?, claimed_at = ?
+        WHERE epoch_id = ? AND user_id = ? AND status IN ('unclaimed', 'expired')
+          AND EXISTS (SELECT 1 FROM reward_claims WHERE epoch_id = ? AND user_id = ? AND tx_hash = ? AND log_index = ?)
+      `).bind(
+        claim.txHash, claim.claimedAt, claim.epochId, claim.userId,
+        claim.epochId, claim.userId, claim.txHash, claim.logIndex,
+      ),
+    ]);
+    return { claim, applied: Number(results[0]?.meta?.changes ?? 0) > 0 };
+  }
+
+  async syncYdStakingPosition(position: YdStakingPosition): Promise<YdStakingPosition> {
+    await this.db.prepare(`
+      INSERT INTO staking_positions
+        (user_id, wallet_address, amount_units, unlock_time, duration_seconds, reputation_bps, raw_power,
+         delegated_to, voting_power, verified, last_tx_hash, last_block_number, last_log_index, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        wallet_address = excluded.wallet_address,
+        amount_units = excluded.amount_units,
+        unlock_time = excluded.unlock_time,
+        duration_seconds = excluded.duration_seconds,
+        reputation_bps = excluded.reputation_bps,
+        raw_power = excluded.raw_power,
+        delegated_to = excluded.delegated_to,
+        voting_power = excluded.voting_power,
+        verified = excluded.verified,
+        last_tx_hash = excluded.last_tx_hash,
+        last_block_number = excluded.last_block_number,
+        last_log_index = excluded.last_log_index,
+        updated_at = excluded.updated_at
+      WHERE staking_positions.last_block_number IS NULL
+        OR CAST(excluded.last_block_number AS INTEGER) > CAST(staking_positions.last_block_number AS INTEGER)
+        OR (CAST(excluded.last_block_number AS INTEGER) = CAST(staking_positions.last_block_number AS INTEGER)
+          AND excluded.last_log_index >= COALESCE(staking_positions.last_log_index, -1))
+    `).bind(
+      position.userId, position.walletAddress.toLocaleLowerCase(), position.amountUnits, position.unlockTime,
+      position.durationSeconds, position.reputationBps, position.rawPower, position.delegatedTo?.toLocaleLowerCase() ?? null,
+      position.votingPower, position.verified ? 1 : 0, position.lastTxHash, position.lastBlockNumber,
+      position.lastLogIndex, position.updatedAt,
+    ).run();
+    const row = await this.db.prepare('SELECT * FROM staking_positions WHERE user_id = ?').bind(position.userId).first<Row>();
+    return row ? mapStakingPosition(row) : position;
+  }
+
+  async listGovernanceCandidates(): Promise<Array<{ userId: string; walletAddress: string }>> {
+    const { results } = await this.db.prepare(`
+      SELECT id, lower(wallet_address) AS wallet_address FROM profiles
+      WHERE wallet_address IS NOT NULL AND wallet_address <> ''
+      ORDER BY id ASC
+    `).all<Row>();
+    return results
+      .map((row) => ({ userId: text(row.id), walletAddress: text(row.wallet_address) }))
+      .filter((item) => /^0x[a-f0-9]{40}$/.test(item.walletAddress));
+  }
+
+  async createEcosystemProposal(proposal: EcosystemProposal, electorate: GovernancePowerSnapshot[]): Promise<EcosystemGovernanceDetail> {
+    const statements: D1Statement[] = [this.db.prepare(`
+      INSERT INTO governance_proposals
+        (id, proposal_number, proposer_id, proposal_type, title, description, payload_json, status,
+         snapshot_block, starts_at, ends_at, quorum_bps, approval_bps, eligible_power,
+         for_power, against_power, abstain_power, finalized_at, finalized_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      proposal.id, proposal.proposalNumber, proposal.proposerId, proposal.proposalType, proposal.title,
+      proposal.description, JSON.stringify(proposal.payload), proposal.status, proposal.snapshotBlock,
+      proposal.startsAt, proposal.endsAt, proposal.quorumBps, proposal.approvalBps, proposal.eligiblePower,
+      proposal.forPower, proposal.againstPower, proposal.abstainPower, proposal.finalizedAt,
+      proposal.finalizedBy, proposal.createdAt,
+    )];
+    for (const snapshot of electorate) {
+      statements.push(this.db.prepare(`
+        INSERT INTO governance_power_snapshots
+          (proposal_id, user_id, wallet_address, power, delegate_sources_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(
+        snapshot.proposalId, snapshot.userId, snapshot.walletAddress.toLocaleLowerCase(), snapshot.power,
+        JSON.stringify(snapshot.delegateSources), snapshot.createdAt,
+      ));
+    }
+    statements.push(this.db.prepare(`
+      INSERT INTO yd_admin_actions (id, actor_id, action, target_id, detail_json, created_at)
+      VALUES (?, ?, 'governance_proposal_created', ?, ?, ?)
+    `).bind(
+      `YDACTION-${crypto.randomUUID()}`, proposal.proposerId, proposal.id,
+      JSON.stringify({ snapshotBlock: proposal.snapshotBlock, eligiblePower: proposal.eligiblePower }), proposal.createdAt,
+    ));
+    await this.db.batch(statements);
+    return (await this.getEcosystemGovernance(proposal.id, proposal.proposerId, proposal.createdAt))!;
+  }
+
+  private async getEcosystemGovernance(id: string, userId: string, now = new Date().toISOString()): Promise<EcosystemGovernanceDetail | null> {
+    const proposalRow = await this.db.prepare('SELECT * FROM governance_proposals WHERE id = ?').bind(id).first<Row>();
+    if (!proposalRow) return null;
+    const [snapshotRows, voteRows] = await Promise.all([
+      this.db.prepare('SELECT * FROM governance_power_snapshots WHERE proposal_id = ? ORDER BY user_id ASC').bind(id).all<Row>(),
+      this.db.prepare('SELECT * FROM governance_votes WHERE proposal_id = ? ORDER BY created_at ASC, id ASC').bind(id).all<Row>(),
+    ]);
+    const proposal = mapEcosystemProposal(proposalRow);
+    const electorate = snapshotRows.results.map(mapGovernanceSnapshot);
+    const votes = voteRows.results.map(mapEcosystemVote);
+    const snapshot = electorate.find((item) => item.userId === userId);
+    const vote = votes.find((item) => item.voterId === userId);
+    return {
+      proposal,
+      electorate,
+      votes,
+      currentUser: {
+        eligible: Boolean(snapshot),
+        canVote: Boolean(snapshot) && !vote && proposal.status === 'active'
+          && Date.parse(now) >= Date.parse(proposal.startsAt) && Date.parse(now) <= Date.parse(proposal.endsAt),
+        hasVoted: Boolean(vote),
+        power: snapshot?.power ?? '0',
+        choice: vote?.choice ?? null,
+      },
+    };
+  }
+
+  async listEcosystemGovernance(userId: string, now = new Date().toISOString()): Promise<EcosystemGovernanceDetail[]> {
+    const { results } = await this.db.prepare('SELECT id FROM governance_proposals ORDER BY proposal_number DESC').all<Row>();
+    const details = await Promise.all(results.map((row) => this.getEcosystemGovernance(text(row.id), userId, now)));
+    return details.filter((detail): detail is EcosystemGovernanceDetail => detail !== null);
+  }
+
+  async castEcosystemVote(
+    id: string,
+    voterId: string,
+    choice: EcosystemVoteChoice,
+    reason: string,
+    votedAt: string,
+  ): Promise<EcosystemVoteResult> {
+    const governance = await this.getEcosystemGovernance(id, voterId, votedAt);
+    if (!governance) return { state: 'missing' };
+    if (!governance.currentUser.eligible) return { state: 'not_eligible' };
+    if (governance.currentUser.hasVoted) return { state: 'already_voted' };
+    if (governance.proposal.status !== 'active') return { state: 'closed' };
+    if (Date.parse(votedAt) < Date.parse(governance.proposal.startsAt) || Date.parse(votedAt) > Date.parse(governance.proposal.endsAt)) {
+      return { state: 'expired' };
+    }
+    const voteId = `YDVOTE-${crypto.randomUUID()}`;
+    const results = await this.db.batch([
+      this.db.prepare(`
+        INSERT OR IGNORE INTO governance_votes
+          (id, proposal_id, voter_id, wallet_address, choice, power, reason, created_at)
+        SELECT ?, p.id, s.user_id, s.wallet_address, ?, s.power, ?, ?
+        FROM governance_proposals p JOIN governance_power_snapshots s ON s.proposal_id = p.id
+        WHERE p.id = ? AND s.user_id = ? AND p.status = 'active'
+          AND julianday(?) >= julianday(p.starts_at) AND julianday(?) <= julianday(p.ends_at)
+      `).bind(voteId, choice, reason, votedAt, id, voterId, votedAt, votedAt),
+      this.db.prepare(`
+        UPDATE governance_proposals SET
+          for_power = CAST(CAST(for_power AS INTEGER) + CASE WHEN ? = 'for' THEN (SELECT CAST(power AS INTEGER) FROM governance_votes WHERE id = ?) ELSE 0 END AS TEXT),
+          against_power = CAST(CAST(against_power AS INTEGER) + CASE WHEN ? = 'against' THEN (SELECT CAST(power AS INTEGER) FROM governance_votes WHERE id = ?) ELSE 0 END AS TEXT),
+          abstain_power = CAST(CAST(abstain_power AS INTEGER) + CASE WHEN ? = 'abstain' THEN (SELECT CAST(power AS INTEGER) FROM governance_votes WHERE id = ?) ELSE 0 END AS TEXT)
+        WHERE id = ? AND EXISTS (SELECT 1 FROM governance_votes WHERE id = ?)
+      `).bind(choice, voteId, choice, voteId, choice, voteId, id, voteId),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) {
+      const latest = await this.getEcosystemGovernance(id, voterId, votedAt);
+      if (latest?.currentUser.hasVoted) return { state: 'already_voted' };
+      return { state: 'closed' };
+    }
+    return { state: 'applied', governance: (await this.getEcosystemGovernance(id, voterId, votedAt))! };
+  }
+
+  async finalizeEcosystemProposal(id: string, actorId: string, finalizedAt: string): Promise<EcosystemFinalizeResult> {
+    const governance = await this.getEcosystemGovernance(id, actorId, finalizedAt);
+    if (!governance) return { state: 'missing' };
+    if (governance.proposal.status !== 'active') return { state: 'finalized', governance };
+    const evaluation = evaluateEcosystemProposal(
+      governance.proposal,
+      finalizedAt,
+      governance.votes.length,
+      governance.electorate.length,
+    );
+    if (!evaluation.finalizable) return { state: 'not_ready', governance };
+    await this.db.batch([this.db.prepare(`
+      UPDATE governance_proposals SET status = ?, finalized_at = ?, finalized_by = ?
+      WHERE id = ? AND status = 'active'
+    `).bind(evaluation.status, finalizedAt, actorId, id), this.db.prepare(`
+      INSERT INTO yd_admin_actions (id, actor_id, action, target_id, detail_json, created_at)
+      SELECT ?, ?, 'governance_proposal_finalized', ?, ?, ?
+      WHERE EXISTS (SELECT 1 FROM governance_proposals WHERE id = ? AND finalized_at = ?)
+    `).bind(
+      `YDACTION-${crypto.randomUUID()}`, actorId, id, JSON.stringify({ status: evaluation.status }), finalizedAt, id, finalizedAt,
+    )]);
+    return { state: 'finalized', governance: (await this.getEcosystemGovernance(id, actorId, finalizedAt))! };
   }
 
   async claimIdempotent(userId: string, key: string, method: string, path: string, requestHash: string): Promise<IdempotencyClaim> {

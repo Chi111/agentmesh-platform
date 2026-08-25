@@ -10,8 +10,9 @@
   "packageManager": "npm@10.9.4",
   "scripts": {
     "dev": "wrangler dev --config backend/wrangler.toml",
-    "build:contracts": "solcjs --bin --abi --base-path . --include-path node_modules --output-dir dist-contracts contracts/AgentMeshEscrow.sol",
+    "build:contracts": "solcjs --bin --abi --base-path . --include-path node_modules --output-dir dist-contracts contracts/*.sol",
     "deploy:contract:sepolia": "node scripts/deployEscrow.mjs",
+    "deploy:yd:sepolia": "npm run build:contracts && node scripts/deployYdFinance.mjs",
     "smoke:contract:sepolia": "node scripts/smokeEscrow.mjs",
     "build:worker": "cd backend && wrangler deploy --dry-run --outdir ../dist-worker",
     "dev:frontend": "cd frontend && npm run dev",

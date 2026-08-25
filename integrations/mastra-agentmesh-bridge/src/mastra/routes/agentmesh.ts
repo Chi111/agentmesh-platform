@@ -81,10 +81,49 @@ export const agentmeshEndpoint = registerApiRoute('/agentmesh/invoke', {
   handler: async c => {
     const challenge = c.req.header('X-AgentMesh-Trial')?.trim();
     if (challenge) {
+      const agentId = c.req.header('X-AgentMesh-Agent-Id')?.trim();
+      if (!agentId) return c.json({ error: 'X-AgentMesh-Agent-Id is required for trial requests' }, 400);
+      let trialBody: JsonObject;
+      try {
+        const parsed = await c.req.json() as unknown;
+        trialBody = objectValue(parsed) ?? {};
+      } catch {
+        return c.json({ challenge, agentId, status: 'rejected', error: { code: 'TRIAL_INVALID_JSON' } }, 400);
+      }
+      if (trialBody.agentId !== agentId) {
+        return c.json({ challenge, agentId, status: 'rejected', error: { code: 'TRIAL_AGENT_ID_MISMATCH' } }, 400);
+      }
+      const trialCase = objectValue(trialBody.case);
+      const trialCaseId = typeof trialCase?.id === 'string' ? trialCase.id : 'structured_execution';
+      if (trialCaseId === 'error_handling') {
+        return c.json({
+          challenge,
+          agentId,
+          status: 'rejected',
+          error: { code: 'TRIAL_VALIDATION_ERROR', message: 'The synthetic invalid input was rejected as expected.' },
+        }, 422);
+      }
+      if (trialCaseId === 'artifact_delivery') {
+        return c.json({
+          challenge,
+          agentId,
+          status: 'accepted',
+          output: { artifact: { kind: 'structured-report', mimeType: 'application/json' } },
+        });
+      }
+      if (trialCaseId === 'engineering_capabilities') {
+        return c.json({
+          challenge,
+          agentId,
+          status: 'accepted',
+          output: { modes: ['analyze', 'implement', 'review'], verification: true },
+        });
+      }
       return c.json({
         challenge,
+        agentId,
         status: 'accepted',
-        output: { runtime: 'mastra', protocol: 'agentmesh.trial.v1' },
+        output: { runtime: 'mastra', protocol: 'agentmesh.trial.v3' },
       });
     }
 
