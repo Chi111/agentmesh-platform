@@ -8,6 +8,7 @@ import type {
   AgentTrial,
   Deliverable,
   Dispute,
+  LedgerExportPrivateArtifact,
   LedgerCursor,
   ExecutionEvent,
   IdempotentResult,
@@ -26,6 +27,8 @@ import type {
   UserRole,
   WorkflowEdge,
   WorkflowStage,
+  WorkflowTemplateDetail,
+  WorkflowTransitionCheckpoint,
   WorkflowViewport,
 } from './contracts';
 import { isAgentMarketEligible, qualityGateMode } from './agentQuality';
@@ -64,8 +67,9 @@ import {
   type SettlementEnv,
 } from './chain';
 import { D1PlatformStore, type D1Database } from './store';
-import { AGENTMESH_TESTNET_SETTLEMENT, isWeb3Payment } from './payments';
+import { AGENTMESH_TESTNET_SETTLEMENT, isWeb3Payment, paymentBudgetPrecision } from './payments';
 import {
+  artifactBelongsToCurrentAttempt,
   hasMeaningfulStageOutput,
   stageRequiresArtifact,
   structuredStageResult,
@@ -74,19 +78,31 @@ import {
 import {
   blockedNodeIds,
   incomingStageIds,
+  layoutWorkflowStages,
   linearEdges,
   normalizeViewport,
+  outgoingStageIds,
   readyNodes,
+  topologicalOrder,
   validateWorkflowGraph,
   workflowAggregate,
   WorkflowValidationError,
 } from './workflowGraph';
+import {
+  applyWorkflowMappings,
+  assertWorkflowMappedInputSize,
+  evaluateWorkflowCondition,
+  validateWorkflowCondition,
+  validateWorkflowMappings,
+  WorkflowDslError,
+} from './workflowDsl';
 import {
   adaptiveFallbackCompilation,
   compileWorkflowWithLangGraph,
   type WorkflowCompilerMetadata,
 } from './workflowCompiler';
 import { REWARD_FORMULA_VERSION } from './ydFinance';
+import { EXPORT_DOWNLOAD_TOKEN_MS } from './exportJobs';
 import {
   readGovernancePowerSnapshot,
   syncStakingTransaction,
@@ -107,6 +123,7 @@ export interface Env extends PinmeEnv, PrivyEnv, SettlementEnv, YdChainEnv {
   AGENT_ENDPOINT_ALLOWLIST?: string;
   PUBLIC_BASE_URL?: string;
   AGENT_QUALITY_GATE_MODE?: string;
+  EXPORT_SERVICE_TOKEN?: string;
 }
 
 interface WorkerExecutionContext {
@@ -127,6 +144,7 @@ interface AppDependencies {
   ydClaimVerifier?: typeof verifyRewardClaim;
   ydStakingSynchronizer?: typeof syncStakingTransaction;
   ydPowerSnapshotReader?: typeof readGovernancePowerSnapshot;
+  exportDownloadIssuer?: (env: Env, artifact: LedgerExportPrivateArtifact, expiresAt: string) => Promise<{ url: string; expiresAt: string }>;
 }
 
 const BUILTIN_AGENT_PROFILES = {
@@ -337,6 +355,24 @@ function testTopupEnabled(env: Env): boolean {
   return env.PROJECT_NAME?.trim() === AGENTMESH_TESTNET_SETTLEMENT.projectName;
 }
 
+function constantTimeTokenEqual(left: string, right: string): boolean {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  let difference = leftBytes.length ^ rightBytes.length;
+  const length = Math.max(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    difference |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
+  }
+  return difference === 0;
+}
+
+function requireExportService(request: Request, env: Env): void {
+  const configured = env.EXPORT_SERVICE_TOKEN?.trim();
+  if (!configured) throw new ApiError(503, 'EXPORT_SERVICE_NOT_CONFIGURED', 'The private export service is not configured');
+  const provided = request.headers.get('X-Export-Service-Token')?.trim() ?? '';
+  if (!constantTimeTokenEqual(provided, configured)) throw new ApiError(401, 'INVALID_EXPORT_SERVICE_TOKEN', 'Export service authentication failed');
+}
+
 function corsHeaders(request: Request, env: Env): Record<string, string> {
   const configured = configuredOrigins(env);
   const requestOrigin = request.headers.get('Origin')?.trim();
@@ -345,7 +381,7 @@ function corsHeaders(request: Request, env: Env): Record<string, string> {
   return {
     ...(allowedOrigin ? { 'Access-Control-Allow-Origin': allowedOrigin } : {}),
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Privy-Id-Token, Idempotency-Key, X-AgentMesh-Signature',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Privy-Id-Token, Idempotency-Key, X-AgentMesh-Signature, X-Export-Service-Token',
     'Access-Control-Max-Age': '86400',
     'Cache-Control': 'no-store',
     'Cross-Origin-Resource-Policy': 'cross-origin',
@@ -561,6 +597,8 @@ function workflowDraftFromBody(
       agentId,
       input: normalizedInput,
       output: null,
+      attemptNo: existing?.attemptNo ?? 1,
+      attemptCreatedAt: existing?.attemptCreatedAt ?? now,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -568,13 +606,20 @@ function workflowDraftFromBody(
   const edges = body.edges.map((value): WorkflowEdge => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ApiError(400, 'INVALID_EDGE', 'Every edge must be an object');
     const edge = value as Record<string, unknown>;
-    return {
-      id: typeof edge.id === 'string' && edge.id.trim() ? edge.id.trim().slice(0, 120) : makeId('EDGE'),
-      missionId: mission.id,
-      sourceStageId: requiredString(edge, 'sourceStageId', 1, 120),
-      targetStageId: requiredString(edge, 'targetStageId', 1, 120),
-      createdAt: now,
-    };
+    try {
+      return {
+        id: typeof edge.id === 'string' && edge.id.trim() ? edge.id.trim().slice(0, 120) : makeId('EDGE'),
+        missionId: mission.id,
+        sourceStageId: requiredString(edge, 'sourceStageId', 1, 120),
+        targetStageId: requiredString(edge, 'targetStageId', 1, 120),
+        condition: edge.condition === undefined || edge.condition === null ? null : validateWorkflowCondition(edge.condition),
+        mappings: validateWorkflowMappings(edge.mappings),
+        createdAt: now,
+      };
+    } catch (error) {
+      if (error instanceof WorkflowDslError) throw new ApiError(400, error.code, error.message);
+      throw error;
+    }
   });
   const expectedVersion = Number(body.workflowVersion);
   if (!Number.isInteger(expectedVersion) || expectedVersion < 1) throw new ApiError(400, 'VALIDATION_ERROR', 'workflowVersion must be a positive integer');
@@ -616,6 +661,7 @@ function callbackArtifacts(
   body: Record<string, unknown>,
   missionId: string,
   stageId: string,
+  attemptNo: number,
   agentId: string,
   createdAt: string,
 ): Deliverable[] {
@@ -635,6 +681,7 @@ function callbackArtifacts(
       id: makeId('DEL'),
       missionId,
       stageId,
+      attemptNo,
       agentId,
       name: requiredString(artifact, 'name', 2, 180),
       uri: safeUrl(requiredString(artifact, 'uri', 8, 2_000), `artifacts[${index}].uri`),
@@ -695,11 +742,97 @@ function normalizedStringList(value: unknown): string[] | undefined {
   return result.length > 0 ? result : undefined;
 }
 
+const CALLBACK_RESULT_STANDARD_KEYS = new Set([
+  'summary', 'deliverable', 'recommendation', 'findings', 'risks', 'verified',
+  'completionStatus', 'model', 'agentTier', 'verification', 'changes',
+]);
+const CALLBACK_OUTPUT_ENVELOPE_KEYS = new Set(['result', 'runtime', 'source', 'error']);
+const CALLBACK_OUTPUT_OMITTED_KEYS = new Set([
+  'rawmodelresponse', 'debugpayload', 'artifactid', 'apikey', 'authorization', 'accesstoken',
+]);
+const CALLBACK_CUSTOM_RESULT_MAX_BYTES = 16_000;
+const CALLBACK_CUSTOM_RESULT_MAX_DEPTH = 12;
+const CALLBACK_CUSTOM_RESULT_MAX_NODES = 1_000;
+const CALLBACK_CUSTOM_RESULT_MAX_COLLECTION_ITEMS = 100;
+const CALLBACK_CUSTOM_RESULT_MAX_KEY_LENGTH = 200;
+const CALLBACK_CUSTOM_RESULT_MAX_STRING_LENGTH = 16_000;
+const CALLBACK_OUTPUT_DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+function callbackOutputKeyFingerprint(value: string): string {
+  return value.toLocaleLowerCase().replaceAll('_', '').replaceAll('-', '');
+}
+
+function normalizeCallbackCustomResult(source: Record<string, unknown>, hasEnvelope: boolean): Record<string, unknown> {
+  let nodes = 0;
+  const visit = (value: unknown, depth: number): unknown => {
+    nodes += 1;
+    if (nodes > CALLBACK_CUSTOM_RESULT_MAX_NODES) {
+      throw new ApiError(400, 'CALLBACK_OUTPUT_TOO_LARGE', 'Custom callback output exceeds the node limit');
+    }
+    if (depth > CALLBACK_CUSTOM_RESULT_MAX_DEPTH) {
+      throw new ApiError(400, 'CALLBACK_OUTPUT_TOO_DEEP', 'Custom callback output exceeds the depth limit');
+    }
+    if (value === null || typeof value === 'boolean') return value;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw new ApiError(400, 'INVALID_CALLBACK_OUTPUT', 'Custom callback output numbers must be finite');
+      return value;
+    }
+    if (typeof value === 'string') {
+      if (value.length > CALLBACK_CUSTOM_RESULT_MAX_STRING_LENGTH) {
+        throw new ApiError(400, 'CALLBACK_OUTPUT_TOO_LARGE', 'Custom callback output contains an oversized string');
+      }
+      return value;
+    }
+    if (Array.isArray(value)) {
+      if (value.length > CALLBACK_CUSTOM_RESULT_MAX_COLLECTION_ITEMS) {
+        throw new ApiError(400, 'CALLBACK_OUTPUT_TOO_LARGE', 'Custom callback output contains an oversized array');
+      }
+      return value.map((item) => visit(item, depth + 1));
+    }
+    const record = objectRecord(value);
+    if (!record) throw new ApiError(400, 'INVALID_CALLBACK_OUTPUT', 'Custom callback output must contain only JSON values');
+    const entries = Object.entries(record);
+    if (entries.length > CALLBACK_CUSTOM_RESULT_MAX_COLLECTION_ITEMS) {
+      throw new ApiError(400, 'CALLBACK_OUTPUT_TOO_LARGE', 'Custom callback output contains too many object fields');
+    }
+    const normalized = Object.create(null) as Record<string, unknown>;
+    for (const [key, item] of entries) {
+      if (key.length > CALLBACK_CUSTOM_RESULT_MAX_KEY_LENGTH) {
+        throw new ApiError(400, 'CALLBACK_OUTPUT_TOO_LARGE', 'Custom callback output contains an oversized key');
+      }
+      if (CALLBACK_OUTPUT_DANGEROUS_KEYS.has(key)) {
+        throw new ApiError(400, 'UNSAFE_CALLBACK_OUTPUT', 'Custom callback output contains an unsafe object key');
+      }
+      if (CALLBACK_OUTPUT_OMITTED_KEYS.has(callbackOutputKeyFingerprint(key))) continue;
+      normalized[key] = visit(item, depth + 1);
+    }
+    return normalized;
+  };
+
+  const custom = Object.create(null) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(source)) {
+    if (CALLBACK_RESULT_STANDARD_KEYS.has(key) || (hasEnvelope && CALLBACK_OUTPUT_ENVELOPE_KEYS.has(key))) continue;
+    if (CALLBACK_OUTPUT_DANGEROUS_KEYS.has(key)) {
+      throw new ApiError(400, 'UNSAFE_CALLBACK_OUTPUT', 'Custom callback output contains an unsafe object key');
+    }
+    if (CALLBACK_OUTPUT_OMITTED_KEYS.has(callbackOutputKeyFingerprint(key))) continue;
+    custom[key] = visit(value, 1);
+  }
+  const serialized = JSON.stringify(custom);
+  if (new TextEncoder().encode(serialized).byteLength > CALLBACK_CUSTOM_RESULT_MAX_BYTES) {
+    throw new ApiError(400, 'CALLBACK_OUTPUT_TOO_LARGE', 'Custom callback output exceeds the serialized size limit');
+  }
+  if (containsSensitiveCredential(serialized)) {
+    throw new ApiError(400, 'SENSITIVE_CALLBACK_OUTPUT', 'Custom callback output must not contain credentials');
+  }
+  return custom;
+}
+
 function normalizeCallbackOutput(output: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (!output) return undefined;
   const wrappedResult = objectRecord(output.result);
   const source = wrappedResult ?? output;
-  const result: Record<string, unknown> = {};
+  const result = normalizeCallbackCustomResult(source, wrappedResult === null);
   for (const key of ['summary', 'deliverable', 'recommendation'] as const) {
     const value = source[key];
     if (typeof value === 'string' && value.trim()) result[key] = value.trim().slice(0, key === 'deliverable' ? 50_000 : 20_000);
@@ -1110,7 +1243,7 @@ function queryLimit(url: URL, fallback: number, maximum: number): number {
 }
 
 async function missionDetail(store: PlatformStore, mission: Mission, now = new Date().toISOString()): Promise<MissionDetail> {
-  const [stages, edges, offers, events, deliverables, escrow, disputes] = await Promise.all([
+  const [stages, edges, offers, events, deliverables, escrow, disputes, changeRequests, checkpoints, transitions] = await Promise.all([
     store.listStages(mission.id),
     store.listEdges(mission.id),
     store.listStageOffers(mission.id, now),
@@ -1118,8 +1251,13 @@ async function missionDetail(store: PlatformStore, mission: Mission, now = new D
     store.listDeliverables(mission.id),
     store.getEscrow(mission.id),
     store.getDisputes(mission.id),
+    store.listMissionChangeRequests(mission.id),
+    store.listWorkflowCheckpoints(mission.id),
+    // Mission detail and SSE are hot paths. The full append-only history remains
+    // in D1, while the response is bounded by the graph's current edge set.
+    store.listCurrentWorkflowTransitions(mission.id),
   ]);
-  return { mission, stages, edges, offers, events, deliverables, escrow, disputes };
+  return { mission, stages, edges, offers, events, deliverables, escrow, disputes, changeRequests, checkpoints, transitions };
 }
 
 const OFFER_WINDOW_MS = 24 * 60 * 60 * 1_000;
@@ -1139,6 +1277,282 @@ function stableJson(value: unknown): string {
 async function canonicalRequestHash(payload: unknown): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(stableJson(payload)));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function workflowTemplateSemanticPayload(nodes: WorkflowStage[], edges: WorkflowEdge[]) {
+  return {
+    nodes: nodes.map(({
+      createdAt: _createdAt,
+      updatedAt: _updatedAt,
+      attemptCreatedAt: _attemptCreatedAt,
+      missionId: _missionId,
+      ...node
+    }) => node),
+    edges: edges.map(({ createdAt: _createdAt, missionId: _missionId, ...edge }) => edge),
+  };
+}
+
+async function buildWorkflowTemplateSnapshot(input: {
+  mission: Mission;
+  stages: WorkflowStage[];
+  edges: WorkflowEdge[];
+  selectedNodeIds: string[];
+  templateId: string;
+  now: string;
+}): Promise<Pick<WorkflowTemplateDetail['version'], 'nodes' | 'edges' | 'entryIds' | 'exitIds' | 'contentHash'>> {
+  const { mission, stages, edges, selectedNodeIds, templateId, now } = input;
+  const selectedIds = selectedNodeIds.length ? new Set(selectedNodeIds) : new Set(stages.map((stage) => stage.id));
+  if (selectedIds.size === 0 || [...selectedIds].some((id) => !stages.some((stage) => stage.id === id))) {
+    throw new ApiError(400, 'INVALID_TEMPLATE_SELECTION', 'Template selection contains an unknown workflow node');
+  }
+  const selectedStages = stages.filter((stage) => selectedIds.has(stage.id));
+  const selectedEdges = edges.filter((edge) => selectedIds.has(edge.sourceStageId) && selectedIds.has(edge.targetStageId));
+  const selectedBudget = selectedStages
+    .filter((stage) => stage.nodeType === 'task')
+    .reduce((sum, stage) => sum + stage.budget, 0);
+  if (selectedBudget <= 0) throw new ApiError(400, 'INVALID_TEMPLATE_BUDGET', 'A template requires at least one funded task node');
+  try {
+    validateWorkflowGraph({ mission: { ...mission, budget: selectedBudget }, stages: selectedStages, edges: selectedEdges });
+  } catch (error) {
+    graphApiError(error);
+  }
+
+  const ordered = topologicalOrder(selectedStages, selectedEdges);
+  const localIdBySource = new Map(ordered.map((stage, index) => [stage.id, `NODE-${index + 1}`]));
+  const minimumX = Math.min(...ordered.map((stage) => stage.positionX));
+  const minimumY = Math.min(...ordered.map((stage) => stage.positionY));
+  const nodes = ordered.map((stage, index): WorkflowStage => {
+    const normalizedInput = { ...stage.input };
+    delete normalizedInput.mappedInput;
+    delete normalizedInput.transitionCheckpoints;
+    delete normalizedInput.template;
+    return {
+      ...stage,
+      id: localIdBySource.get(stage.id)!,
+      missionId: templateId,
+      position: index + 1,
+      positionX: stage.positionX - minimumX + 40,
+      positionY: stage.positionY - minimumY + 40,
+      progress: 0,
+      status: 'queued',
+      agentId: null,
+      input: normalizedInput,
+      output: null,
+      attemptNo: 1,
+      attemptCreatedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+  });
+  const normalizedEdges = selectedEdges.map((edge, index): WorkflowEdge => ({
+    ...edge,
+    id: `EDGE-${index + 1}`,
+    missionId: templateId,
+    sourceStageId: localIdBySource.get(edge.sourceStageId)!,
+    targetStageId: localIdBySource.get(edge.targetStageId)!,
+    createdAt: now,
+  }));
+  const entryIds = nodes.filter((node) => incomingStageIds(node.id, normalizedEdges).length === 0).map((node) => node.id);
+  const exitIds = nodes.filter((node) => outgoingStageIds(node.id, normalizedEdges).length === 0).map((node) => node.id);
+  const templateMission = { ...mission, id: templateId, budget: selectedBudget };
+  let validatedNodes: WorkflowStage[];
+  try {
+    validatedNodes = validateWorkflowGraph({ mission: templateMission, stages: nodes, edges: normalizedEdges });
+  } catch (error) {
+    graphApiError(error);
+  }
+  const contentHash = `sha256:${await canonicalRequestHash({
+    ...workflowTemplateSemanticPayload(validatedNodes, normalizedEdges),
+    entryIds,
+    exitIds,
+  })}`;
+  return { nodes: validatedNodes, edges: normalizedEdges, entryIds, exitIds, contentHash };
+}
+
+function allocatedTemplateBudgets(
+  tasks: Array<{ weight: number }>,
+  budget: number,
+  paymentMethod: PaymentMethod,
+): number[] {
+  const precision = paymentBudgetPrecision(paymentMethod);
+  const scale = 10 ** precision;
+  const totalUnits = Math.round(budget * scale);
+  if (Math.abs(totalUnits / scale - budget) > Number.EPSILON * Math.max(1, budget) * 8) {
+    throw new ApiError(400, 'INVALID_BUDGET_PRECISION', `budget supports at most ${precision} decimal places`);
+  }
+  const totalWeight = tasks.reduce((sum, task) => sum + task.weight, 0);
+  if (tasks.length === 0 || totalWeight <= 0 || totalUnits <= 0) {
+    throw new ApiError(400, 'INVALID_TEMPLATE_BUDGET', 'Template expansion requires a positive task budget');
+  }
+  const rawUnits = tasks.map((task) => totalUnits * task.weight / totalWeight);
+  const units = rawUnits.map(Math.floor);
+  let remainder = totalUnits - units.reduce((sum, value) => sum + value, 0);
+  const remainderOrder = rawUnits
+    .map((value, index) => ({ index, fraction: value - Math.floor(value) }))
+    .sort((left, right) => right.fraction - left.fraction || left.index - right.index);
+  for (let index = 0; index < remainder; index += 1) units[remainderOrder[index % remainderOrder.length].index] += 1;
+  return units.map((value) => value / scale);
+}
+
+function expandWorkflowTemplate(input: {
+  mission: Mission;
+  existingStages: WorkflowStage[];
+  existingEdges: WorkflowEdge[];
+  detail: WorkflowTemplateDetail;
+  iterations: number;
+  budget: number;
+  replace: boolean;
+  attachAfterStageId: string | null;
+  attachBeforeStageId: string | null;
+  expectedVersion: number;
+  now: string;
+}): { stages: WorkflowStage[]; edges: WorkflowEdge[] } {
+  const {
+    mission, existingStages, existingEdges, detail, iterations, budget, replace,
+    attachAfterStageId, attachBeforeStageId, expectedVersion, now,
+  } = input;
+  if (!Number.isInteger(iterations) || iterations < 1 || iterations > 5) {
+    throw new ApiError(400, 'INVALID_LOOP_BOUND', 'iterations must be an integer between 1 and 5');
+  }
+  if (replace && (attachAfterStageId || attachBeforeStageId)) {
+    throw new ApiError(400, 'INVALID_TEMPLATE_ATTACHMENT', 'replace cannot be combined with attachment nodes');
+  }
+  if (!replace && !attachAfterStageId && !attachBeforeStageId) {
+    throw new ApiError(400, 'TEMPLATE_ATTACHMENT_REQUIRED', 'Choose an upstream or downstream attachment node');
+  }
+  const existingIds = new Set(existingStages.map((stage) => stage.id));
+  for (const attachmentId of [attachAfterStageId, attachBeforeStageId].filter((id): id is string => Boolean(id))) {
+    if (!existingIds.has(attachmentId)) throw new ApiError(400, 'INVALID_TEMPLATE_ATTACHMENT', `Attachment node ${attachmentId} does not exist`);
+  }
+  if (attachAfterStageId && attachAfterStageId === attachBeforeStageId) {
+    throw new ApiError(400, 'INVALID_TEMPLATE_ATTACHMENT', 'Upstream and downstream attachment nodes must differ');
+  }
+  const replacedEdge = !replace && attachAfterStageId && attachBeforeStageId
+    ? existingEdges.find((edge) => edge.sourceStageId === attachAfterStageId && edge.targetStageId === attachBeforeStageId)
+    : null;
+  if (replacedEdge && (replacedEdge.condition || replacedEdge.mappings?.length)) {
+    throw new ApiError(
+      400,
+      'TEMPLATE_ATTACHMENT_RULED_EDGE',
+      'A template cannot replace an edge with a condition or field mappings; attach at one endpoint or remove the edge rule first',
+    );
+  }
+
+  const taskTemplates = detail.version.nodes.filter((node) => node.nodeType === 'task');
+  const weightedTasks = Array.from({ length: iterations }, () => taskTemplates.map((node) => ({ weight: node.budget }))).flat();
+  const budgets = allocatedTemplateBudgets(weightedTasks, budget, mission.paymentMethod);
+  let budgetIndex = 0;
+  const scopeToken = `${mission.id}-${expectedVersion}-${detail.template.id}-v${detail.version.version}`
+    .replace(/[^A-Za-z0-9_-]/g, '')
+    .slice(-64);
+  const cloneIds: Array<Map<string, string>> = [];
+  const clonedStages: WorkflowStage[] = [];
+  const clonedEdges: WorkflowEdge[] = [];
+  for (let iteration = 1; iteration <= iterations; iteration += 1) {
+    const nodeIds = new Map(detail.version.nodes.map((node, index) => [node.id, `STAGE-${scopeToken}-i${iteration}-n${index + 1}`]));
+    cloneIds.push(nodeIds);
+    detail.version.nodes.forEach((node, index) => {
+      clonedStages.push({
+        ...node,
+        id: nodeIds.get(node.id)!,
+        missionId: mission.id,
+        position: 0,
+        progress: 0,
+        status: 'queued',
+        agentId: null,
+        budget: node.nodeType === 'task' ? budgets[budgetIndex++] : 0,
+        input: {
+          ...node.input,
+          template: {
+            templateId: detail.template.id,
+            version: detail.version.version,
+            localNodeId: node.id,
+            iteration,
+            iterations,
+            contentHash: detail.version.contentHash,
+          },
+        },
+        output: null,
+        attemptNo: 1,
+        attemptCreatedAt: now,
+        createdAt: now,
+        updatedAt: now,
+        positionX: node.positionX + (iteration - 1) * 400,
+        positionY: node.positionY,
+      });
+    });
+    detail.version.edges.forEach((edge, index) => {
+      clonedEdges.push({
+        ...edge,
+        id: `EDGE-${scopeToken}-i${iteration}-e${index + 1}`,
+        missionId: mission.id,
+        sourceStageId: nodeIds.get(edge.sourceStageId)!,
+        targetStageId: nodeIds.get(edge.targetStageId)!,
+        createdAt: now,
+      });
+    });
+  }
+  for (let iteration = 1; iteration < iterations; iteration += 1) {
+    detail.version.exitIds.forEach((exitId, exitIndex) => {
+      detail.version.entryIds.forEach((entryId, entryIndex) => {
+        clonedEdges.push({
+          id: `EDGE-${scopeToken}-loop${iteration}-x${exitIndex + 1}-n${entryIndex + 1}`,
+          missionId: mission.id,
+          sourceStageId: cloneIds[iteration - 1].get(exitId)!,
+          targetStageId: cloneIds[iteration].get(entryId)!,
+          createdAt: now,
+        });
+      });
+    });
+  }
+
+  let baseStages = existingStages;
+  if (!replace) {
+    const remainingBudget = mission.budget - budget;
+    if (remainingBudget <= 0) {
+      throw new ApiError(400, 'INVALID_TEMPLATE_BUDGET', 'An attached template must leave a positive budget for existing task nodes');
+    }
+    const existingTasks = existingStages.filter((stage) => stage.nodeType === 'task');
+    const existingBudgets = allocatedTemplateBudgets(
+      existingTasks.map((stage) => ({ weight: stage.budget })),
+      remainingBudget,
+      mission.paymentMethod,
+    );
+    let existingBudgetIndex = 0;
+    baseStages = existingStages.map((stage) => stage.nodeType === 'task'
+      ? { ...stage, budget: existingBudgets[existingBudgetIndex++], updatedAt: now }
+      : stage);
+  }
+  let stages = replace ? clonedStages : [...baseStages, ...clonedStages];
+  let edges = replace ? clonedEdges : [
+    ...existingEdges.filter((edge) => edge.id !== replacedEdge?.id),
+    ...clonedEdges,
+  ];
+  if (!replace && attachAfterStageId) {
+    edges = [...edges, ...detail.version.entryIds.map((entryId, index): WorkflowEdge => ({
+      id: `EDGE-${scopeToken}-attach-in-${index + 1}`,
+      missionId: mission.id,
+      sourceStageId: attachAfterStageId,
+      targetStageId: cloneIds[0].get(entryId)!,
+      createdAt: now,
+    }))];
+  }
+  if (!replace && attachBeforeStageId) {
+    edges = [...edges, ...detail.version.exitIds.map((exitId, index): WorkflowEdge => ({
+      id: `EDGE-${scopeToken}-attach-out-${index + 1}`,
+      missionId: mission.id,
+      sourceStageId: cloneIds[iterations - 1].get(exitId)!,
+      targetStageId: attachBeforeStageId,
+      createdAt: now,
+    }))];
+  }
+  stages = layoutWorkflowStages(stages, edges);
+  try {
+    stages = validateWorkflowGraph({ mission, stages, edges });
+  } catch (error) {
+    graphApiError(error);
+  }
+  return { stages, edges };
 }
 
 function parseJsonObject(content: string | undefined): Record<string, unknown> | null {
@@ -1161,6 +1575,8 @@ async function runBuiltinAgent(
   stage: WorkflowStage,
   stages: WorkflowStage[],
   edges: WorkflowEdge[],
+  mappedInput: Record<string, unknown>,
+  transitionCheckpoints: WorkflowTransitionCheckpoint[],
 ): Promise<{ output: Record<string, unknown>; source: 'pinme-llm' | 'deterministic-fallback' }> {
   const kind = builtinAgentKind(agent);
   if (!kind) throw new ApiError(409, 'BUILTIN_AGENT_INVALID', 'The official Agent runtime is not recognized');
@@ -1197,6 +1613,14 @@ async function runBuiltinAgent(
       input: stage.input,
     },
     upstream,
+    mappedInput,
+    transitionCheckpoints: transitionCheckpoints.map((checkpoint) => ({
+      id: checkpoint.id,
+      edgeId: checkpoint.edgeId,
+      sourceStageId: checkpoint.sourceStageId,
+      sourceAttemptNo: checkpoint.sourceAttemptNo,
+      matched: checkpoint.matched,
+    })),
   }, fallback);
 }
 
@@ -1273,13 +1697,35 @@ async function completeBuiltinAgentDispatch(input: {
   edges: WorkflowEdge[];
   stage: WorkflowStage;
   agent: Agent;
+  mappedInput: Record<string, unknown>;
+  transitionCheckpoints: WorkflowTransitionCheckpoint[];
   runId: string;
   expiresAt: string;
   now: Date;
 }): Promise<{ stage: WorkflowStage; mission: Mission | null; acknowledgement: Record<string, unknown> }> {
-  const { request, env, dependencies, store, mission, stages, edges, stage, agent, runId, expiresAt, now } = input;
-  const execution = await runBuiltinAgent(env, dependencies, agent, mission, stage, stages, edges);
+  const {
+    request, env, dependencies, store, mission, stages, edges, stage, agent,
+    mappedInput, transitionCheckpoints, runId, expiresAt, now,
+  } = input;
+  const execution = await runBuiltinAgent(
+    env, dependencies, agent, mission, stage, stages, edges, mappedInput, transitionCheckpoints,
+  );
   const completedAt = (dependencies.now?.() ?? new Date()).toISOString();
+  const deliverableId = makeId('DEL');
+  const contentHash = `sha256:${await canonicalRequestHash(execution.output)}`;
+  const deliverable: Deliverable = {
+    id: deliverableId,
+    missionId: mission.id,
+    stageId: stage.id,
+    attemptNo: stage.attemptNo,
+    agentId: agent.id,
+    name: `${stage.name} · ${agent.name} 结构化结果`,
+    uri: builtinDeliverableUri(request, env, mission.id),
+    contentHash,
+    mimeType: 'application/json',
+    status: 'submitted',
+    createdAt: completedAt,
+  };
   await store.addEvent({
     id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'dispatch.accepted',
     message: `${agent.name} 官方运行时已接收任务`, actorType: 'platform', actorId: null,
@@ -1295,31 +1741,18 @@ async function completeBuiltinAgentDispatch(input: {
     now: completedAt,
     status: 'done',
     output: execution.output,
+    artifacts: [deliverable],
     progress: Math.min(100, Math.round((stage.position / Math.max(stages.length, 1)) * 100)),
     currentStage: `${stage.name} 已完成`,
     event: {
       id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'stage.done',
       message: `${agent.name} 已生成结构化交付`, actorType: 'agent', actorId: agent.id,
-      payload: { source: execution.source, builtin: true }, createdAt: completedAt,
+      payload: { source: execution.source, builtin: true, deliverableId, contentHash }, createdAt: completedAt,
     },
   });
   if (callbackResult.state !== 'applied') {
     throw new ApiError(409, 'BUILTIN_AGENT_EXECUTION_CONFLICT', `Official Agent completion could not be applied: ${callbackResult.state}`);
   }
-  const deliverableId = makeId('DEL');
-  const contentHash = `sha256:${await canonicalRequestHash(execution.output)}`;
-  await store.addDeliverable({
-    id: deliverableId,
-    missionId: mission.id,
-    stageId: stage.id,
-    agentId: agent.id,
-    name: `${stage.name} · ${agent.name} 结构化结果`,
-    uri: builtinDeliverableUri(request, env, mission.id),
-    contentHash,
-    mimeType: 'application/json',
-    status: 'submitted',
-    createdAt: completedAt,
-  });
   await store.addEvent({
     id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'deliverable.submitted',
     message: `${agent.name} 已提交结构化交付物`, actorType: 'agent', actorId: agent.id,
@@ -1330,7 +1763,7 @@ async function completeBuiltinAgentDispatch(input: {
     store.listDeliverables(mission.id),
   ]);
   let latestMission = await store.getMission(mission.id);
-  if (workflowDeliveryReadiness(latestStages, latestDeliverables).ready) {
+  if (latestMission?.status !== 'paused' && workflowDeliveryReadiness(latestStages, latestDeliverables).ready) {
     latestMission = await store.submitMissionForReview(mission.id, reviewDueAt(now));
   }
   await deliverNotification(store, env, dependencies, {
@@ -1356,6 +1789,8 @@ interface NodeDispatchResult {
 }
 
 async function refreshWorkflowAggregate(store: PlatformStore, missionId: string): Promise<Mission | null> {
+  const mission = await store.getMission(missionId);
+  if (!mission || mission.status === 'paused') return mission;
   const [stages, edges] = await Promise.all([store.listStages(missionId), store.listEdges(missionId)]);
   const aggregate = workflowAggregate(stages, edges);
   return store.updateMissionWorkflowState(missionId, aggregate.progress, aggregate.currentStage);
@@ -1367,23 +1802,165 @@ async function activateReadyApprovals(
   actorId: string | null,
   now: string,
 ): Promise<WorkflowStage[]> {
+  const mission = await store.getMission(missionId);
+  if (!mission || mission.status !== 'running') return [];
   const [stages, edges] = await Promise.all([store.listStages(missionId), store.listEdges(missionId)]);
   const approvals = readyNodes(stages, edges).approvals;
+  const activatedApprovals: WorkflowStage[] = [];
   for (const gate of approvals) {
-    const activated = await store.updateStage(missionId, gate.id, 'running');
+    const activated = await store.transitionStage(missionId, gate.id, 'queued', 'running');
     if (!activated) continue;
+    activatedApprovals.push(activated);
     await store.addEvent({
       id: makeId('EVT'), missionId, stageId: gate.id, type: 'gate.awaiting_approval',
       message: `${gate.name} 正在等待任务方审批`, actorType: 'platform', actorId,
       payload: { criteria: gate.input.approvalCriteria ?? gate.purpose }, createdAt: now,
     });
   }
-  return approvals;
+  return activatedApprovals;
+}
+
+function mergeMappedInput(target: Record<string, unknown>, source: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(source)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const current = target[key];
+      const child = current && typeof current === 'object' && !Array.isArray(current)
+        ? current as Record<string, unknown>
+        : Object.create(null) as Record<string, unknown>;
+      target[key] = child;
+      mergeMappedInput(child, value as Record<string, unknown>);
+    } else {
+      target[key] = structuredClone(value);
+    }
+  }
+}
+
+function workflowDispatchInput(
+  store: PlatformStore,
+  missionId: string,
+  stageId: string,
+  stages: WorkflowStage[],
+): Promise<{ mappedInput: Record<string, unknown>; transitionCheckpoints: WorkflowTransitionCheckpoint[] }> {
+  return store.listCurrentWorkflowTransitions(missionId).then((checkpoints) => {
+    const transitionCheckpoints = checkpoints.filter((checkpoint) => (
+      checkpoint.targetStageId === stageId
+      && stages.find((candidate) => candidate.id === checkpoint.sourceStageId)?.attemptNo === checkpoint.sourceAttemptNo
+    ));
+    const mappedInput = Object.create(null) as Record<string, unknown>;
+    transitionCheckpoints.sort((left, right) => left.edgeId.localeCompare(right.edgeId))
+      .forEach((checkpoint) => mergeMappedInput(mappedInput, checkpoint.mappedInput));
+    try {
+      assertWorkflowMappedInputSize(mappedInput);
+    } catch (error) {
+      if (error instanceof WorkflowDslError) throw new ApiError(413, error.code, error.message);
+      throw error;
+    }
+    return { mappedInput, transitionCheckpoints };
+  });
+}
+
+export async function resolveWorkflowTransitions(
+  store: PlatformStore,
+  mission: Mission,
+  now: string,
+): Promise<{ stages: WorkflowStage[]; transitions: WorkflowTransitionCheckpoint[] }> {
+  if (mission.status !== 'running') return { stages: await store.listStages(mission.id), transitions: await store.listWorkflowTransitions(mission.id) };
+  let [stages, edges, transitions] = await Promise.all([
+    store.listStages(mission.id), store.listEdges(mission.id), store.listCurrentWorkflowTransitions(mission.id),
+  ]);
+  const stageById = new Map(stages.map((stage) => [stage.id, stage]));
+  const transitionKey = (edgeId: string, attemptNo: number) => `${edgeId}:${attemptNo}`;
+  const existing = new Set(transitions.map((checkpoint) => transitionKey(checkpoint.edgeId, checkpoint.sourceAttemptNo)));
+
+  for (const edge of edges) {
+    if (!edge.condition && !(edge.mappings?.length)) continue;
+    const source = stageById.get(edge.sourceStageId);
+    if (!source || source.status !== 'done' || existing.has(transitionKey(edge.id, source.attemptNo))) continue;
+    const output = structuredStageResult(source.output) ?? source.output ?? {};
+    let matched = true;
+    let mappedInput: Record<string, unknown> = {};
+    let missingRequired: string[] = [];
+    let errorCode: string | null = null;
+    try {
+      if (edge.condition) matched = evaluateWorkflowCondition(edge.condition, output);
+      if (edge.mappings?.length) {
+        const mapped = applyWorkflowMappings(edge.mappings, output);
+        mappedInput = mapped.mappedInput;
+        missingRequired = mapped.missingRequired;
+        if (missingRequired.length > 0) errorCode = 'MAPPING_REQUIRED_SOURCE_MISSING';
+      }
+    } catch (error) {
+      errorCode = error instanceof WorkflowDslError ? error.code : 'WORKFLOW_TRANSITION_FAILED';
+      matched = false;
+      mappedInput = {};
+    }
+    const recorded = await store.recordWorkflowTransition({
+      id: makeId('TRANSITION'), missionId: mission.id, edgeId: edge.id,
+      sourceStageId: edge.sourceStageId, targetStageId: edge.targetStageId,
+      sourceAttemptNo: source.attemptNo, workflowVersion: mission.workflowVersion,
+      matched, mappedInput, missingRequired, errorCode, createdAt: now,
+    });
+    transitions.push(recorded.checkpoint);
+    existing.add(transitionKey(edge.id, source.attemptNo));
+  }
+
+  transitions = await store.listCurrentWorkflowTransitions(mission.id);
+  const currentTransition = new Map(transitions.map((checkpoint) => [
+    transitionKey(checkpoint.edgeId, checkpoint.sourceAttemptNo), checkpoint,
+  ]));
+  for (const target of stages.filter((stage) => stage.status === 'queued')) {
+    const incoming = edges.filter((edge) => edge.targetStageId === target.id);
+    if (!incoming.length || incoming.some((edge) => stageById.get(edge.sourceStageId)?.status !== 'done')) continue;
+    const evaluated = incoming.map((edge) => {
+      const source = stageById.get(edge.sourceStageId)!;
+      return edge.condition || edge.mappings?.length
+        ? currentTransition.get(transitionKey(edge.id, source.attemptNo))
+        : null;
+    });
+    if (evaluated.some((checkpoint, index) => (incoming[index].condition || incoming[index].mappings?.length) && !checkpoint)) continue;
+    const transitionError = evaluated.find((checkpoint) => checkpoint?.errorCode)?.errorCode;
+    if (transitionError) {
+      const failed = await store.transitionStage(mission.id, target.id, 'queued', 'failed', {
+        summary: target.nodeType === 'task' ? '字段映射未通过运行时校验。' : '审批条件未通过运行时校验。',
+        error: { code: transitionError }, verified: false,
+      });
+      if (failed) await store.addEvent({
+        id: makeId('EVT'), missionId: mission.id, stageId: target.id,
+        type: target.nodeType === 'task' ? 'stage.mapping_failed' : 'gate.condition_failed',
+        message: target.nodeType === 'task' ? `${target.name} 因字段映射缺失而未派发` : `${target.name} 因条件求值错误而停止`,
+        actorType: 'platform', actorId: null,
+        payload: { errorCode: transitionError }, createdAt: now,
+      });
+      continue;
+    }
+    const conditional = incoming.map((edge, index) => edge.condition ? evaluated[index] : null).filter(Boolean);
+    if (target.nodeType === 'approval' && conditional.length > 0 && conditional.some((checkpoint) => !checkpoint!.matched)) {
+      const skipped = await store.transitionStage(mission.id, target.id, 'queued', 'done', {
+        summary: '条件未满足，审批 Gate 已跳过。', skipped: true, verified: true,
+      });
+      if (skipped) await store.addEvent({
+        id: makeId('EVT'), missionId: mission.id, stageId: target.id, type: 'gate.condition_skipped',
+        message: `${target.name} 的条件未满足，已跳过审批`, actorType: 'platform', actorId: null,
+        payload: { edgeIds: incoming.filter((edge) => edge.condition).map((edge) => edge.id) }, createdAt: now,
+      });
+    }
+  }
+  stages = await store.listStages(mission.id);
+  return { stages, transitions };
 }
 
 async function enqueueReadyTaskNodes(store: PlatformStore, missionId: string, now: string): Promise<WorkflowStage[]> {
+  const mission = await store.getMission(missionId);
+  if (!mission || mission.status !== 'running') return [];
+  await resolveWorkflowTransitions(store, mission, now);
   await activateReadyApprovals(store, missionId, null, now);
-  const [stages, edges] = await Promise.all([store.listStages(missionId), store.listEdges(missionId)]);
+  const [stages, edges, deliverables] = await Promise.all([
+    store.listStages(missionId), store.listEdges(missionId), store.listDeliverables(missionId),
+  ]);
+  if (workflowDeliveryReadiness(stages, deliverables).ready) {
+    await store.submitMissionForReview(missionId, reviewDueAt(new Date(now)));
+    return [];
+  }
   const tasks = readyNodes(stages, edges).tasks;
   await store.enqueueDispatches(missionId, tasks.map((stage) => stage.id), now);
   await refreshWorkflowAggregate(store, missionId);
@@ -1410,6 +1987,7 @@ async function dispatchTaskNode(input: {
   if (!agent || agent.status !== 'active') throw new ApiError(409, 'AGENT_UNAVAILABLE', 'Assigned Agent is not active');
   const callbackSecret = env.AGENT_WEBHOOK_SECRET?.trim() || env.API_KEY?.trim();
   if (!callbackSecret) throw new ApiError(503, 'CALLBACK_SIGNING_UNAVAILABLE', 'Agent callback signing is not configured');
+  const { mappedInput, transitionCheckpoints } = await workflowDispatchInput(store, mission.id, stage.id, stages);
   const claimedStage = stage.status === 'running' ? stage : await store.claimStageForDispatch(mission.id, stage.id);
   if (!claimedStage) throw new ApiError(409, 'STAGE_ALREADY_DISPATCHED', 'This task node is already running, completed, or blocked by dependencies');
   try {
@@ -1420,7 +1998,8 @@ async function dispatchTaskNode(input: {
     await store.createAgentDispatch({ runId, missionId: mission.id, stageId: stage.id, agentId: agent.id, expiresAt });
     if (builtinKind) {
       const completed = await completeBuiltinAgentDispatch({
-        request, env, dependencies, store, mission, stages, edges, stage: claimedStage, agent, runId, expiresAt, now,
+        request, env, dependencies, store, mission, stages, edges, stage: claimedStage, agent,
+        mappedInput, transitionCheckpoints, runId, expiresAt, now,
       });
       await refreshWorkflowAggregate(store, mission.id);
       return {
@@ -1445,7 +2024,7 @@ async function dispatchTaskNode(input: {
         // handoff summary rather than the complete predecessor output.
         output: handoffSummary(candidate),
         artifacts: upstreamArtifacts
-          .filter((artifact) => artifact.stageId === candidate.id)
+          .filter((artifact) => artifactBelongsToCurrentAttempt(candidate, artifact))
           .map((artifact) => ({
             id: artifact.id,
             name: artifact.name,
@@ -1473,6 +2052,11 @@ async function dispatchTaskNode(input: {
           name: stage.name, purpose: stage.purpose, category: stage.category, budget: stage.budget, input: stage.input,
         },
         upstream,
+        mappedInput,
+        transitionCheckpoints: transitionCheckpoints.map((checkpoint) => ({
+          id: checkpoint.id, edgeId: checkpoint.edgeId, sourceStageId: checkpoint.sourceStageId,
+          sourceAttemptNo: checkpoint.sourceAttemptNo, matched: checkpoint.matched,
+        })),
       },
       callback: { url: callbackUrl, signature: token, runId, expiresAt, callbackIdRequired: true },
     });
@@ -1550,6 +2134,9 @@ async function dispatchReadyWorkflowNodes(input: {
   cascadeBuiltin?: boolean;
 }): Promise<Array<NodeDispatchResult | { stageId: string; error: { status: number; code: string; message: string } }>> {
   const { request, env, dependencies, store, missionId, now, cascadeBuiltin = false } = input;
+  const currentMission = await store.getMission(missionId);
+  if (!currentMission) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+  if (currentMission.status !== 'running') return [];
   await enqueueReadyTaskNodes(store, missionId, now.toISOString());
   const [mission, stages, edges, agents, pending] = await Promise.all([
     store.getMission(missionId), store.listStages(missionId), store.listEdges(missionId), store.listAgents(),
@@ -1600,6 +2187,52 @@ async function dispatchReadyWorkflowNodes(input: {
     return [...results, ...downstream];
   }
   return results;
+}
+
+function downstreamStageIds(targetStageIds: string[], edges: WorkflowEdge[]): string[] {
+  const selected = new Set(targetStageIds);
+  const queue = [...targetStageIds];
+  while (queue.length) {
+    const sourceId = queue.shift()!;
+    for (const edge of edges) {
+      if (edge.sourceStageId !== sourceId || selected.has(edge.targetStageId)) continue;
+      selected.add(edge.targetStageId);
+      queue.push(edge.targetStageId);
+    }
+  }
+  return [...selected];
+}
+
+async function reconcileMissionRuntime(input: {
+  request: Request;
+  env: Env;
+  dependencies: AppDependencies;
+  store: PlatformStore;
+  missionId: string;
+  schedulerRevision: number;
+  actorId: string | null;
+  executionContext?: WorkerExecutionContext;
+}): Promise<void> {
+  const { request, env, dependencies, store, missionId, schedulerRevision, actorId, executionContext } = input;
+  const reconcile = async () => {
+    const mission = await store.getMission(missionId);
+    if (!mission || !['running', 'review'].includes(mission.status)) return;
+    if (mission.status === 'running') {
+      await store.recoverExpiredStageDispatches(missionId, (dependencies.now?.() ?? new Date()).toISOString());
+      const [stages, deliverables] = await Promise.all([store.listStages(missionId), store.listDeliverables(missionId)]);
+      if (workflowDeliveryReadiness(stages, deliverables).ready) {
+        await store.submitMissionForReview(missionId, reviewDueAt(dependencies.now?.() ?? new Date()));
+      } else {
+        await enqueueReadyTaskNodes(store, missionId, (dependencies.now?.() ?? new Date()).toISOString());
+      }
+    }
+    await store.markMissionCheckpointClean(
+      missionId, schedulerRevision, actorId, (dependencies.now?.() ?? new Date()).toISOString(),
+    );
+  };
+  const promise = reconcile();
+  if (executionContext) executionContext.waitUntil(promise);
+  await promise;
 }
 
 async function requireMissionAccess(store: PlatformStore, user: UserContext, missionId: string): Promise<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[]; agents: Agent[] }> {
@@ -1746,7 +2379,14 @@ export function createApp(dependencies: AppDependencies = {}) {
             wallet: { web2Balance: true, testTopupEnabled: testTopupEnabled(env), testOnly: true, withdrawable: false },
             storage: { records: 'd1', deliverables: 'ipfs_or_https_uri' },
             realtime: { primary: 'sse', fallback: 'polling' },
-            treasury: { ledger: true, cursorPagination: true, serverTrend: true, csvExport: 'client_generated' },
+            treasury: {
+              ledger: true,
+              cursorPagination: true,
+              serverTrend: true,
+              csvExport: 'direct_up_to_5000_async_control_plane_above_5000',
+              privateExportServiceConfigured: Boolean(env.EXPORT_SERVICE_TOKEN),
+              privateDownloadSignerConfigured: Boolean(dependencies.exportDownloadIssuer),
+            },
             notifications: { inApp: true, email: true, preferenceAware: true },
             operations: { persistedPreferences: true, disputeAuditTrail: true, adminRoleManagement: true, adminAuditTrail: true },
             ydFinance: { merkleRewards: true, stakingPower: true, ecosystemGovernance: true, earnVault: false },
@@ -1926,6 +2566,16 @@ export function createApp(dependencies: AppDependencies = {}) {
           if (!stage || stage.agentId !== agentId) throw new ApiError(403, 'INVALID_ASSIGNMENT', 'Agent is not assigned to this stage');
           const stageStatus = enumValue(body, 'status', ['running', 'done', 'failed'] as const);
           const callbackCreatedAt = (dependencies.now?.() ?? new Date()).toISOString();
+          const callbackClaim = await store.claimAgentCallback({
+            runId, callbackId, missionId, stageId, agentId, expiresAt,
+            now: now.toISOString(), status: stageStatus,
+          });
+          if (callbackClaim === 'duplicate') {
+            return success(request, env, requestId, { stage, mission }, 200, { replayed: true });
+          }
+          if (callbackClaim === 'expired') throw new ApiError(410, 'CALLBACK_EXPIRED', 'This Agent dispatch has expired or already completed');
+          if (callbackClaim === 'missing') throw new ApiError(401, 'INVALID_CALLBACK_RUN', 'The Agent dispatch run is not recognized');
+          if (callbackClaim === 'invalid') throw new ApiError(409, 'INVALID_STAGE_TRANSITION', 'This stage is no longer eligible for callbacks');
           const recordInvalidDelivery = async (errorCode: string) => store.recordAgentMetricEvent(qualityMetric({
             idempotencyKey: `artifact-invalid:${missionId}:${stageId}:${runId}`,
             agentId,
@@ -1942,7 +2592,7 @@ export function createApp(dependencies: AppDependencies = {}) {
           let artifacts: Deliverable[];
           try {
             output = normalizeCallbackOutput(body.output === undefined ? undefined : recordValue(body, 'output'));
-            artifacts = callbackArtifacts(body, missionId, stageId, agentId, callbackCreatedAt);
+            artifacts = callbackArtifacts(body, missionId, stageId, stage.attemptNo, agentId, callbackCreatedAt);
           } catch (error) {
             if (stageStatus === 'done') await recordInvalidDelivery(error instanceof ApiError ? error.code : 'INVALID_DELIVERY_PAYLOAD');
             throw error;
@@ -1955,7 +2605,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             throw new ApiError(422, 'INVALID_COMPLETION_OUTPUT', 'A done callback requires a successful structured result with a summary and evidence');
           }
           const hasExistingStageArtifact = existingDeliverables.some((deliverable) => (
-            deliverable.stageId === stageId && deliverable.status !== 'rejected'
+            deliverable.status !== 'rejected' && artifactBelongsToCurrentAttempt(stage, deliverable)
           ));
           if (stageStatus === 'done' && stageRequiresArtifact(stage, stages) && !hasExistingStageArtifact && artifacts.length === 0) {
             await recordInvalidDelivery('ARTIFACT_REQUIRED');
@@ -2015,12 +2665,15 @@ export function createApp(dependencies: AppDependencies = {}) {
           const deliverables = await store.listDeliverables(missionId);
           let latestMission = await store.getMission(missionId);
           const readiness = workflowDeliveryReadiness(latestStages, deliverables);
-          if (readiness.ready) {
+          if (latestMission?.status === 'paused') {
+            // The in-flight terminal callback is durable, but pause suppresses every downstream transition.
+          } else if (readiness.ready) {
             latestMission = await store.submitMissionForReview(missionId, reviewDueAt(now));
           } else {
             latestMission = await refreshWorkflowAggregate(store, missionId);
             if (stageStatus === 'done') {
               await enqueueReadyTaskNodes(store, missionId, now.toISOString());
+              latestMission = await store.getMission(missionId) ?? latestMission;
               if (executionContext) {
                 executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
               }
@@ -2034,6 +2687,56 @@ export function createApp(dependencies: AppDependencies = {}) {
             tone: stageStatus === 'failed' ? 'warning' : stageStatus === 'done' ? 'success' : 'info',
           });
           return success(request, env, requestId, { stage: updatedStage, mission: latestMission }, 202);
+        }
+
+        const internalExportMatch = pathname.match(/^\/api\/internal\/export-jobs(?:\/([^/]+)\/(progress|complete|fail))?$/);
+        if (internalExportMatch && method === 'POST') {
+          requireExportService(request, env);
+          const body = await readObject(request);
+          const workerId = requiredString(body, 'workerId', 3, 120);
+          const exportNow = now.toISOString();
+          if (!internalExportMatch[1]) {
+            const claim = await store.claimDeveloperLedgerExport(workerId, exportNow);
+            return success(request, env, requestId, claim);
+          }
+          const exportId = decodeURIComponent(internalExportMatch[1]);
+          const exportAction = internalExportMatch[2];
+          const attempt = finiteNumber(body, 'attempt', 1, 1_000_000);
+          if (!Number.isInteger(attempt)) throw new ApiError(400, 'VALIDATION_ERROR', 'attempt must be an integer');
+          if (exportAction === 'progress') {
+            const processedRows = finiteNumber(body, 'processedRows', 0, 1_000_000_000);
+            if (!Number.isInteger(processedRows)) throw new ApiError(400, 'VALIDATION_ERROR', 'processedRows must be an integer');
+            const job = await store.updateDeveloperLedgerExportProgress(exportId, workerId, attempt, processedRows, exportNow);
+            if (!job) throw new ApiError(409, 'EXPORT_JOB_NOT_PROCESSING', 'The export job is not leased to this worker');
+            return success(request, env, requestId, job);
+          }
+          if (exportAction === 'complete') {
+            const objectKey = requiredString(body, 'objectKey', 5, 1_000);
+            if (objectKey.includes('://') || objectKey.includes('..') || objectKey.startsWith('/')
+              || !objectKey.startsWith(`private/exports/${exportId}/`)) {
+              throw new ApiError(400, 'INVALID_EXPORT_OBJECT_KEY', 'objectKey must be a private reference scoped to this export job');
+            }
+            const sha256 = requiredString(body, 'sha256', 64, 64).toLocaleLowerCase();
+            if (!/^[a-f0-9]{64}$/.test(sha256)) throw new ApiError(400, 'VALIDATION_ERROR', 'sha256 must be 64 lowercase hexadecimal characters');
+            const rowCount = finiteNumber(body, 'rowCount', 5_001, 1_000_000_000);
+            const byteSize = finiteNumber(body, 'byteSize', 1, 2_000_000_000);
+            if (!Number.isInteger(rowCount) || !Number.isInteger(byteSize)) throw new ApiError(400, 'VALIDATION_ERROR', 'rowCount and byteSize must be integers');
+            const job = await store.completeDeveloperLedgerExport({
+              id: exportId, workerId, attempt, objectKey, sha256, rowCount, byteSize, completedAt: exportNow,
+            });
+            if (!job) throw new ApiError(409, 'EXPORT_JOB_NOT_PROCESSING', 'The export job cannot be completed by this worker');
+            return success(request, env, requestId, job);
+          }
+          const errorCode = enumValue(body, 'errorCode', ['STORAGE_ERROR', 'GENERATION_ERROR', 'SOURCE_UNAVAILABLE', 'INTEGRITY_ERROR'] as const);
+          const safeMessages = {
+            STORAGE_ERROR: 'Private export storage failed',
+            GENERATION_ERROR: 'Export generation failed',
+            SOURCE_UNAVAILABLE: 'Ledger source was temporarily unavailable',
+            INTEGRITY_ERROR: 'Export integrity validation failed',
+          } as const;
+          const job = await store.failDeveloperLedgerExport(exportId, workerId, attempt, errorCode, safeMessages[errorCode], exportNow);
+          if (!job) throw new ApiError(409, 'EXPORT_JOB_NOT_PROCESSING', 'The export job cannot be failed by this worker');
+          return success(request, env, requestId, job);
         }
 
         const user = await requireUser(request, env, dependencies, store);
@@ -2328,11 +3031,14 @@ export function createApp(dependencies: AppDependencies = {}) {
           if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
           const targetId = decodeURIComponent(arbitrationMemberMatch[1]);
           const body = await readObject(request);
+          const power = body.power === undefined ? undefined : finiteNumber(body, 'power', 1, 1_000_000);
+          if (power !== undefined && !Number.isInteger(power)) throw new ApiError(400, 'VALIDATION_ERROR', 'power must be an integer');
           const member = await store.setArbitrationMember(
             targetId,
             requiredBoolean(body, 'active'),
             user.id,
             (dependencies.now?.() ?? new Date()).toISOString(),
+            power,
           );
           if (!member) throw new ApiError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
           return success(request, env, requestId, member);
@@ -2385,6 +3091,71 @@ export function createApp(dependencies: AppDependencies = {}) {
           return success(request, env, requestId, missions, 200, { count: missions.length });
         }
 
+        if (pathname === '/api/workflow-templates' && method === 'GET') {
+          const templates = await store.listWorkflowTemplates(user.id);
+          return success(request, env, requestId, templates, 200, { count: templates.length });
+        }
+
+        if (pathname === '/api/workflow-templates' && method === 'POST') {
+          const body = await readObject(request);
+          const missionId = requiredString(body, 'missionId', 1, 120);
+          const context = await requireMissionAccess(store, user, missionId);
+          if (context.mission.requesterId !== user.id) {
+            throw new ApiError(403, 'FORBIDDEN', 'Only the mission requester can save a private workflow template');
+          }
+          if (!['draft', 'matching'].includes(context.mission.status) || (await store.getEscrow(missionId))?.status !== 'pending') {
+            throw new ApiError(409, 'WORKFLOW_LOCKED', 'Templates can only be saved from an unfunded workflow');
+          }
+          const result = await runIdempotent(request, store, user, body, async () => {
+            const selectedNodeIds = stringArray(body, 'nodeIds', 30);
+            const createdAt = (dependencies.now?.() ?? new Date()).toISOString();
+            const name = requiredString(body, 'name', 2, 120);
+            const existingTemplate = (await store.listWorkflowTemplates(user.id))
+              .find((detail) => detail.template.name === name);
+            const templateId = existingTemplate?.template.id ?? makeId('TEMPLATE');
+            const snapshot = await buildWorkflowTemplateSnapshot({
+              mission: context.mission,
+              stages: context.stages,
+              edges: context.edges,
+              selectedNodeIds,
+              templateId,
+              now: createdAt,
+            });
+            const saved = await store.saveWorkflowTemplateVersion({
+              id: templateId,
+              ownerId: user.id,
+              name,
+              description: optionalString(body, 'description', 600) ?? '',
+              ...snapshot,
+              createdAt,
+            });
+            if (saved.state === 'conflict') {
+              throw new ApiError(409, 'TEMPLATE_VERSION_CONFLICT', 'The template changed while this version was being saved');
+            }
+            await store.addEvent({
+              id: makeId('EVT'), missionId, stageId: null, type: 'workflow.template_saved',
+              message: saved.state === 'unchanged' ? '工作流模板内容未变化' : '工作流模板版本已保存',
+              actorType: 'requester', actorId: user.id,
+              payload: {
+                templateId: saved.detail.template.id,
+                version: saved.detail.version.version,
+                contentHash: saved.detail.version.contentHash,
+                nodeCount: saved.detail.version.nodes.length,
+              },
+              createdAt,
+            });
+            return {
+              status: saved.state === 'saved' ? 201 : 200,
+              body: { detail: saved.detail, unchanged: saved.state === 'unchanged' },
+            };
+          });
+          const command = result.body as { detail: WorkflowTemplateDetail; unchanged: boolean };
+          return success(request, env, requestId, command.detail, result.status, {
+            unchanged: command.unchanged,
+            replayed: Boolean(result.replayed),
+          });
+        }
+
         if (pathname === '/api/missions' && method === 'POST') {
           if (user.role !== 'requester' && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Requester role is required');
           const body = await readObject(request);
@@ -2418,6 +3189,11 @@ export function createApp(dependencies: AppDependencies = {}) {
               compiledSpec: null,
               workflowVersion: 1,
               workflowViewport: { x: 0, y: 0, zoom: 1 },
+              pausedAt: null,
+              pausedBy: null,
+              pauseReason: null,
+              pauseMode: null,
+              schedulerRevision: 0,
               createdAt: now,
               updatedAt: now,
             };
@@ -2449,6 +3225,108 @@ export function createApp(dependencies: AppDependencies = {}) {
         if (missionMatch && method === 'GET') {
           const { mission } = await requireMissionAccess(store, user, decodeURIComponent(missionMatch[1]));
           return success(request, env, requestId, await missionDetail(store, mission, now.toISOString()));
+        }
+
+        const missionRuntimeMatch = pathname.match(/^\/api\/missions\/([^/]+)\/(pause|resume)$/);
+        if (missionRuntimeMatch && method === 'POST') {
+          const missionId = decodeURIComponent(missionRuntimeMatch[1]);
+          const action = missionRuntimeMatch[2];
+          const context = await requireMissionAccess(store, user, missionId);
+          const body = await readObject(request);
+          const result = await runIdempotent(request, store, user, body, async () => {
+            const changedAt = (dependencies.now?.() ?? new Date()).toISOString();
+            if (action === 'pause') {
+              const reason = requiredString(body, 'reason', 5, 1_000);
+              const mode = user.role === 'admin' ? 'emergency' as const : 'requester' as const;
+              if (mode === 'requester' && context.mission.requesterId !== user.id) {
+                throw new ApiError(403, 'FORBIDDEN', 'Only the mission requester can pause execution');
+              }
+              const escalatesToEmergency = context.mission.status === 'paused'
+                && context.mission.pauseMode === 'requester'
+                && mode === 'emergency';
+              if (context.mission.status === 'paused' && !escalatesToEmergency) {
+                return { status: 200, body: await missionDetail(store, context.mission, changedAt) };
+              }
+              if (context.mission.status !== 'running' && !escalatesToEmergency) throw new ApiError(409, 'MISSION_NOT_RUNNING', 'Only a running funded mission can be paused');
+              const mutation = await store.pauseMission(missionId, user.id, mode, reason, changedAt);
+              if (mutation.state === 'invalid') throw new ApiError(409, 'MISSION_PAUSE_CONFLICT', 'Mission could not be paused from its current state');
+              return { status: 200, body: await missionDetail(store, mutation.mission, changedAt) };
+            }
+
+            if (context.mission.status !== 'paused') {
+              return { status: 200, body: await missionDetail(store, context.mission, changedAt) };
+            }
+            const expectedMode = context.mission.pauseMode;
+            if (!expectedMode) throw new ApiError(409, 'MISSION_RESUME_CONFLICT', 'Mission pause metadata is incomplete');
+            if (expectedMode === 'emergency' && user.role !== 'admin') {
+              throw new ApiError(403, 'EMERGENCY_PAUSE_ADMIN_REQUIRED', 'Only an administrator can resume an emergency pause');
+            }
+            if (expectedMode === 'requester' && context.mission.requesterId !== user.id) {
+              throw new ApiError(403, 'FORBIDDEN', 'Only the mission requester can resume this pause');
+            }
+            const mutation = await store.resumeMission(
+              missionId, user.id, expectedMode, context.mission.schedulerRevision, changedAt,
+            );
+            if (mutation.state === 'invalid') throw new ApiError(409, 'MISSION_RESUME_CONFLICT', 'Mission could not be resumed from its current state');
+            if (mutation.state === 'applied') {
+              await reconcileMissionRuntime({
+                request, env, dependencies, store, missionId, schedulerRevision: mutation.schedulerRevision,
+                actorId: user.id, executionContext,
+              });
+            }
+            const reconciledMission = await store.getMission(missionId) ?? mutation.mission;
+            return { status: 200, body: await missionDetail(store, reconciledMission, changedAt) };
+          });
+          return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
+        }
+
+        const missionChangeRequestsMatch = pathname.match(/^\/api\/missions\/([^/]+)\/change-requests$/);
+        if (missionChangeRequestsMatch && (method === 'GET' || method === 'POST')) {
+          const missionId = decodeURIComponent(missionChangeRequestsMatch[1]);
+          const context = await requireMissionAccess(store, user, missionId);
+          if (method === 'GET') return success(request, env, requestId, await store.listMissionChangeRequests(missionId));
+          if (context.mission.requesterId !== user.id || user.role !== 'requester') {
+            throw new ApiError(403, 'FORBIDDEN', 'Only the mission requester can create a change request');
+          }
+          const body = await readObject(request);
+          const result = await runIdempotent(request, store, user, body, async () => {
+            if (!['paused', 'review'].includes(context.mission.status)) {
+              throw new ApiError(409, 'CHANGE_REQUEST_STATE_REQUIRED', 'Pause the mission or wait for review before requesting rework');
+            }
+            const targetStageIds = [...new Set(stringArray(body, 'targetStageIds', 30))];
+            if (!targetStageIds.length) throw new ApiError(400, 'CHANGE_TARGET_REQUIRED', 'Select at least one task node for rework');
+            const eligible = new Map(context.stages.filter((stage) => stage.nodeType === 'task' && ['done', 'failed'].includes(stage.status)).map((stage) => [stage.id, stage]));
+            if (targetStageIds.some((stageId) => !eligible.has(stageId))) {
+              throw new ApiError(400, 'INVALID_CHANGE_TARGET', 'Rework targets must be completed or failed task nodes');
+            }
+            const resetStageIds = downstreamStageIds(targetStageIds, context.edges);
+            const resetStageIdSet = new Set(resetStageIds);
+            const affectedRunningStages = context.stages.filter((stage) => resetStageIdSet.has(stage.id) && stage.status === 'running');
+            if (affectedRunningStages.some((stage) => stage.nodeType === 'task')) {
+              throw new ApiError(409, 'CHANGE_TARGET_RUNNING', 'A selected or downstream task node is still running');
+            }
+            const createdAt = (dependencies.now?.() ?? new Date()).toISOString();
+            const mutation = await store.applyMissionChangeRequest({
+              id: makeId('CHANGE'), missionId, targetStageIds, resetStageIds,
+              reason: requiredString(body, 'reason', 5, 2_000),
+              acceptanceCriteria: requiredString(body, 'acceptanceCriteria', 5, 4_000),
+              requestedBy: user.id, createdAt,
+              expectedRunningStageIds: affectedRunningStages.map((stage) => stage.id),
+            });
+            if (mutation.state === 'blocked_running_stage') {
+              throw new ApiError(409, 'CHANGE_TARGET_RUNNING', 'A selected or downstream node is still running');
+            }
+            if (mutation.state === 'invalid') throw new ApiError(409, 'CHANGE_REQUEST_CONFLICT', 'The change request no longer matches mission state');
+            if (mutation.mission.status !== 'paused') {
+              await reconcileMissionRuntime({
+                request, env, dependencies, store, missionId, schedulerRevision: mutation.schedulerRevision,
+                actorId: user.id, executionContext,
+              });
+            }
+            const reconciledMission = await store.getMission(missionId) ?? mutation.mission;
+            return { status: 201, body: await missionDetail(store, reconciledMission, createdAt) };
+          });
+          return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
         }
 
         const missionFeedbackMatch = pathname.match(/^\/api\/missions\/([^/]+)\/stages\/([^/]+)\/feedback$/);
@@ -2569,6 +3447,91 @@ export function createApp(dependencies: AppDependencies = {}) {
           return success(request, env, requestId, { mission: result.mission, stages: ordered, edges: draft.edges });
         }
 
+        const workflowExpandMatch = pathname.match(/^\/api\/missions\/([^/]+)\/workflow\/expand$/);
+        if (workflowExpandMatch && method === 'POST') {
+          const missionId = decodeURIComponent(workflowExpandMatch[1]);
+          const access = await requireMissionAccess(store, user, missionId);
+          if (access.mission.requesterId !== user.id) {
+            throw new ApiError(403, 'FORBIDDEN', 'Only the mission requester can expand a workflow template');
+          }
+          const body = await readObject(request);
+          const idempotent = await runIdempotent(request, store, user, body, async () => {
+            const context = await requireMissionAccess(store, user, missionId);
+            if (!['draft', 'matching'].includes(context.mission.status) || (await store.getEscrow(missionId))?.status !== 'pending') {
+              throw new ApiError(409, 'WORKFLOW_LOCKED', 'The workflow cannot change after escrow funding starts');
+            }
+            const expectedVersion = Number(body.workflowVersion);
+            if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+              throw new ApiError(400, 'VALIDATION_ERROR', 'workflowVersion must be a positive integer');
+            }
+            const requestedTemplateVersion = body.version === undefined ? undefined : Number(body.version);
+            if (requestedTemplateVersion !== undefined && (!Number.isInteger(requestedTemplateVersion) || requestedTemplateVersion < 1)) {
+              throw new ApiError(400, 'VALIDATION_ERROR', 'version must be a positive integer');
+            }
+            const templateId = requiredString(body, 'templateId', 1, 120);
+            const detail = await store.getWorkflowTemplate(user.id, templateId, requestedTemplateVersion);
+            if (!detail) throw new ApiError(404, 'WORKFLOW_TEMPLATE_NOT_FOUND', 'Workflow template or requested version not found');
+            const iterations = Number(body.iterations ?? 1);
+            const budget = finiteNumber(body, 'budget', 0.000001, context.mission.budget);
+            const replace = body.replace === true;
+            const attachAfterStageId = optionalString(body, 'attachAfterStageId', 120);
+            const attachBeforeStageId = optionalString(body, 'attachBeforeStageId', 120);
+            const expanded = expandWorkflowTemplate({
+              mission: context.mission,
+              existingStages: context.stages,
+              existingEdges: context.edges,
+              detail,
+              iterations,
+              budget,
+              replace,
+              attachAfterStageId,
+              attachBeforeStageId,
+              expectedVersion,
+              now: now.toISOString(),
+            });
+            const result = await store.saveWorkflowDraft(
+              missionId,
+              expanded.stages,
+              expanded.edges,
+              context.mission.workflowViewport,
+              expectedVersion,
+            );
+            if (result.state === 'missing') throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+            if (result.state === 'locked') throw new ApiError(409, 'WORKFLOW_LOCKED', 'The workflow cannot change after escrow funding starts');
+            if (result.state === 'version_conflict') {
+              throw new ApiError(409, 'WORKFLOW_VERSION_CONFLICT', 'The workflow changed in another session; reload before expanding', {
+                currentVersion: (await store.getMission(missionId))?.workflowVersion,
+              });
+            }
+            await store.addEvent({
+              id: makeId('EVT'), missionId, stageId: null, type: 'workflow.template_expanded',
+              message: iterations === 1 ? '工作流模板已展开' : `工作流模板已静态展开 ${iterations} 次`,
+              actorType: 'requester', actorId: user.id,
+              payload: {
+                templateId: detail.template.id,
+                templateVersion: detail.version.version,
+                iterations,
+                replace,
+                contentHash: detail.version.contentHash,
+                workflowVersion: result.mission.workflowVersion,
+              },
+              createdAt: now.toISOString(),
+            });
+            return {
+              status: 200,
+              body: {
+                mission: result.mission,
+                stages: expanded.stages,
+                edges: expanded.edges,
+                template: detail.template,
+                templateVersion: detail.version.version,
+                iterations,
+              },
+            };
+          });
+          return success(request, env, requestId, idempotent.body, idempotent.status, { replayed: Boolean(idempotent.replayed) });
+        }
+
         const gateDecisionMatch = pathname.match(/^\/api\/missions\/([^/]+)\/gates\/([^/]+)\/decision$/);
         if (gateDecisionMatch && method === 'POST') {
           const missionId = decodeURIComponent(gateDecisionMatch[1]);
@@ -2585,8 +3548,12 @@ export function createApp(dependencies: AppDependencies = {}) {
           const decision = enumValue(body, 'decision', ['approved', 'rejected'] as const);
           const feedback = optionalString(body, 'feedback', 2_000);
           const decidedAt = now.toISOString();
+          let rejectionSnapshot: WorkflowStage[] | null = null;
           if (decision === 'approved') {
-            await store.updateStage(missionId, gateId, 'done', { decision, feedback, decidedAt, actorId: user.id });
+            const approvedGate = await store.transitionStage(
+              missionId, gateId, 'running', 'done', { decision, feedback, decidedAt, actorId: user.id },
+            );
+            if (!approvedGate) throw new ApiError(409, 'GATE_STATE_CONFLICT', 'The Gate changed or the mission was paused before approval');
             await store.addEvent({
               id: makeId('EVT'), missionId, stageId: gateId, type: 'gate.approved', message: `${gate.name} 已批准`,
               actorType: 'requester', actorId: user.id, payload: { feedback }, createdAt: decidedAt,
@@ -2594,25 +3561,49 @@ export function createApp(dependencies: AppDependencies = {}) {
             await enqueueReadyTaskNodes(store, missionId, decidedAt);
             if (executionContext) executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
           } else {
+            if (context.mission.requesterId !== user.id) throw new ApiError(403, 'FORBIDDEN', 'Only the requester can request Gate rework');
             const reworkNodeIds = stringArray(body, 'reworkNodeIds', 30);
             if (!feedback) throw new ApiError(400, 'GATE_FEEDBACK_REQUIRED', 'Rejecting a Gate requires written feedback');
             const directUpstream = new Set(incomingStageIds(gateId, context.edges));
             const eligible = new Set(context.stages.filter((stage) => stage.nodeType === 'task' && directUpstream.has(stage.id)).map((stage) => stage.id));
             if (!reworkNodeIds.length) throw new ApiError(400, 'REWORK_NODE_REQUIRED', 'Rejecting a Gate requires at least one direct upstream task node');
             if (reworkNodeIds.some((id) => !eligible.has(id))) throw new ApiError(400, 'INVALID_REWORK_NODE', 'Gate rework nodes must be direct upstream task nodes');
-            await store.updateStage(missionId, gateId, 'failed', { decision, feedback, reworkNodeIds, decidedAt, actorId: user.id });
+            const resetStageIds = downstreamStageIds(reworkNodeIds, context.edges);
+            if (context.stages.some((stage) => resetStageIds.includes(stage.id) && stage.status === 'running' && stage.id !== gateId)) {
+              throw new ApiError(409, 'CHANGE_REQUEST_BLOCKED_BY_RUNNING_STAGE', 'Rework cannot replace a branch while one of its affected nodes is running');
+            }
+            const pause = await store.pauseMission(missionId, user.id, 'requester', feedback, decidedAt);
+            if (pause.state !== 'applied') throw new ApiError(409, 'MISSION_PAUSE_CONFLICT', 'Mission changed or was already paused while Gate rework was being created');
+            const change = await store.applyMissionChangeRequest({
+              id: makeId('CHANGE'), missionId, targetStageIds: reworkNodeIds,
+              resetStageIds, reason: feedback,
+              acceptanceCriteria: String(gate.input.approvalCriteria ?? gate.purpose), requestedBy: user.id, createdAt: decidedAt,
+              expectedRunningStageIds: [gateId],
+            });
+            if (change.state !== 'applied') {
+              await store.resumeMission(
+                missionId, user.id, 'requester', pause.schedulerRevision, decidedAt,
+              );
+              throw new ApiError(409, 'CHANGE_REQUEST_CONFLICT', 'Gate rework could not be versioned safely');
+            }
+            rejectionSnapshot = await store.listStages(missionId);
+            const resumed = await store.resumeMission(
+              missionId, user.id, 'requester', change.schedulerRevision, decidedAt,
+            );
+            if (resumed.state !== 'applied') throw new ApiError(409, 'MISSION_RESUME_CONFLICT', 'Versioned Gate rework could not resume scheduling');
             await store.addEvent({
               id: makeId('EVT'), missionId, stageId: gateId, type: 'gate.rejected', message: `${gate.name} 已驳回并要求返工`,
               actorType: 'requester', actorId: user.id,
               payload: { feedback, reworkNodeIds, priorOutputs: Object.fromEntries(context.stages.filter((stage) => reworkNodeIds.includes(stage.id)).map((stage) => [stage.id, stage.output])) },
               createdAt: decidedAt,
             });
-            await store.resetWorkflowNodes(missionId, reworkNodeIds, gateId);
-            await enqueueReadyTaskNodes(store, missionId, decidedAt);
-            if (executionContext) executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+            await reconcileMissionRuntime({
+              request, env, dependencies, store, missionId, schedulerRevision: resumed.schedulerRevision,
+              actorId: user.id, executionContext,
+            });
           }
           let updatedMission = await refreshWorkflowAggregate(store, missionId);
-          const latestGateStages = await store.listStages(missionId);
+          const latestGateStages = rejectionSnapshot ?? await store.listStages(missionId);
           if (decision === 'approved' && latestGateStages.length > 0 && latestGateStages.every((stage) => stage.status === 'done')) {
             updatedMission = await store.submitMissionForReview(missionId, reviewDueAt(now));
           }
@@ -2628,19 +3619,52 @@ export function createApp(dependencies: AppDependencies = {}) {
           const missionId = decodeURIComponent(retryNodeMatch[1]);
           const stageId = decodeURIComponent(retryNodeMatch[2]);
           const context = await requireMissionAccess(store, user, missionId);
-          if (context.mission.requesterId !== user.id && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can retry a task node');
+          if (context.mission.requesterId !== user.id || user.role !== 'requester') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can retry a task node');
           if (context.mission.status !== 'running' || (await store.getEscrow(missionId))?.status !== 'held') throw new ApiError(409, 'MISSION_NOT_RUNNING', 'Retry requires a running funded mission');
           const stage = context.stages.find((candidate) => candidate.id === stageId && candidate.nodeType === 'task');
           if (!stage) throw new ApiError(404, 'NODE_NOT_FOUND', 'Task node not found');
           if (stage.status !== 'failed') throw new ApiError(409, 'NODE_NOT_FAILED', 'Only a failed task node can be retried');
-          await store.resetWorkflowNodes(missionId, [stageId]);
+          const failedTransitions = (await store.listCurrentWorkflowTransitions(missionId)).filter((checkpoint) => (
+            checkpoint.targetStageId === stageId && checkpoint.errorCode
+          ));
+          if (failedTransitions.length > 0) {
+            throw new ApiError(409, 'MAPPING_SOURCE_REWORK_REQUIRED', 'This node failed before dispatch because an upstream mapping could not be resolved; rework the producing source node instead', {
+              sourceStageIds: [...new Set(failedTransitions.map((checkpoint) => checkpoint.sourceStageId))],
+              errorCodes: [...new Set(failedTransitions.map((checkpoint) => checkpoint.errorCode))],
+            });
+          }
+          const retriedAt = now.toISOString();
+          const resetStageIds = downstreamStageIds([stageId], context.edges);
+          if (context.stages.some((candidate) => resetStageIds.includes(candidate.id) && candidate.status === 'running')) {
+            throw new ApiError(409, 'CHANGE_REQUEST_BLOCKED_BY_RUNNING_STAGE', 'Retry cannot replace a branch while one of its affected nodes is running');
+          }
+          const pause = await store.pauseMission(missionId, user.id, 'requester', `重试失败节点：${stage.name}`, retriedAt);
+          if (pause.state !== 'applied') throw new ApiError(409, 'MISSION_PAUSE_CONFLICT', 'Mission changed or was already paused while retry was being created');
+          const change = await store.applyMissionChangeRequest({
+            id: makeId('CHANGE'), missionId, targetStageIds: [stageId],
+            resetStageIds, reason: `重试失败节点：${stage.name}`,
+            acceptanceCriteria: stage.purpose, requestedBy: user.id, createdAt: retriedAt,
+          });
+          if (change.state !== 'applied') {
+            await store.resumeMission(
+              missionId, user.id, 'requester', pause.schedulerRevision, retriedAt,
+            );
+            throw new ApiError(409, 'CHANGE_REQUEST_CONFLICT', 'Retry could not create a new stage attempt');
+          }
+          const retrySnapshot = await store.listStages(missionId);
           await store.addEvent({
             id: makeId('EVT'), missionId, stageId, type: 'node.retry_requested', message: `${stage.name} 已请求重试`,
             actorType: 'requester', actorId: user.id, payload: {}, createdAt: now.toISOString(),
           });
-          await enqueueReadyTaskNodes(store, missionId, now.toISOString());
-          if (executionContext) executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
-          return success(request, env, requestId, { mission: await refreshWorkflowAggregate(store, missionId), stages: await store.listStages(missionId), edges: context.edges });
+          const resumed = await store.resumeMission(
+            missionId, user.id, 'requester', change.schedulerRevision, retriedAt,
+          );
+          if (resumed.state !== 'applied') throw new ApiError(409, 'MISSION_RESUME_CONFLICT', 'Retry could not resume scheduling');
+          await reconcileMissionRuntime({
+            request, env, dependencies, store, missionId, schedulerRevision: resumed.schedulerRevision,
+            actorId: user.id, executionContext,
+          });
+          return success(request, env, requestId, { mission: await refreshWorkflowAggregate(store, missionId), stages: retrySnapshot, edges: context.edges });
         }
 
         const missionActionMatch = pathname.match(/^\/api\/missions\/([^/]+)\/(compile|candidates|workflow|start|dispatch|events|deliverables|review|accept|disputes)$/);
@@ -2795,7 +3819,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             const body = await readObject(request);
             const depositTxHash = optionalString(body, 'depositTxHash', 200);
             const existingEscrow = await store.getEscrow(missionId);
-            if (context.mission.status === 'running' && existingEscrow?.status === 'held') {
+            if (['running', 'paused'].includes(context.mission.status) && existingEscrow?.status === 'held') {
               const sameDeposit = isWeb3Payment(context.mission.paymentMethod)
                 ? Boolean(depositTxHash && depositTxHash.toLocaleLowerCase() === existingEscrow.depositTxHash?.toLocaleLowerCase())
                 : !depositTxHash;
@@ -2864,7 +3888,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (!startResult) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
             if (!startResult.applied) {
               const currentEscrow = await store.getEscrow(missionId);
-              if (startResult.mission.status === 'running' && currentEscrow?.status === 'held') {
+              if (['running', 'paused'].includes(startResult.mission.status) && currentEscrow?.status === 'held') {
                 return success(request, env, requestId, { mission: startResult.mission, escrow: currentEscrow, pollAfterMs: 3000 }, 200, { replayed: true });
               }
               throw new ApiError(409, 'MISSION_ALREADY_STARTED', 'Mission funding has already started or is no longer available');
@@ -2914,7 +3938,7 @@ export function createApp(dependencies: AppDependencies = {}) {
           }
 
           if (action === 'events' && method === 'POST') {
-            if (context.mission.status !== 'running' && context.mission.status !== 'review') {
+            if (!['running', 'review', 'paused'].includes(context.mission.status)) {
               throw new ApiError(409, 'MISSION_TERMINAL', 'Events cannot be appended to a terminal or unfunded mission');
             }
             const body = await readObject(request);
@@ -2972,6 +3996,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             }
             const deliverable: Deliverable = {
               id: makeId('DEL'), missionId, stageId,
+              attemptNo: stage?.attemptNo ?? null,
               agentId: stage?.agentId ?? null,
               name: requiredString(body, 'name', 2, 180),
               uri: safeUrl(requiredString(body, 'uri', 8, 2_000), 'uri'),
@@ -3005,6 +4030,9 @@ export function createApp(dependencies: AppDependencies = {}) {
             const deliverables = await store.listDeliverables(missionId);
             requireWorkflowDelivery(context.stages, deliverables);
             const saved = await store.submitMissionForReview(missionId, reviewDueAt(now));
+            if (!saved || saved.status !== 'review') {
+              throw new ApiError(409, 'MISSION_REVIEW_CONFLICT', 'Mission was paused or changed before review could start');
+            }
             await deliverNotification(store, env, dependencies, {
               userId: context.mission.requesterId,
               category: 'settlement',
@@ -3093,8 +4121,8 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (context.mission.requesterId !== user.id && user.role !== 'admin') {
               throw new ApiError(403, 'FORBIDDEN', 'Only the requester or an administrator can freeze this escrow');
             }
-            if (context.mission.status !== 'running' && context.mission.status !== 'review') {
-              throw new ApiError(409, 'MISSION_NOT_DISPUTABLE', 'Only running or review missions can enter dispute');
+            if (!['running', 'review', 'paused'].includes(context.mission.status)) {
+              throw new ApiError(409, 'MISSION_NOT_DISPUTABLE', 'Only running, paused, or review missions can enter dispute');
             }
             const body = await readObject(request);
             const freezeTxHash = optionalString(body, 'freezeTxHash', 200);
@@ -3468,11 +4496,79 @@ export function createApp(dependencies: AppDependencies = {}) {
           }, 200, { limit: requestedLimit, token });
         }
 
+        if (pathname === '/api/developer/ledger/export-jobs') {
+          if (user.role !== 'developer' && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Developer role is required');
+          const exportNow = now.toISOString();
+          if (method === 'GET') return success(request, env, requestId, await store.listDeveloperLedgerExports(user.id, exportNow));
+          if (method === 'POST') {
+            const body = await readObject(request);
+            const token = enumValue(body, 'token', ['CREDIT', 'mUSDC', 'sETH'] as const, 'CREDIT');
+            const result = await runIdempotent(request, store, user, body, async () => {
+              const prepared = await store.requestDeveloperLedgerExport(user.id, token, exportNow);
+              return { status: prepared.mode === 'async' ? 202 : 200, body: prepared };
+            });
+            return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
+          }
+        }
+
+        const developerExportMatch = pathname.match(/^\/api\/developer\/ledger\/export-jobs\/([^/]+)(?:\/(cancel|retry|download-token))?$/);
+        if (developerExportMatch) {
+          if (user.role !== 'developer' && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Developer role is required');
+          const exportId = decodeURIComponent(developerExportMatch[1]);
+          const exportAction = developerExportMatch[2];
+          const exportNow = now.toISOString();
+          if (!exportAction && method === 'GET') {
+            const job = await store.getDeveloperLedgerExport(user.id, exportId, exportNow);
+            if (!job) throw new ApiError(404, 'EXPORT_JOB_NOT_FOUND', 'Export job not found');
+            return success(request, env, requestId, job);
+          }
+          if (method === 'POST' && (exportAction === 'cancel' || exportAction === 'retry')) {
+            const body = await readObject(request);
+            const result = await runIdempotent(request, store, user, body, async () => {
+              const mutation = exportAction === 'cancel'
+                ? await store.cancelDeveloperLedgerExport(user.id, exportId, exportNow)
+                : await store.retryDeveloperLedgerExport(user.id, exportId, exportNow);
+              if (mutation.state === 'missing') throw new ApiError(404, 'EXPORT_JOB_NOT_FOUND', 'Export job not found');
+              if (mutation.state === 'invalid_state') throw new ApiError(409, 'EXPORT_JOB_INVALID_STATE', `Export job cannot ${exportAction} from its current state`);
+              return { status: 200, body: mutation.job };
+            });
+            return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
+          }
+          if (method === 'POST' && exportAction === 'download-token') {
+            const artifact = await store.getDeveloperLedgerExportArtifact(user.id, exportId, exportNow);
+            if (!artifact) {
+              const job = await store.getDeveloperLedgerExport(user.id, exportId, exportNow);
+              if (!job) throw new ApiError(404, 'EXPORT_JOB_NOT_FOUND', 'Export job not found');
+              throw new ApiError(409, job.status === 'expired' ? 'EXPORT_ARTIFACT_EXPIRED' : 'EXPORT_ARTIFACT_NOT_READY', 'The private export artifact is not available');
+            }
+            if (!dependencies.exportDownloadIssuer) {
+              throw new ApiError(503, 'EXPORT_STORAGE_NOT_CONFIGURED', 'Private export download signing is not configured');
+            }
+            const maximumExpiry = new Date(Math.min(
+              Date.parse(artifact.expiresAt), Date.parse(exportNow) + EXPORT_DOWNLOAD_TOKEN_MS,
+            )).toISOString();
+            const issued = await dependencies.exportDownloadIssuer(env, artifact, maximumExpiry);
+            const issuedExpiry = Date.parse(issued.expiresAt);
+            let issuedUrl: URL | null = null;
+            try {
+              if (typeof issued.url === 'string') issuedUrl = new URL(issued.url);
+            } catch {
+              issuedUrl = null;
+            }
+            const signingCompletedAt = (dependencies.now?.() ?? new Date()).getTime();
+            if (!issuedUrl || issuedUrl.protocol !== 'https:' || !Number.isFinite(issuedExpiry)
+              || issuedExpiry <= signingCompletedAt || issuedExpiry > Date.parse(maximumExpiry)) {
+              throw new ApiError(502, 'INVALID_EXPORT_DOWNLOAD_TOKEN', 'The private export signer returned an invalid token');
+            }
+            return success(request, env, requestId, { url: issuedUrl.toString(), expiresAt: issued.expiresAt });
+          }
+        }
+
         if (pathname === '/api/disputes' && method === 'GET') {
           return success(request, env, requestId, await store.listDisputes(user));
         }
 
-        const disputeActionMatch = pathname.match(/^\/api\/disputes\/([^/]+)\/(actions|governance|review|votes|finalize|resolve)$/);
+        const disputeActionMatch = pathname.match(/^\/api\/disputes\/([^/]+)\/(actions|governance|review|votes|appeal|finalize|execution|resolve)$/);
         if (disputeActionMatch) {
           const disputeId = decodeURIComponent(disputeActionMatch[1]);
           const action = disputeActionMatch[2];
@@ -3503,14 +4599,30 @@ export function createApp(dependencies: AppDependencies = {}) {
             return success(request, env, requestId, result.governance, 201);
           }
 
+          if (action === 'appeal' && method === 'POST') {
+            const body = await readObject(request);
+            const reason = requiredString(body, 'reason', 20, 4_000);
+            const result = await store.createDisputeAppeal(disputeId, user.id, reason, arbitrationNow);
+            if (result.state === 'missing') throw new ApiError(404, 'PROPOSAL_NOT_FOUND', 'Arbitration proposal not found');
+            if (result.state === 'not_allowed') throw new ApiError(403, 'ARBITRATION_APPEAL_NOT_ALLOWED', 'Only a party to the dispute may appeal');
+            if (result.state === 'not_finalized') throw new ApiError(409, 'ARBITRATION_APPEAL_NOT_READY', 'The initial proposal must have a final outcome before appeal');
+            if (result.state === 'expired') throw new ApiError(409, 'ARBITRATION_APPEAL_EXPIRED', 'The appeal window has ended');
+            if (result.state === 'already_appealed') throw new ApiError(409, 'ARBITRATION_APPEAL_USED', 'This dispute already used its one appeal');
+            if (result.state === 'no_expanded_electorate') throw new ApiError(409, 'ARBITRATION_APPEAL_NEEDS_EXPANDED_COUNCIL', 'An appeal requires at least one additional eligible arbitrator');
+            if (result.state === 'execution_queued') throw new ApiError(409, 'ARBITRATION_EXECUTION_ALREADY_QUEUED', 'The final ruling was already queued and can no longer be appealed');
+            return success(request, env, requestId, result.governance, 201);
+          }
+
           if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
           if (action === 'review' && method === 'POST') {
             if (!['open', 'reviewing'].includes(accessible.status)) throw new ApiError(409, 'DISPUTE_CLOSED', 'Only open disputes can enter review');
             const existingGovernance = await store.getDisputeGovernance(disputeId, user.id, arbitrationNow);
             if (existingGovernance?.proposal) return success(request, env, requestId, accessible, 200, { replayed: true });
+            const body = await readObject(request);
+            const weightMode = enumValue(body, 'weightMode', ['one_person_one_vote', 'power'] as const, 'one_person_one_vote');
             let dispute;
             try {
-              dispute = await store.startDisputeReview(disputeId, user.id, arbitrationNow);
+              dispute = await store.startDisputeReview(disputeId, user.id, arbitrationNow, weightMode);
             } catch (reviewError) {
               if (reviewError instanceof Error && reviewError.message.includes('ARBITRATION_NO_ELIGIBLE_MEMBERS')) {
                 throw new ApiError(409, 'ARBITRATION_NO_ELIGIBLE_MEMBERS', '至少需要一名与案件无利益冲突的活跃仲裁委员');
@@ -3525,6 +4637,17 @@ export function createApp(dependencies: AppDependencies = {}) {
               tone: 'info',
             });
             return success(request, env, requestId, dispute);
+          }
+
+          if (action === 'execution' && method === 'POST') {
+            const mission = await store.getMission(accessible.missionId);
+            if (!mission) throw new ApiError(404, 'MISSION_NOT_FOUND', 'The disputed mission no longer exists');
+            const result = await store.queueDisputeExecution(disputeId, user.id, arbitrationNow, isWeb3Payment(mission.paymentMethod));
+            if (result.state === 'missing') throw new ApiError(404, 'PROPOSAL_NOT_FOUND', 'Arbitration proposal not found');
+            if (result.state === 'not_ready') throw new ApiError(409, 'ARBITRATION_EXECUTION_NOT_READY', 'The final ruling is not executable until appeal rights are exhausted');
+            if (result.state === 'escrow_not_frozen') throw new ApiError(409, 'ESCROW_NOT_FROZEN', 'The escrow must remain frozen before queuing execution');
+            if (result.state === 'already_executed') throw new ApiError(409, 'ARBITRATION_ALREADY_EXECUTED', 'The ruling has already been executed');
+            return success(request, env, requestId, result.governance, result.state === 'queued' ? 201 : 200, { replayed: result.state === 'replayed' });
           }
 
           if (action === 'finalize' && method === 'POST') {
@@ -3547,9 +4670,11 @@ export function createApp(dependencies: AppDependencies = {}) {
             const governance = await store.getDisputeGovernance(disputeId, user.id, arbitrationNow);
             const authorized = status === 'resolved'
               ? governance?.proposal?.status === 'succeeded' && governance.proposal.outcome === 'refund_requester'
-              : governance?.proposal?.status === 'defeated' && governance.proposal.outcome === 'reject_dispute';
+                && governance.execution?.action === 'refund_requester' && governance.execution.status !== 'executed'
+              : governance?.proposal?.status === 'defeated' && governance.proposal.outcome === 'reject_dispute'
+                && governance.execution?.action === 'reject_dispute' && governance.execution.status !== 'executed';
             if (!authorized) {
-              throw new ApiError(409, 'ARBITRATION_AUTHORIZATION_REQUIRED', 'A finalized DAO vote matching this ruling is required');
+              throw new ApiError(409, 'ARBITRATION_AUTHORIZATION_REQUIRED', 'A queued final DAO ruling matching this action is required');
             }
             const mission = await store.getMission(accessible.missionId);
             const escrow = await store.getEscrow(accessible.missionId);
@@ -3623,13 +4748,24 @@ export function createApp(dependencies: AppDependencies = {}) {
       const store = getStore(env, dependencies);
       const now = dependencies.now?.() ?? new Date();
       executionContext.waitUntil(refreshScheduledAgentHealth(env, dependencies, store, now));
-      const pending = await store.listPendingDispatches(80, now.toISOString());
-      const missionIds = [...new Set(pending.map((item) => item.missionId))];
+      const [pending, dirty] = await Promise.all([
+        store.listPendingDispatches(80, now.toISOString()),
+        store.listDirtyMissionControls(80),
+      ]);
+      const dirtyRevision = new Map(dirty.map((item) => [item.missionId, item.schedulerRevision]));
+      const missionIds = [...new Set([...pending.map((item) => item.missionId), ...dirty.map((item) => item.missionId)])];
       const configuredOrigin = env.PUBLIC_BASE_URL?.trim()
         || (env.PROJECT_NAME?.trim() ? `https://${env.PROJECT_NAME.trim()}.api.pinme.pro` : 'https://agentmesh.invalid');
       for (const missionId of missionIds) {
         const request = new Request(`${configuredOrigin.replace(/\/$/, '')}/api/internal/workflow-dispatch`);
-        executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+        const revision = dirtyRevision.get(missionId);
+        executionContext.waitUntil((revision === undefined
+          ? Promise.resolve()
+          : reconcileMissionRuntime({
+            request, env, dependencies, store, missionId, schedulerRevision: revision, actorId: null,
+          }))
+          .then(() => dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }))
+          .then(() => undefined));
       }
     },
   };

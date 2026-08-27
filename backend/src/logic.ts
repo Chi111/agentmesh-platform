@@ -109,6 +109,8 @@ export function parseLlmCompilation(content: string, mission: Mission): Workflow
       };
     })(),
     output: null,
+    attemptNo: 1,
+    attemptCreatedAt: now,
     createdAt: now,
     updatedAt: now,
   }; });

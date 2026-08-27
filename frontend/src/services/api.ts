@@ -10,6 +10,8 @@ import type {
   CandidateMatch,
   Deliverable,
   DeveloperLedger,
+  LedgerExportJob,
+  LedgerExportRequestResult,
   Dispute,
   DisputeAction,
   DisputeGovernance,
@@ -19,6 +21,7 @@ import type {
   EcosystemProposalType,
   EcosystemVoteChoice,
   Mission,
+  MissionChangeRequest,
   MissionDetail,
   NewAgentInput,
   NewDeliverableInput,
@@ -35,6 +38,7 @@ import type {
   RewardAllocation,
   WorkflowStage,
   WorkflowEdge,
+  WorkflowTemplateDetail,
   WorkflowViewport,
 } from '../types/domain';
 
@@ -241,8 +245,8 @@ export const api = {
   }),
   listAdminActions: (limit = 100) => request<AdminAction[]>(`/api/admin/audit?limit=${encodeURIComponent(String(limit))}`, { authenticated: true }),
   listArbitrationMembers: () => request<ArbitrationMember[]>('/api/arbitration/members', { authenticated: true }),
-  setArbitrationMember: (userId: string, active: boolean) => request<ArbitrationMember>(`/api/arbitration/members/${encodeURIComponent(userId)}`, {
-    method: 'PUT', authenticated: true, body: JSON.stringify({ active }),
+  setArbitrationMember: (userId: string, active: boolean, power?: number) => request<ArbitrationMember>(`/api/arbitration/members/${encodeURIComponent(userId)}`, {
+    method: 'PUT', authenticated: true, body: JSON.stringify({ active, ...(power === undefined ? {} : { power }) }),
   }),
   createMission: (input: NewMissionInput) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>('/api/missions', {
     method: 'POST',
@@ -251,6 +255,16 @@ export const api = {
     body: JSON.stringify(input),
   }),
   getMission: (missionId: string) => request<MissionDetail>(`/api/missions/${encodeURIComponent(missionId)}`, { authenticated: true }),
+  pauseMission: (missionId: string, reason: string) => request<MissionDetail>(`/api/missions/${encodeURIComponent(missionId)}/pause`, {
+    method: 'POST', authenticated: true, idempotencyKey: `pause-${missionId}-${crypto.randomUUID()}`, body: JSON.stringify({ reason }),
+  }),
+  resumeMission: (missionId: string) => request<MissionDetail>(`/api/missions/${encodeURIComponent(missionId)}/resume`, {
+    method: 'POST', authenticated: true, idempotencyKey: `resume-${missionId}-${crypto.randomUUID()}`, body: '{}',
+  }),
+  createMissionChangeRequest: (missionId: string, input: { targetStageIds: string[]; reason: string; acceptanceCriteria: string }) => request<MissionDetail>(`/api/missions/${encodeURIComponent(missionId)}/change-requests`, {
+    method: 'POST', authenticated: true, idempotencyKey: `change-${missionId}-${crypto.randomUUID()}`, body: JSON.stringify(input),
+  }),
+  listMissionChangeRequests: (missionId: string) => request<MissionChangeRequest[]>(`/api/missions/${encodeURIComponent(missionId)}/change-requests`, { authenticated: true }),
   compileWorkflow: (missionId: string) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>(`/api/missions/${encodeURIComponent(missionId)}/compile`, {
     method: 'POST', authenticated: true, body: '{}',
   }),
@@ -261,6 +275,29 @@ export const api = {
     viewport: WorkflowViewport;
   }) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow/draft`, {
     method: 'PUT', authenticated: true, body: JSON.stringify(input),
+  }),
+  listWorkflowTemplates: () => request<WorkflowTemplateDetail[]>('/api/workflow-templates', { authenticated: true }),
+  saveWorkflowTemplate: (input: { missionId: string; name: string; description?: string; nodeIds?: string[] }) => request<WorkflowTemplateDetail>('/api/workflow-templates', {
+    method: 'POST', authenticated: true, idempotencyKey: `workflow-template-save-${crypto.randomUUID()}`, body: JSON.stringify(input),
+  }),
+  expandWorkflowTemplate: (missionId: string, input: {
+    templateId: string;
+    version?: number;
+    iterations: number;
+    budget: number;
+    workflowVersion: number;
+    replace?: boolean;
+    attachAfterStageId?: string;
+    attachBeforeStageId?: string;
+  }) => request<{
+    mission: Mission;
+    stages: WorkflowStage[];
+    edges: WorkflowEdge[];
+    template: WorkflowTemplateDetail['template'];
+    templateVersion: number;
+    iterations: number;
+  }>(`/api/missions/${encodeURIComponent(missionId)}/workflow/expand`, {
+    method: 'POST', authenticated: true, idempotencyKey: `workflow-expand-${crypto.randomUUID()}`, body: JSON.stringify(input),
   }),
   getCandidates: (missionId: string) => request<CandidateMatch[]>(`/api/missions/${encodeURIComponent(missionId)}/candidates`, { authenticated: true }),
   confirmWorkflow: (missionId: string, assignments: Record<string, string>) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[]; offers: StageOffer[] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow`, {
@@ -299,13 +336,19 @@ export const api = {
   listDisputes: () => request<Dispute[]>('/api/disputes', { authenticated: true }),
   listDisputeActions: (disputeId: string) => request<DisputeAction[]>(`/api/disputes/${encodeURIComponent(disputeId)}/actions`, { authenticated: true }),
   getDisputeGovernance: (disputeId: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/governance`, { authenticated: true }),
-  startDisputeReview: (disputeId: string) => request<Dispute>(`/api/disputes/${encodeURIComponent(disputeId)}/review`, {
-    method: 'POST', authenticated: true, body: '{}',
+  startDisputeReview: (disputeId: string, weightMode: 'one_person_one_vote' | 'power' = 'one_person_one_vote') => request<Dispute>(`/api/disputes/${encodeURIComponent(disputeId)}/review`, {
+    method: 'POST', authenticated: true, body: JSON.stringify({ weightMode }),
   }),
   castDisputeVote: (disputeId: string, choice: DisputeVoteChoice, reason: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/votes`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ choice, reason }),
   }),
   finalizeDisputeVote: (disputeId: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/finalize`, {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  createDisputeAppeal: (disputeId: string, reason: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/appeal`, {
+    method: 'POST', authenticated: true, body: JSON.stringify({ reason }),
+  }),
+  queueDisputeExecution: (disputeId: string) => request<DisputeGovernance>(`/api/disputes/${encodeURIComponent(disputeId)}/execution`, {
     method: 'POST', authenticated: true, body: '{}',
   }),
   resolveDispute: (disputeId: string, resolution: string, status: 'resolved' | 'rejected', resolutionTxHash: string | null = null) => request<Dispute>(`/api/disputes/${encodeURIComponent(disputeId)}/resolve`, {
@@ -348,6 +391,19 @@ export const api = {
   }),
   getDeveloperLedger: (limit = 50, cursor?: string | null, token = 'CREDIT') => request<DeveloperLedger>(`/api/developer/ledger?limit=${encodeURIComponent(String(limit))}&token=${encodeURIComponent(token)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, {
     authenticated: true,
+  }),
+  requestDeveloperLedgerExport: (token: 'CREDIT' | 'mUSDC' | 'sETH') => request<LedgerExportRequestResult>('/api/developer/ledger/export-jobs', {
+    method: 'POST', authenticated: true, idempotencyKey: `ledger-export-${token}-${crypto.randomUUID()}`, body: JSON.stringify({ token }),
+  }),
+  listDeveloperLedgerExports: () => request<LedgerExportJob[]>('/api/developer/ledger/export-jobs', { authenticated: true }),
+  cancelDeveloperLedgerExport: (id: string) => request<LedgerExportJob>(`/api/developer/ledger/export-jobs/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST', authenticated: true, idempotencyKey: `ledger-export-cancel-${id}`, body: '{}',
+  }),
+  retryDeveloperLedgerExport: (id: string, attempt: number) => request<LedgerExportJob>(`/api/developer/ledger/export-jobs/${encodeURIComponent(id)}/retry`, {
+    method: 'POST', authenticated: true, idempotencyKey: `ledger-export-retry-${id}-${attempt}`, body: '{}',
+  }),
+  getDeveloperLedgerExportDownload: (id: string) => request<{ url: string; expiresAt: string }>(`/api/developer/ledger/export-jobs/${encodeURIComponent(id)}/download-token`, {
+    method: 'POST', authenticated: true, body: '{}',
   }),
   markNotificationsRead: () => request<{ ok: boolean }>('/api/notifications/read', {
     method: 'POST', authenticated: true, body: '{}',

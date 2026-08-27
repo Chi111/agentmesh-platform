@@ -37,6 +37,15 @@ export function stageRequiresArtifact(stage: ExecutionStage, workflowStages: Exe
   return stageExecutionMode(stage, workflowStages) === 'implement';
 }
 
+export function artifactBelongsToCurrentAttempt(stage: WorkflowStage, deliverable: Deliverable): boolean {
+  if (deliverable.stageId !== stage.id) return false;
+  const attemptNo = stage.attemptNo || 1;
+  if (deliverable.attemptNo !== undefined && deliverable.attemptNo !== null) {
+    return deliverable.attemptNo === attemptNo;
+  }
+  return attemptNo === 1;
+}
+
 export function structuredStageResult(output: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
   if (!output || output.invalidated === true || objectValue(output.error)) return null;
   return objectValue(output.result) ?? output;
@@ -80,13 +89,10 @@ export function workflowDeliveryReadiness(
     return { ready: false, code: 'INVALID_STAGE_OUTPUT', missingOutputStageIds, missingArtifactStageIds: [] };
   }
 
-  const deliveredStageIds = new Set(
-    deliverables
-      .filter((deliverable) => deliverable.status !== 'rejected' && deliverable.stageId)
-      .map((deliverable) => deliverable.stageId as string),
-  );
   const missingArtifactStageIds = stages
-    .filter((stage) => stageRequiresArtifact(stage, stages) && !deliveredStageIds.has(stage.id))
+    .filter((stage) => stageRequiresArtifact(stage, stages) && !deliverables.some((deliverable) => (
+      deliverable.status !== 'rejected' && artifactBelongsToCurrentAttempt(stage, deliverable)
+    )))
     .map((stage) => stage.id);
   if (missingArtifactStageIds.length > 0) {
     return { ready: false, code: 'ARTIFACT_REQUIRED', missingOutputStageIds: [], missingArtifactStageIds };

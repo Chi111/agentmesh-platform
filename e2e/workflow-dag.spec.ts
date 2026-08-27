@@ -73,13 +73,18 @@ async function expectNoNodeOverlap(nodes: Locator) {
   }).toBe(true);
 }
 
-async function mockWorkspace(page: Page, missionDetail: Record<string, unknown>, onRequest?: (route: Route) => boolean | Promise<boolean>) {
+async function mockWorkspace(
+  page: Page,
+  missionDetail: Record<string, unknown>,
+  onRequest?: (route: Route) => boolean | Promise<boolean>,
+  workspaceProfile = requester,
+) {
   await page.route('**/api/**', async (route) => {
     if (onRequest && await onRequest(route)) return;
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/agents') return route.fulfill({ json: envelope(agents) });
-    if (path === '/api/bootstrap') return route.fulfill({ json: envelope({ profile: requester, missions: [missionDetail.mission], agents, notifications: [], developer: null }) });
+    if (path === '/api/bootstrap') return route.fulfill({ json: envelope({ profile: workspaceProfile, missions: [missionDetail.mission], agents, notifications: [], developer: null }) });
     if (path === '/api/disputes') return route.fulfill({ json: envelope([]) });
     if (path === `/api/missions/${baseMission.id}/candidates`) return route.fulfill({ json: envelope(draftStages.filter((stage) => stage.nodeType === 'task').map((stage) => ({
       stageId: stage.id,
@@ -118,7 +123,7 @@ test('desktop editor supports manual assignment, save, clear and undo', async ({
   await expect(page.getByText('候选建议（需手动选择）')).toBeVisible();
   await expect(page.getByLabel('Agent（不自动选择）')).toHaveValue('');
   await page.getByLabel('Agent（不自动选择）').selectOption('AGENT-pinme');
-  await page.getByLabel('名称').fill('架构与风险分析');
+  await page.getByLabel('名称', { exact: true }).fill('架构与风险分析');
   await page.getByRole('button', { name: '保存' }).click();
   await expect.poll(() => savedDraft).not.toBeNull();
   expect(savedDraft?.workflowVersion).toBe(3);
@@ -141,6 +146,182 @@ test('desktop editor supports manual assignment, save, clear and undo', async ({
   await page.getByRole('button', { name: '自动布局' }).click();
   await page.getByRole('button', { name: '校验' }).click();
   await expect(page.getByText('发送邀请前必须为每个任务节点手动选择 Agent。')).toBeVisible();
+});
+
+test('edge inspector persists a bounded terminal Gate condition', async ({ page }) => {
+  const detail = { mission: baseMission, stages: draftStages, edges: draftEdges, offers: [], events: [], deliverables: [], escrow: { status: 'pending', amount: 300, token: 'CREDIT', network: 'web2', paymentMethod: 'web2_balance' }, disputes: [] };
+  let savedDraft: Record<string, unknown> | null = null;
+  await mockWorkspace(page, detail, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === `/api/missions/${baseMission.id}/workflow/draft` && request.method() === 'PUT') {
+      savedDraft = request.postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: envelope({ mission: { ...baseMission, workflowVersion: 4 }, stages: savedDraft.nodes, edges: savedDraft.edges }) }).then(() => true);
+    }
+    return false;
+  });
+
+  await page.goto(`/#/missions/${baseMission.id}/workflow`);
+  await page.locator('.react-flow__edge[data-id="EDGE-implement-gate"] .react-flow__edge-interaction').dispatchEvent('click');
+  await expect(page.getByText('转换规则', { exact: true })).toBeVisible();
+  await page.getByText('条件 Gate', { exact: true }).click();
+  await page.getByLabel('输出路径（JSON Pointer）').fill('/verified');
+  await page.getByLabel('运算符').selectOption('eq');
+  await page.getByLabel('比较值').fill('true');
+  await page.getByRole('button', { name: '保存' }).click();
+
+  await expect.poll(() => savedDraft).not.toBeNull();
+  expect((savedDraft?.edges as Array<Record<string, unknown>>).find((edge) => edge.id === 'EDGE-implement-gate')).toMatchObject({
+    condition: { op: 'eq', path: '/verified', value: true },
+    mappings: [],
+  });
+});
+
+test('edge inspector accepts the root JSON Pointer as a mapping source', async ({ page }) => {
+  const detail = { mission: baseMission, stages: draftStages, edges: draftEdges, offers: [], events: [], deliverables: [], escrow: { status: 'pending', amount: 300, token: 'CREDIT', network: 'web2', paymentMethod: 'web2_balance' }, disputes: [] };
+  let savedDraft: Record<string, unknown> | null = null;
+  await mockWorkspace(page, detail, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === `/api/missions/${baseMission.id}/workflow/draft` && request.method() === 'PUT') {
+      savedDraft = request.postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: envelope({ mission: { ...baseMission, workflowVersion: 4 }, stages: savedDraft.nodes, edges: savedDraft.edges }) }).then(() => true);
+    }
+    return false;
+  });
+
+  await page.goto(`/#/missions/${baseMission.id}/workflow`);
+  await page.locator('.react-flow__edge[data-id="EDGE-analysis-implement"] .react-flow__edge-interaction').dispatchEvent('click');
+  await page.getByRole('button', { name: '+ 添加' }).click();
+  await page.getByLabel('来源').fill('');
+  await page.getByLabel('写入').fill('/upstream');
+  await page.getByRole('button', { name: '保存' }).click();
+
+  await expect.poll(() => savedDraft).not.toBeNull();
+  expect((savedDraft?.edges as Array<Record<string, unknown>>).find((edge) => edge.id === 'EDGE-analysis-implement')).toMatchObject({
+    mappings: [{ from: '', to: '/upstream', required: true }],
+  });
+});
+
+test('edge inspector views and edits every composite condition form as JSON', async ({ page }) => {
+  const detail = { mission: baseMission, stages: draftStages, edges: draftEdges, offers: [], events: [], deliverables: [], escrow: { status: 'pending', amount: 300, token: 'CREDIT', network: 'web2', paymentMethod: 'web2_balance' }, disputes: [] };
+  let savedDraft: Record<string, unknown> | null = null;
+  await mockWorkspace(page, detail, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === `/api/missions/${baseMission.id}/workflow/draft` && request.method() === 'PUT') {
+      savedDraft = request.postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: envelope({ mission: { ...baseMission, workflowVersion: 4 }, stages: savedDraft.nodes, edges: savedDraft.edges }) }).then(() => true);
+    }
+    return false;
+  });
+
+  await page.goto(`/#/missions/${baseMission.id}/workflow`);
+  await page.locator('.react-flow__edge[data-id="EDGE-implement-gate"] .react-flow__edge-interaction').dispatchEvent('click');
+  await page.getByText('条件 Gate', { exact: true }).click();
+  const editor = page.getByLabel('完整条件 AST（JSON）');
+  await editor.fill(JSON.stringify({
+    op: 'or',
+    conditions: [
+      { op: 'eq', path: '/verified', value: true },
+      { op: 'not', condition: { op: 'in', path: '/risk', value: ['critical'] } },
+    ],
+  }, null, 2));
+  await page.getByRole('button', { name: '应用条件 JSON' }).click();
+  await expect(editor).toHaveValue(/"op": "or"/u);
+  await expect(editor).toHaveValue(/"op": "not"/u);
+  await expect(editor).toHaveValue(/"op": "in"/u);
+  await page.getByRole('button', { name: '保存' }).click();
+
+  await expect.poll(() => savedDraft).not.toBeNull();
+  expect((savedDraft?.edges as Array<Record<string, unknown>>).find((edge) => edge.id === 'EDGE-implement-gate')).toMatchObject({
+    condition: {
+      op: 'or',
+      conditions: [
+        { op: 'eq', path: '/verified', value: true },
+        { op: 'not', condition: { op: 'in', path: '/risk', value: ['critical'] } },
+      ],
+    },
+  });
+});
+
+test('template dialog saves a private version and requests static expansion', async ({ page }) => {
+  const detail = { mission: baseMission, stages: draftStages, edges: draftEdges, offers: [], events: [], deliverables: [], escrow: { status: 'pending', amount: 300, token: 'CREDIT', network: 'web2', paymentMethod: 'web2_balance' }, disputes: [] };
+  const templateDetail = {
+    template: { id: 'TEMPLATE-e2e', ownerId: requester.id, name: '工程交付链', description: 'E2E template', currentVersion: 1, createdAt: now, updatedAt: now },
+    version: { templateId: 'TEMPLATE-e2e', version: 1, nodes: draftStages, edges: draftEdges, entryIds: ['STAGE-analysis'], exitIds: ['STAGE-gate'], contentHash: `sha256:${'a'.repeat(64)}`, createdAt: now },
+  };
+  let templates: typeof templateDetail[] = [];
+  let expansionBody: Record<string, unknown> | null = null;
+  await mockWorkspace(page, detail, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/workflow-templates' && request.method() === 'GET') {
+      return route.fulfill({ json: envelope(templates) }).then(() => true);
+    }
+    if (path === '/api/workflow-templates' && request.method() === 'POST') {
+      templates = [templateDetail];
+      return route.fulfill({ status: 201, json: envelope(templateDetail) }).then(() => true);
+    }
+    if (path === `/api/missions/${baseMission.id}/workflow/expand` && request.method() === 'POST') {
+      expansionBody = request.postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: envelope({ mission: { ...baseMission, workflowVersion: 4 }, stages: draftStages, edges: draftEdges, template: templateDetail.template, templateVersion: 1, iterations: 2 }) }).then(() => true);
+    }
+    return false;
+  });
+
+  await page.goto(`/#/missions/${baseMission.id}/workflow`);
+  await page.getByRole('button', { name: '模板与循环' }).click();
+  await page.getByLabel('模板名称').fill('工程交付链');
+  await page.getByLabel('说明').fill('E2E template');
+  await page.getByRole('button', { name: '保存私有模板' }).click();
+  await expect(page.getByRole('combobox', { name: '模板', exact: true })).toHaveValue('TEMPLATE-e2e');
+  await page.getByLabel('静态次数').selectOption('2');
+  await page.getByRole('button', { name: '展开到画布' }).click();
+
+  await expect.poll(() => expansionBody).not.toBeNull();
+  expect(expansionBody).toMatchObject({
+    templateId: 'TEMPLATE-e2e', iterations: 2, budget: 300, workflowVersion: 3, replace: true,
+  });
+});
+
+test('legacy overlapping drafts persist automatic layout before confirmation', async ({ page }) => {
+  const overlappingStages = draftStages.map((stage) => ({
+    ...stage,
+    positionX: 80,
+    positionY: 80,
+    agentId: stage.nodeType === 'task' ? 'AGENT-pinme' : null,
+  }));
+  const detail = {
+    mission: baseMission,
+    stages: overlappingStages,
+    edges: draftEdges,
+    offers: [], events: [], deliverables: [],
+    escrow: { status: 'pending', amount: 300, token: 'CREDIT', network: 'web2', paymentMethod: 'web2_balance' },
+    disputes: [],
+  };
+  const requestOrder: string[] = [];
+  let savedNodes: Array<Record<string, unknown>> = [];
+  await mockWorkspace(page, detail, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === `/api/missions/${baseMission.id}/workflow/draft` && request.method() === 'PUT') {
+      requestOrder.push('save');
+      savedNodes = (request.postDataJSON() as { nodes: Array<Record<string, unknown>> }).nodes;
+      return route.fulfill({ json: envelope({ mission: { ...baseMission, workflowVersion: 4 }, stages: savedNodes, edges: draftEdges }) }).then(() => true);
+    }
+    if (path === `/api/missions/${baseMission.id}/workflow` && request.method() === 'POST') {
+      requestOrder.push('confirm');
+      return route.fulfill({ json: envelope({ mission: { ...baseMission, workflowVersion: 4 }, stages: savedNodes, edges: draftEdges, offers: [] }) }).then(() => true);
+    }
+    return false;
+  });
+
+  await page.goto(`/#/missions/${baseMission.id}/workflow`);
+  await expectNoNodeOverlap(page.locator('.react-flow__node'));
+  await page.getByRole('button', { name: '发送邀请' }).click();
+  await expect.poll(() => requestOrder).toEqual(['save', 'confirm']);
+  expect(new Set(savedNodes.map((node) => `${node.positionX}:${node.positionY}`)).size).toBe(savedNodes.length);
 });
 
 test('desktop editor creates nodes by drag and connects handles', async ({ page }) => {
@@ -290,21 +471,37 @@ test('execution graph exposes Agent, events, artifacts and Gate controls per nod
   await page.setViewportSize({ width: 1728, height: 907 });
   const executionMission = { ...baseMission, status: 'running', progress: 60, currentStage: '1 个待审批', team: ['AGENT-pinme'] };
   const executionStages = [
-    { ...draftStages[0], status: 'done', progress: 100, agentId: 'AGENT-pinme', output: { summary: '架构分析已完成', risks: ['依赖升级风险'] } },
+    { ...draftStages[0], status: 'done', progress: 100, attemptNo: 2, agentId: 'AGENT-pinme', output: { summary: '架构分析已完成', risks: ['依赖升级风险'] } },
     { ...draftStages[1], status: 'running', progress: 40, agentId: 'AGENT-ds' },
     { ...draftStages[1], id: 'STAGE-failed', name: '失败节点', status: 'failed', progress: 0, agentId: 'AGENT-ds' },
     { ...draftStages[2], status: 'running', progress: 0 },
   ];
-  const executionEdges = [{ id: 'EDGE-analysis-gate', missionId: baseMission.id, sourceStageId: 'STAGE-analysis', targetStageId: 'STAGE-gate' }];
+  const executionEdges = [{ id: 'EDGE-analysis-gate', missionId: baseMission.id, sourceStageId: 'STAGE-analysis', targetStageId: 'STAGE-gate', condition: { op: 'exists', path: '/verified' } }];
   const detail = {
     mission: executionMission,
     stages: executionStages,
     edges: executionEdges,
     offers: [],
     events: [{ id: 'EVT-analysis-done', missionId: baseMission.id, stageId: 'STAGE-analysis', type: 'stage.done', message: '架构分析完成', createdAt: now }],
-    deliverables: [{ id: 'DEL-analysis', missionId: baseMission.id, stageId: 'STAGE-analysis', agentId: 'AGENT-pinme', name: '架构报告', uri: 'https://artifacts.example.test/architecture', contentHash: 'sha256:architecture', mimeType: 'application/json', status: 'submitted', createdAt: now }],
+    deliverables: [
+      { id: 'DEL-analysis', missionId: baseMission.id, stageId: 'STAGE-analysis', attemptNo: 2, agentId: 'AGENT-pinme', name: '架构报告', uri: 'https://artifacts.example.test/architecture', contentHash: 'sha256:architecture', mimeType: 'application/json', status: 'submitted', createdAt: now },
+      { id: 'DEL-analysis-stale', missionId: baseMission.id, stageId: 'STAGE-analysis', attemptNo: 1, agentId: 'AGENT-pinme', name: '旧版架构报告', uri: 'https://artifacts.example.test/architecture-stale', contentHash: 'sha256:architecture-stale', mimeType: 'application/json', status: 'submitted', createdAt: now },
+    ],
     escrow: { status: 'held', amount: 300, token: 'CREDIT', network: 'web2' },
     disputes: [],
+    transitions: [
+      {
+        id: 'TRANSITION-analysis-gate-current', missionId: baseMission.id, edgeId: 'EDGE-analysis-gate',
+        sourceStageId: 'STAGE-analysis', targetStageId: 'STAGE-gate', sourceAttemptNo: 2,
+        workflowVersion: 3, matched: true, mappedInput: {}, missingRequired: [], errorCode: null, createdAt: now,
+      },
+      {
+        id: 'TRANSITION-analysis-gate-stale', missionId: baseMission.id, edgeId: 'EDGE-analysis-gate',
+        sourceStageId: 'STAGE-analysis', targetStageId: 'STAGE-gate', sourceAttemptNo: 1,
+        workflowVersion: 3, matched: false, mappedInput: {}, missingRequired: [], errorCode: null,
+        createdAt: new Date(Date.parse(now) + 1_000).toISOString(),
+      },
+    ],
   };
   let gateDecision: Record<string, unknown> | null = null;
   await mockWorkspace(page, detail, async (route) => {
@@ -320,6 +517,7 @@ test('execution graph exposes Agent, events, artifacts and Gate controls per nod
   await page.goto(`/#/missions/${baseMission.id}/execution`);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollHeight <= window.innerHeight)).toBe(true);
   const executionFlow = page.locator('.workflow-execution-flow');
+  const executionGraph = page.getByTestId('workflow-execution-graph');
   await expectNoNodeOverlap(executionFlow.locator('.react-flow__node'));
   await expect(executionFlow).toHaveClass(/dark/);
   await expect(executionFlow.locator('.react-flow__attribution')).toHaveCSS('background-color', 'rgba(13, 17, 23, 0.82)');
@@ -331,8 +529,11 @@ test('execution graph exposes Agent, events, artifacts and Gate controls per nod
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollHeight <= window.innerHeight)).toBe(true);
   await expect(page.getByText('PinMe Sol Engineering Agent', { exact: true }).last()).toBeVisible();
   await expect(page.getByText('架构分析完成')).toBeVisible();
-  await expect(page.getByText('架构报告', { exact: true }).first()).toBeVisible();
-  await expect(page.getByText('sha256:architecture')).toBeVisible();
+  await expect(executionGraph.getByText('架构报告', { exact: true })).toBeVisible();
+  await expect(executionGraph.getByText('sha256:architecture')).toBeVisible();
+  await expect(executionGraph.getByText('旧版架构报告', { exact: true })).toHaveCount(0);
+  await expect(executionGraph.getByText('sha256:architecture-stale')).toHaveCount(0);
+  await expect(page.getByText('旧版架构报告', { exact: true })).toHaveCount(0);
 
   await page.getByText('失败节点', { exact: true }).first().click();
   const retryButton = page.getByRole('button', { name: '显式重试此节点' });
@@ -341,6 +542,8 @@ test('execution graph exposes Agent, events, artifacts and Gate controls per nod
 
   await page.getByText('任务方审批', { exact: true }).first().click();
   await expect(page.getByText('人工审批 Gate', { exact: true })).toBeVisible();
+  await expect(page.getByText('已应用映射 （无字段）', { exact: true })).toBeVisible();
+  await expect(page.getByText('条件为假，分支已跳过', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '批准' })).toBeInViewport();
   await expect(page.getByRole('button', { name: '驳回并返工' })).toBeInViewport();
   await page.getByLabel('返工：架构分析').check();
@@ -348,4 +551,170 @@ test('execution graph exposes Agent, events, artifacts and Gate controls per nod
   await page.getByRole('button', { name: '驳回并返工' }).click();
   await expect.poll(() => gateDecision).not.toBeNull();
   expect(gateDecision).toMatchObject({ decision: 'rejected', feedback: '需要补充依赖风险', reworkNodeIds: ['STAGE-analysis'] });
+});
+
+test('paused execution exposes guarded resume and versioned rework controls', async ({ page }) => {
+  const pausedMission = {
+    ...baseMission,
+    requesterId: requester.id,
+    status: 'paused',
+    progress: 70,
+    currentStage: '工程实现已暂停',
+    team: ['AGENT-pinme'],
+    pausedAt: now,
+    pausedBy: requester.id,
+    pauseReason: '等待新的依赖审计结果。',
+    pauseMode: 'requester',
+    schedulerRevision: 4,
+  };
+  const pausedStages = [
+    { ...draftStages[0], status: 'done', progress: 100, agentId: 'AGENT-pinme', attemptNo: 1, output: { summary: '旧版架构结果', verified: true } },
+    { ...draftStages[1], status: 'done', progress: 100, agentId: 'AGENT-ds', attemptNo: 2, output: { summary: '实现结果', verified: true } },
+    { ...draftStages[2], status: 'done', progress: 100, attemptNo: 1, output: { decision: 'approved' } },
+  ];
+  const detail = {
+    mission: pausedMission,
+    stages: pausedStages,
+    edges: draftEdges,
+    offers: [],
+    events: [],
+    deliverables: [{
+      id: 'DEL-paused', missionId: baseMission.id, stageId: 'STAGE-implement', agentId: 'AGENT-ds',
+      attemptNo: 2,
+      name: '暂停前工程制品', uri: 'ipfs://bafypausedartifact', contentHash: 'sha256:paused-artifact',
+      mimeType: 'application/json', status: 'submitted', createdAt: now,
+    }],
+    escrow: { status: 'held', amount: 300, token: 'CREDIT', network: 'web2' },
+    disputes: [],
+    changeRequests: [{
+      id: 'CHANGE-v1', missionId: baseMission.id, version: 1, targetStageIds: ['STAGE-implement'],
+      resetStageIds: ['STAGE-implement', 'STAGE-gate'], reason: '第一轮返工', acceptanceCriteria: '补齐回归证据',
+      requestedBy: requester.id, priorStageState: [], status: 'applied', createdAt: now,
+    }],
+    checkpoints: [{ id: 'CHECKPOINT-4', missionId: baseMission.id, sequence: 4, kind: 'pause', workflowVersion: 3, schedulerRevision: 4, changeVersion: 1, schedulerState: 'clean', payload: {}, createdBy: requester.id, createdAt: now }],
+  };
+  let changeBody: Record<string, unknown> | null = null;
+  let emergencyPauseBody: Record<string, unknown> | null = null;
+  await mockWorkspace(page, detail, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith('/change-requests') && request.method() === 'POST') {
+      changeBody = request.postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: envelope(detail) }).then(() => true);
+    }
+    if (path.endsWith('/pause') && request.method() === 'POST') {
+      emergencyPauseBody = request.postDataJSON() as Record<string, unknown>;
+      return route.fulfill({
+        json: envelope({ ...detail, mission: { ...pausedMission, pauseMode: 'emergency', pauseReason: '需要管理员介入处置安全风险。' } }),
+      }).then(() => true);
+    }
+    return false;
+  });
+
+  await page.goto(`/#/missions/${baseMission.id}/execution`);
+  await expect(page.getByText('已暂停', { exact: true })).toBeVisible();
+  await expect(page.getByText('等待新的依赖审计结果。', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: '恢复任务' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '派发所有就绪节点' })).toBeDisabled();
+  await expect(page.getByText('返工 v1', { exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: '请求返工' }).click();
+  await expect(page.getByRole('dialog')).toContainText('只创建新的执行 attempt');
+  await page.getByRole('checkbox').first().check();
+  await page.getByLabel('返工原因').fill('新的依赖审计结果改变了实现约束。');
+  await page.getByLabel('独立验收标准').fill('必须补充针对新约束的回归测试和风险说明。');
+  await page.getByRole('button', { name: '创建返工版本' }).click();
+  await expect.poll(() => changeBody).not.toBeNull();
+  expect(changeBody).toMatchObject({
+    targetStageIds: ['STAGE-analysis'],
+    reason: '新的依赖审计结果改变了实现约束。',
+    acceptanceCriteria: '必须补充针对新约束的回归测试和风险说明。',
+  });
+
+  const adminProfile = { id: 'ADMIN-e2e', email: 'admin@example.test', displayName: 'E2E Admin', role: 'admin' };
+  await page.evaluate(async (nextProfile) => {
+    const { useAppStore } = await import('/src/store/useAppStore.ts');
+    useAppStore.setState({ profile: nextProfile, role: 'admin' });
+  }, adminProfile);
+  await page.getByRole('button', { name: '提升为紧急暂停' }).click();
+  await expect(page.getByRole('dialog')).toContainText('提升后只有管理员可恢复调度');
+  await page.getByLabel('暂停原因').fill('需要管理员介入处置安全风险。');
+  await page.getByRole('button', { name: '确认提升为紧急暂停' }).click();
+  await expect.poll(() => emergencyPauseBody).not.toBeNull();
+  expect(emergencyPauseBody).toEqual({ reason: '需要管理员介入处置安全风险。' });
+  await expect(page.getByText('管理员紧急暂停', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '恢复任务' })).toBeVisible();
+
+  const developerProfile = { id: 'DEV-pinme', email: 'developer@example.test', displayName: 'E2E Developer', role: 'developer' };
+  await page.evaluate(async (nextProfile) => {
+    const { useAppStore } = await import('/src/store/useAppStore.ts');
+    useAppStore.setState({ profile: nextProfile, role: 'developer' });
+  }, developerProfile);
+  await expect(page.getByRole('button', { name: '提交任务方验收' })).toBeDisabled();
+});
+
+test('review route exposes a requester rework path and hides it from administrators', async ({ page }) => {
+  const reviewMission = {
+    ...baseMission, requesterId: requester.id, status: 'review', progress: 100,
+    currentStage: '等待验收', team: ['AGENT-pinme'], reviewDueAt: '2026-08-30T12:00:00.000Z',
+  };
+  const reviewStages = draftStages.map((stage, index) => ({
+    ...stage, status: 'done', progress: 100, agentId: stage.nodeType === 'task' ? agents[index % agents.length].id : null,
+    output: { summary: `${stage.name} 已完成`, verified: true },
+    attemptNo: stage.id === 'STAGE-implement' ? 2 : 1,
+    attemptCreatedAt: stage.id === 'STAGE-implement' ? '2026-08-22T11:00:00.000Z' : '2026-08-22T09:00:00.000Z',
+  }));
+  const detail = {
+    mission: reviewMission, stages: reviewStages, edges: draftEdges, offers: [], events: [], deliverables: [
+      {
+        id: 'DEL-old-attempt', missionId: baseMission.id, stageId: 'STAGE-implement', agentId: 'AGENT-ds',
+        attemptNo: 1,
+        name: '旧版工程制品', uri: 'ipfs://bafyoldattempt', contentHash: 'sha256:old-attempt',
+        mimeType: 'application/json', status: 'submitted', createdAt: '2026-08-22T10:00:00.000Z',
+      },
+      {
+        id: 'DEL-current-attempt', missionId: baseMission.id, stageId: 'STAGE-implement', agentId: 'AGENT-ds',
+        attemptNo: 2,
+        name: '当前版本工程制品', uri: 'ipfs://bafycurrentattempt', contentHash: 'sha256:current-attempt',
+        mimeType: 'application/json', status: 'submitted', createdAt: '2026-08-22T11:30:00.000Z',
+      },
+      {
+        id: 'DEL-mission-old', missionId: baseMission.id, stageId: null, agentId: null,
+        name: '返工前最终交付', uri: 'ipfs://bafymissionold', contentHash: 'sha256:mission-old',
+        mimeType: 'application/zip', status: 'submitted', createdAt: '2026-08-22T10:30:00.000Z',
+      },
+      {
+        id: 'DEL-mission-final', missionId: baseMission.id, stageId: null, agentId: null,
+        name: '任务级最终交付', uri: 'ipfs://bafymissionfinal', contentHash: 'sha256:mission-final',
+        mimeType: 'application/zip', status: 'submitted', createdAt: '2026-08-22T11:45:00.000Z',
+      },
+    ],
+    escrow: { status: 'held', amount: 300, token: 'CREDIT', network: 'web2' }, disputes: [], changeRequests: [{
+      id: 'CHANGE-review-v1', missionId: baseMission.id, version: 1, targetStageIds: ['STAGE-implement'],
+      resetStageIds: ['STAGE-implement', 'STAGE-gate'], reason: '补充工程证据', acceptanceCriteria: '重新提交当前版本制品',
+      requestedBy: requester.id, priorStageState: [], status: 'applied', createdAt: '2026-08-22T11:00:00.000Z',
+    }], checkpoints: [],
+  };
+  await mockWorkspace(page, detail);
+  await page.goto(`/#/missions/${baseMission.id}/acceptance`);
+  await expect.poll(() => page.evaluate(async () => {
+    const { useAppStore } = await import('/src/store/useAppStore.ts');
+    return useAppStore.getState().missions.map((mission) => mission.id);
+  })).toContain(baseMission.id);
+  const reworkLink = page.getByRole('link', { name: '查看执行与请求返工' });
+  await expect(reworkLink).toBeVisible();
+  await expect(reworkLink).toHaveAttribute('href', `#/missions/${baseMission.id}/execution`);
+  await expect(page.getByText('当前版本工程制品', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '任务级最终交付' })).toBeVisible();
+  await expect(page.getByText('旧版工程制品', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('返工前最终交付', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('2 个历史 attempt 或已拒绝制品已保留，仅供审计，不参与当前验收。')).toBeVisible();
+  await expect(page.getByRole('button', { name: /确认交付并释放/ })).toBeEnabled();
+
+  const admin = { id: requester.id, email: 'admin@example.test', displayName: 'E2E Admin', role: 'admin' };
+  await page.evaluate(async (nextProfile) => {
+    const { useAppStore } = await import('/src/store/useAppStore.ts');
+    useAppStore.setState({ profile: nextProfile, role: 'requester' });
+  }, admin);
+  await expect(page.getByRole('link', { name: '查看执行与请求返工' })).toHaveCount(0);
 });

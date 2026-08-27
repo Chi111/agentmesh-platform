@@ -20,6 +20,8 @@ import type {
   DeveloperLedger,
   Dispute,
   DisputeAction,
+  DisputeAppealResult,
+  DisputeExecutionQueueResult,
   DisputeFinalizeResult,
   DisputeGovernance,
   DisputeVote,
@@ -35,11 +37,19 @@ import type {
   Escrow,
   ExecutionEvent,
   GovernancePowerSnapshot,
+  GovernanceExecutionItem,
   IdempotencyClaim,
   IdempotentResult,
   LedgerCursor,
   LedgerEntry,
+  LedgerExportClaim,
+  LedgerExportJob,
+  LedgerExportMutationResult,
+  LedgerExportPrivateArtifact,
+  LedgerExportRequestResult,
   Mission,
+  MissionChangeRequest,
+  MissionPauseMode,
   Notification,
   PlatformStore,
   RewardActivity,
@@ -57,11 +67,31 @@ import type {
   WorkflowStage,
   WorkflowDraftSaveResult,
   WorkflowEdge,
+  WorkflowCheckpoint,
+  WorkflowTransitionCheckpoint,
+  WorkflowTemplateDetail,
+  WorkflowTemplateSaveResult,
   WorkflowViewport,
 } from './contracts';
 import { calculateAgentQuality, feedbackWeightForPriorCount } from './agentQuality';
-import { arbitrationQuorum, arbitrationVotingEndsAt, evaluateArbitrationProposal } from './arbitration';
+import {
+  arbitrationAppealEndsAt,
+  arbitrationExecutionPayloadHash,
+  arbitrationExecutionReady,
+  arbitrationQuorum,
+  arbitrationVoteWeight,
+  arbitrationVotingEndsAt,
+  arbitrationWeightVersion,
+  evaluateArbitrationProposal,
+} from './arbitration';
 import { paymentConfig, TEST_TOPUP_AMOUNT } from './payments';
+import {
+  exportArtifactExpiresAt,
+  exportJobExpiresAt,
+  exportLeaseExpiresAt,
+  exportProgress,
+  MAX_DIRECT_LEDGER_EXPORT_ROWS,
+} from './exportJobs';
 import { allocateRewardEpoch, evaluateEcosystemProposal, REWARD_FORMULA_VERSION, rewardScoreMicros } from './ydFinance';
 import type { Address } from 'viem';
 
@@ -94,6 +124,8 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly missions = new Map<string, Mission>();
   readonly stages = new Map<string, WorkflowStage[]>();
   readonly edges = new Map<string, WorkflowEdge[]>();
+  readonly workflowTransitions = new Map<string, WorkflowTransitionCheckpoint[]>();
+  readonly workflowTemplates = new Map<string, WorkflowTemplateDetail[]>();
   readonly stageOffers = new Map<string, StageOffer[]>();
   readonly agentPerformance = new Map<string, { agentId: string; outcome: 'done' | 'failed' }>();
   readonly events = new Map<string, ExecutionEvent[]>();
@@ -102,20 +134,39 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly disputes = new Map<string, Dispute[]>();
   readonly disputeActions = new Map<string, DisputeAction[]>();
   readonly arbitrationMembers = new Map<string, ArbitrationMember>();
-  readonly disputeProposals = new Map<string, ArbitrationProposal>();
+  readonly disputeProposals = new Map<string, ArbitrationProposal[]>();
   readonly disputeElectorate = new Map<string, ArbitrationElector[]>();
   readonly disputeVotes = new Map<string, DisputeVote[]>();
+  readonly governanceExecutionQueue = new Map<string, GovernanceExecutionItem>();
   readonly notifications = new Map<string, Notification[]>();
   readonly preferences = new Map<string, UserPreferences>();
   readonly adminActions: AdminAction[] = [];
   readonly ledgerEntries: LedgerEntry[] = [];
+  readonly ledgerExportJobs = new Map<string, LedgerExportJob & {
+    ownerId: string;
+    exportType: 'developer_ledger';
+    leaseOwner: string | null;
+    leaseExpiresAt: string | null;
+    snapshotCreatedAt: string;
+    snapshotId: string;
+  }>();
+  readonly ledgerExportArtifacts = new Map<string, LedgerExportPrivateArtifact>();
+  readonly ledgerExportEvents: Array<{
+    id: string; jobId: string; actorType: 'user' | 'service' | 'system'; actorId: string | null;
+    action: string; detail: Record<string, string | number>; createdAt: string;
+  }> = [];
   readonly walletBalances = new Map<string, number>();
   readonly walletTransactions = new Map<string, WalletTransaction[]>();
   readonly testTopupClaims = new Map<string, string>();
   readonly idempotency = new Map<string, { method: string; path: string; requestHash: string; result: IdempotentResult | null }>();
   readonly identities = new Map<string, string>();
   readonly rateLimits = new Map<string, { windowStart: number; count: number }>();
-  readonly agentDispatches = new Map<string, AgentDispatch & { completedAt: string | null; callbackIds: Set<string> }>();
+  readonly agentDispatches = new Map<string, AgentDispatch & {
+    attemptNo: number;
+    completedAt: string | null;
+    callbackIds: Set<string>;
+    appliedCallbackIds: Set<string>;
+  }>();
   readonly dispatchOutbox = new Map<string, DispatchOutboxItem & { status: 'pending' | 'processing' | 'done' }>();
   readonly rewardActivities = new Map<string, RewardActivity>();
   readonly rewardEpochs = new Map<string, RewardEpoch>();
@@ -131,6 +182,25 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly agentMetricEvents = new Map<string, AgentMetricEvent[]>();
   readonly agentReputationSnapshots = new Map<string, AgentReputationSnapshot[]>();
   readonly agentFeedback = new Map<string, AgentFeedback[]>();
+  readonly missionControls = new Map<string, {
+    pausedAt: string | null; pausedBy: string | null; pauseReason: string | null; pauseMode: MissionPauseMode | null;
+    schedulerRevision: number; schedulerState: 'clean' | 'dirty'; changeVersion: number; checkpointSequence: number;
+  }>();
+  readonly missionChangeRequests = new Map<string, MissionChangeRequest[]>();
+  readonly workflowCheckpoints = new Map<string, WorkflowCheckpoint[]>();
+
+  private missionView(mission: Mission): Mission {
+    const control = this.missionControls.get(mission.id);
+    return {
+      ...mission,
+      status: control?.pausedAt && mission.status === 'running' ? 'paused' : mission.status,
+      pausedAt: control?.pausedAt ?? null,
+      pausedBy: control?.pausedBy ?? null,
+      pauseReason: control?.pauseReason ?? null,
+      pauseMode: control?.pauseMode ?? null,
+      schedulerRevision: control?.schedulerRevision ?? 0,
+    };
+  }
 
   private recordAgentPerformance(stageId: string, agentId: string, outcome: 'done' | 'failed') {
     if (this.agentPerformance.has(stageId)) return;
@@ -337,20 +407,25 @@ export class MemoryPlatformStore implements PlatformStore {
 
   async listMissions(user: UserContext): Promise<Mission[]> {
     const missions = [...this.missions.values()];
-    if (user.role === 'admin') return copy(missions);
-    if (user.role === 'requester') return copy(missions.filter((mission) => mission.requesterId === user.id));
+    if (user.role === 'admin') return copy(missions.map((mission) => this.missionView(mission)));
+    if (user.role === 'requester') return copy(missions.filter((mission) => mission.requesterId === user.id).map((mission) => this.missionView(mission)));
     const owned = new Set([...this.agents.values()].filter((agent) => agent.ownerId === user.id).map((agent) => agent.id));
-    return copy(missions.filter((mission) => (this.stages.get(mission.id) ?? []).some((stage) => stage.agentId && owned.has(stage.agentId))));
+    return copy(missions.filter((mission) => (this.stages.get(mission.id) ?? []).some((stage) => stage.agentId && owned.has(stage.agentId))).map((mission) => this.missionView(mission)));
   }
 
   async getMission(id: string): Promise<Mission | null> {
-    return copy(this.missions.get(id) ?? null);
+    const mission = this.missions.get(id);
+    return mission ? copy(this.missionView(mission)) : null;
   }
 
   async createMission(mission: Mission, stages: WorkflowStage[], edges: WorkflowEdge[] = []): Promise<Mission> {
-    this.missions.set(mission.id, copy(mission));
-    this.stages.set(mission.id, copy(stages));
+    this.missions.set(mission.id, copy({ ...mission, status: mission.status === 'paused' ? 'running' : mission.status }));
+    this.stages.set(mission.id, copy(stages.map((stage) => ({ ...stage, attemptNo: stage.attemptNo || 1, attemptCreatedAt: stage.attemptCreatedAt || stage.createdAt }))));
     this.edges.set(mission.id, copy(edges));
+    this.missionControls.set(mission.id, {
+      pausedAt: mission.pausedAt, pausedBy: mission.pausedBy, pauseReason: mission.pauseReason, pauseMode: mission.pauseMode,
+      schedulerRevision: mission.schedulerRevision, schedulerState: 'clean', changeVersion: 0, checkpointSequence: 0,
+    });
     const now = mission.createdAt;
     const payment = paymentConfig(mission.paymentMethod);
     this.escrows.set(mission.id, {
@@ -360,7 +435,7 @@ export class MemoryPlatformStore implements PlatformStore {
       releaseTxHash: null, payoutHash: null, requesterWalletAddress: null, freezeTxHash: null, resolutionTxHash: null,
       releasedAt: null, createdAt: now, updatedAt: now,
     });
-    return copy(mission);
+    return copy(this.missionView(mission));
   }
 
   async saveCompilation(
@@ -463,10 +538,196 @@ export class MemoryPlatformStore implements PlatformStore {
   async submitMissionForReview(id: string, reviewDueAt: string): Promise<Mission | null> {
     const mission = this.missions.get(id);
     if (!mission) return null;
-    if (mission.status !== 'running') return copy(mission);
+    if (mission.status !== 'running' || this.missionControls.get(id)?.pausedAt) return copy(this.missionView(mission));
     const updated: Mission = { ...mission, status: 'review', progress: 100, currentStage: '等待验收', reviewDueAt };
     this.missions.set(id, updated);
-    return copy(updated);
+    return copy(this.missionView(updated));
+  }
+
+  async pauseMission(id: string, actorId: string, mode: MissionPauseMode, reason: string, pausedAt: string) {
+    const mission = this.missions.get(id);
+    const escrow = this.escrows.get(id);
+    const control = this.missionControls.get(id);
+    if (!mission || !control || mission.status !== 'running' || escrow?.status !== 'held') {
+      return { state: 'invalid' as const, mission: mission ? copy(this.missionView(mission)) : null };
+    }
+    const escalatesToEmergency = Boolean(control.pausedAt && control.pauseMode === 'requester' && mode === 'emergency');
+    if (control.pausedAt && !escalatesToEmergency) {
+      return { state: 'unchanged' as const, mission: copy(this.missionView(mission)) };
+    }
+    const next = {
+      ...control, pausedAt, pausedBy: actorId, pauseReason: reason, pauseMode: mode,
+      schedulerRevision: control.schedulerRevision + 1, schedulerState: 'clean' as const,
+      checkpointSequence: control.checkpointSequence + 1,
+    };
+    this.missionControls.set(id, next);
+    this.events.set(id, [...(this.events.get(id) ?? []), {
+      id: `EVT-${crypto.randomUUID()}`, missionId: id, stageId: null, type: 'mission.paused',
+      message: mode === 'emergency' ? '管理员已紧急暂停任务' : '任务方已暂停执行',
+      actorType: mode === 'emergency' ? 'platform' : 'requester', actorId, payload: { mode, reason }, createdAt: pausedAt,
+    }]);
+    this.workflowCheckpoints.set(id, [{
+      id: `CHECKPOINT-${crypto.randomUUID()}`, missionId: id, sequence: next.checkpointSequence, kind: 'pause',
+      workflowVersion: mission.workflowVersion, schedulerRevision: next.schedulerRevision, changeVersion: next.changeVersion,
+      schedulerState: 'clean', payload: { mode, reason }, createdBy: actorId, createdAt: pausedAt,
+    }, ...(this.workflowCheckpoints.get(id) ?? [])]);
+    const view = this.missionView(mission);
+    return { state: 'applied' as const, mission: copy(view), schedulerRevision: view.schedulerRevision };
+  }
+
+  async resumeMission(
+    id: string,
+    actorId: string,
+    expectedMode: MissionPauseMode,
+    expectedSchedulerRevision: number,
+    resumedAt: string,
+  ) {
+    const mission = this.missions.get(id);
+    const escrow = this.escrows.get(id);
+    const control = this.missionControls.get(id);
+    if (!mission || !control || mission.status !== 'running' || escrow?.status !== 'held') {
+      return { state: 'invalid' as const, mission: mission ? copy(this.missionView(mission)) : null };
+    }
+    if (!control.pausedAt) return { state: 'unchanged' as const, mission: copy(this.missionView(mission)) };
+    if (control.pauseMode !== expectedMode || control.schedulerRevision !== expectedSchedulerRevision) {
+      return { state: 'invalid' as const, mission: copy(this.missionView(mission)) };
+    }
+    const payload = { mode: control.pauseMode, pausedAt: control.pausedAt, reason: control.pauseReason };
+    const next = {
+      ...control, pausedAt: null, pausedBy: null, pauseReason: null, pauseMode: null,
+      schedulerRevision: control.schedulerRevision + 1, schedulerState: 'dirty' as const,
+      checkpointSequence: control.checkpointSequence + 1,
+    };
+    this.missionControls.set(id, next);
+    this.events.set(id, [...(this.events.get(id) ?? []), {
+      id: `EVT-${crypto.randomUUID()}`, missionId: id, stageId: null, type: 'mission.resumed',
+      message: '任务执行已恢复', actorType: expectedMode === 'emergency' ? 'platform' : 'requester',
+      actorId, payload, createdAt: resumedAt,
+    }]);
+    this.workflowCheckpoints.set(id, [{
+      id: `CHECKPOINT-${crypto.randomUUID()}`, missionId: id, sequence: next.checkpointSequence, kind: 'resume',
+      workflowVersion: mission.workflowVersion, schedulerRevision: next.schedulerRevision, changeVersion: next.changeVersion,
+      schedulerState: 'dirty', payload, createdBy: actorId, createdAt: resumedAt,
+    }, ...(this.workflowCheckpoints.get(id) ?? [])]);
+    const view = this.missionView(mission);
+    return { state: 'applied' as const, mission: copy(view), schedulerRevision: view.schedulerRevision };
+  }
+
+  async applyMissionChangeRequest(input: {
+    id: string; missionId: string; targetStageIds: string[]; resetStageIds: string[];
+    reason: string; acceptanceCriteria: string; requestedBy: string; createdAt: string;
+    expectedRunningStageIds?: string[];
+  }) {
+    const mission = this.missions.get(input.missionId);
+    const escrow = this.escrows.get(input.missionId);
+    const control = this.missionControls.get(input.missionId);
+    const stages = this.stages.get(input.missionId) ?? [];
+    const resetIds = new Set(input.resetStageIds);
+    const expectedRunningIds = new Set(input.expectedRunningStageIds ?? []);
+    const resetStages = stages.filter((stage) => resetIds.has(stage.id));
+    const targetStages = stages.filter((stage) => input.targetStageIds.includes(stage.id));
+    if (!mission || !control || escrow?.status !== 'held' || !resetIds.size || resetStages.length !== resetIds.size
+      || targetStages.length !== new Set(input.targetStageIds).size || targetStages.some((stage) => !['done', 'failed'].includes(stage.status))
+      || [...expectedRunningIds].some((stageId) => !resetIds.has(stageId))
+      || [...expectedRunningIds].some((stageId) => {
+        const stage = resetStages.find((candidate) => candidate.id === stageId);
+        return stage?.status !== 'running' || stage.nodeType !== 'approval';
+      })
+      || !(mission.status === 'review' || (mission.status === 'running' && control.pausedAt))) {
+      return { state: 'invalid' as const, mission: mission ? copy(this.missionView(mission)) : null };
+    }
+    if (resetStages.some((stage) => stage.status === 'running' && !expectedRunningIds.has(stage.id))) {
+      return { state: 'blocked_running_stage' as const, mission: copy(this.missionView(mission)) };
+    }
+    const priorStageState = resetStages.map((stage) => ({
+      stageId: stage.id, attemptNo: stage.attemptNo, status: stage.status,
+      progress: stage.progress, input: copy(stage.input), output: copy(stage.output),
+    }));
+    const changeVersion = control.changeVersion + 1;
+    const schedulerRevision = control.schedulerRevision + 1;
+    const changeRequest: MissionChangeRequest = {
+      id: input.id, missionId: input.missionId, version: changeVersion,
+      targetStageIds: copy(input.targetStageIds), resetStageIds: [...resetIds], reason: input.reason,
+      acceptanceCriteria: input.acceptanceCriteria, requestedBy: input.requestedBy,
+      priorStageState, status: 'applied', createdAt: input.createdAt,
+    };
+    this.missionChangeRequests.set(input.missionId, [changeRequest, ...(this.missionChangeRequests.get(input.missionId) ?? [])]);
+    for (const [id, item] of this.dispatchOutbox) {
+      if (item.missionId === input.missionId && resetIds.has(item.stageId)) {
+        this.dispatchOutbox.set(id, { ...item, status: 'done', updatedAt: input.createdAt });
+      }
+    }
+    this.stages.set(input.missionId, stages.map((stage) => resetIds.has(stage.id) ? {
+      ...stage, status: 'queued' as const, progress: 0, output: null, attemptNo: stage.attemptNo + 1, updatedAt: input.createdAt,
+      attemptCreatedAt: input.createdAt,
+      input: {
+        ...stage.input,
+        rework: {
+          changeRequestId: input.id,
+          reason: input.reason,
+          acceptanceCriteria: input.acceptanceCriteria,
+          targetStageIds: copy(input.targetStageIds),
+          isTarget: input.targetStageIds.includes(stage.id),
+          requestedAt: input.createdAt,
+        },
+      },
+    } : stage));
+    const nextControl = {
+      ...control, changeVersion, schedulerRevision, schedulerState: 'dirty' as const,
+      checkpointSequence: control.checkpointSequence + 1,
+    };
+    this.missionControls.set(input.missionId, nextControl);
+    const updatedMission = mission.status === 'review' ? {
+      ...mission, status: 'running' as const, reviewDueAt: null,
+      currentStage: '已创建返工版本，等待重新执行', updatedAt: input.createdAt,
+    } : mission;
+    this.missions.set(input.missionId, updatedMission);
+    this.events.set(input.missionId, [...(this.events.get(input.missionId) ?? []), {
+      id: `EVT-${crypto.randomUUID()}`, missionId: input.missionId, stageId: null,
+      type: 'mission.change_requested', message: '任务方已创建版本化返工请求', actorType: 'requester', actorId: input.requestedBy,
+      payload: { changeRequestId: input.id, targetStageIds: input.targetStageIds, resetStageIds: [...resetIds], reason: input.reason, acceptanceCriteria: input.acceptanceCriteria },
+      createdAt: input.createdAt,
+    }]);
+    this.workflowCheckpoints.set(input.missionId, [{
+      id: `CHECKPOINT-${crypto.randomUUID()}`, missionId: input.missionId,
+      sequence: nextControl.checkpointSequence, kind: 'change_request', workflowVersion: mission.workflowVersion,
+      schedulerRevision, changeVersion, schedulerState: 'dirty',
+      payload: { changeRequestId: input.id, targetStageIds: input.targetStageIds, resetStageIds: [...resetIds] },
+      createdBy: input.requestedBy, createdAt: input.createdAt,
+    }, ...(this.workflowCheckpoints.get(input.missionId) ?? [])]);
+    const view = this.missionView(updatedMission);
+    return { state: 'applied' as const, mission: copy(view), changeRequest: copy(changeRequest), schedulerRevision };
+  }
+
+  async listMissionChangeRequests(missionId: string): Promise<MissionChangeRequest[]> {
+    return copy(this.missionChangeRequests.get(missionId) ?? []);
+  }
+
+  async listWorkflowCheckpoints(missionId: string, limit = 50): Promise<WorkflowCheckpoint[]> {
+    return copy((this.workflowCheckpoints.get(missionId) ?? []).slice(0, Math.max(1, Math.min(200, limit))));
+  }
+
+  async listDirtyMissionControls(limit = 50): Promise<Array<{ missionId: string; schedulerRevision: number }>> {
+    const rows = [...this.missionControls.entries()].filter(([missionId, control]) => {
+      const mission = this.missions.get(missionId);
+      return control.schedulerState === 'dirty' && !control.pausedAt
+        && ['running', 'review'].includes(mission?.status ?? '') && this.escrows.get(missionId)?.status === 'held';
+    }).map(([missionId, control]) => ({ missionId, schedulerRevision: control.schedulerRevision }));
+    return copy(rows.slice(0, Math.max(1, Math.min(200, limit))));
+  }
+
+  async markMissionCheckpointClean(missionId: string, schedulerRevision: number, actorId: string | null, reconciledAt: string): Promise<boolean> {
+    const control = this.missionControls.get(missionId);
+    const mission = this.missions.get(missionId);
+    if (!control || !mission || control.pausedAt || control.schedulerState !== 'dirty' || control.schedulerRevision !== schedulerRevision) return false;
+    const next = { ...control, schedulerState: 'clean' as const, checkpointSequence: control.checkpointSequence + 1 };
+    this.missionControls.set(missionId, next);
+    this.workflowCheckpoints.set(missionId, [{
+      id: `CHECKPOINT-${crypto.randomUUID()}`, missionId, sequence: next.checkpointSequence, kind: 'reconciled',
+      workflowVersion: mission.workflowVersion, schedulerRevision, changeVersion: next.changeVersion,
+      schedulerState: 'clean', payload: {}, createdBy: actorId, createdAt: reconciledAt,
+    }, ...(this.workflowCheckpoints.get(missionId) ?? [])]);
+    return true;
   }
 
   async acceptMission(id: string, actorId: string, releaseTxHash: string | null) {
@@ -587,6 +848,96 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(this.edges.get(missionId) ?? []);
   }
 
+  async recordWorkflowTransition(checkpoint: WorkflowTransitionCheckpoint): Promise<{ applied: boolean; checkpoint: WorkflowTransitionCheckpoint }> {
+    const rows = this.workflowTransitions.get(checkpoint.missionId) ?? [];
+    const existing = rows.find((item) => item.edgeId === checkpoint.edgeId && item.sourceAttemptNo === checkpoint.sourceAttemptNo);
+    if (existing) return { applied: false, checkpoint: copy(existing) };
+    const mission = this.missions.get(checkpoint.missionId);
+    const edge = (this.edges.get(checkpoint.missionId) ?? []).find((candidate) => candidate.id === checkpoint.edgeId);
+    const source = (this.stages.get(checkpoint.missionId) ?? []).find((stage) => stage.id === checkpoint.sourceStageId);
+    if (!mission || mission.workflowVersion !== checkpoint.workflowVersion || !edge
+      || edge.sourceStageId !== checkpoint.sourceStageId || edge.targetStageId !== checkpoint.targetStageId
+      || source?.status !== 'done' || source.attemptNo !== checkpoint.sourceAttemptNo) {
+      throw new Error('WORKFLOW_TRANSITION_CONFLICT');
+    }
+    this.workflowTransitions.set(checkpoint.missionId, [...rows, copy(checkpoint)]);
+    return { applied: true, checkpoint: copy(checkpoint) };
+  }
+
+  async listWorkflowTransitions(missionId: string, limit?: number): Promise<WorkflowTransitionCheckpoint[]> {
+    const rows = (this.workflowTransitions.get(missionId) ?? [])
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.edgeId.localeCompare(right.edgeId));
+    return copy(limit === undefined ? rows : rows.slice(-Math.max(1, Math.min(5_000, limit))));
+  }
+
+  async listCurrentWorkflowTransitions(missionId: string): Promise<WorkflowTransitionCheckpoint[]> {
+    const stages = new Map((this.stages.get(missionId) ?? []).map((stage) => [stage.id, stage]));
+    return copy((this.workflowTransitions.get(missionId) ?? [])
+      .filter((checkpoint) => stages.get(checkpoint.sourceStageId)?.attemptNo === checkpoint.sourceAttemptNo)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.edgeId.localeCompare(right.edgeId)));
+  }
+
+  async saveWorkflowTemplateVersion(input: {
+    id: string; ownerId: string; name: string; description: string; nodes: WorkflowStage[]; edges: WorkflowEdge[];
+    entryIds: string[]; exitIds: string[]; contentHash: string; createdAt: string;
+  }): Promise<WorkflowTemplateSaveResult> {
+    const rows = this.workflowTemplates.get(input.ownerId) ?? [];
+    const existingIndex = rows.findIndex((detail) => detail.template.name === input.name);
+    if (existingIndex < 0) {
+      const detail: WorkflowTemplateDetail = {
+        template: {
+          id: input.id, ownerId: input.ownerId, name: input.name, description: input.description,
+          currentVersion: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
+        },
+        version: {
+          templateId: input.id, version: 1, nodes: copy(input.nodes), edges: copy(input.edges),
+          entryIds: copy(input.entryIds), exitIds: copy(input.exitIds), contentHash: input.contentHash, createdAt: input.createdAt,
+        },
+      };
+      this.workflowTemplates.set(input.ownerId, [...rows, detail]);
+      return { state: 'saved', detail: copy(detail) };
+    }
+    const existing = rows[existingIndex];
+    const versions = (existing as WorkflowTemplateDetail & { versions?: WorkflowTemplateDetail['version'][] }).versions
+      ?? [existing.version];
+    const current = versions.find((version) => version.version === existing.template.currentVersion) ?? existing.version;
+    if (current.contentHash === input.contentHash && existing.template.description === input.description) {
+      return { state: 'unchanged', detail: copy({ template: existing.template, version: current }) };
+    }
+    const nextVersion = existing.template.currentVersion + 1;
+    const version = {
+      templateId: existing.template.id, version: nextVersion, nodes: copy(input.nodes), edges: copy(input.edges),
+      entryIds: copy(input.entryIds), exitIds: copy(input.exitIds), contentHash: input.contentHash, createdAt: input.createdAt,
+    };
+    const next = {
+      template: {
+        ...existing.template, description: input.description, currentVersion: nextVersion, updatedAt: input.createdAt,
+      },
+      version,
+      versions: [...versions, version],
+    };
+    const nextRows = [...rows];
+    nextRows[existingIndex] = next;
+    this.workflowTemplates.set(input.ownerId, nextRows);
+    return { state: 'saved', detail: copy({ template: next.template, version }) };
+  }
+
+  async listWorkflowTemplates(ownerId: string): Promise<WorkflowTemplateDetail[]> {
+    return copy((this.workflowTemplates.get(ownerId) ?? [])
+      .map((detail) => ({ template: detail.template, version: detail.version }))
+      .sort((left, right) => right.template.updatedAt.localeCompare(left.template.updatedAt)));
+  }
+
+  async getWorkflowTemplate(ownerId: string, templateId: string, version?: number): Promise<WorkflowTemplateDetail | null> {
+    const detail = (this.workflowTemplates.get(ownerId) ?? []).find((candidate) => candidate.template.id === templateId);
+    if (!detail) return null;
+    const versions = (detail as WorkflowTemplateDetail & { versions?: WorkflowTemplateDetail['version'][] }).versions
+      ?? [detail.version];
+    const selected = version === undefined ? versions.find((candidate) => candidate.version === detail.template.currentVersion)
+      : versions.find((candidate) => candidate.version === version);
+    return selected ? copy({ template: detail.template, version: selected }) : null;
+  }
+
   async listStageOffers(missionId: string, now = new Date().toISOString()): Promise<StageOffer[]> {
     return copy((this.stageOffers.get(missionId) ?? []).map((offer) => (
       offer.status === 'pending' && Date.parse(offer.expiresAt) <= Date.parse(now)
@@ -638,15 +989,25 @@ export class MemoryPlatformStore implements PlatformStore {
     const stages = this.stages.get(missionId) ?? [];
     const mission = this.missions.get(missionId);
     const escrow = this.escrows.get(missionId);
-    if (mission?.status !== 'running' || escrow?.status !== 'held') return null;
+    if (mission?.status !== 'running' || escrow?.status !== 'held' || this.missionControls.get(missionId)?.pausedAt) return null;
     const edges = this.edges.get(missionId) ?? [];
     const dependenciesDone = edges
       .filter((edge) => edge.targetStageId === stageId)
       .every((edge) => stages.find((stage) => stage.id === edge.sourceStageId)?.status === 'done');
+    const hasCurrentTransitionError = (this.workflowTransitions.get(missionId) ?? []).some((checkpoint) => (
+      checkpoint.targetStageId === stageId && checkpoint.errorCode
+      && stages.find((stage) => stage.id === checkpoint.sourceStageId)?.attemptNo === checkpoint.sourceAttemptNo
+    ));
+    const hasMissingRuleCheckpoint = edges
+      .filter((edge) => edge.targetStageId === stageId && (edge.condition || edge.mappings?.length))
+      .some((edge) => !(this.workflowTransitions.get(missionId) ?? []).some((checkpoint) => (
+        checkpoint.edgeId === edge.id
+        && checkpoint.sourceAttemptNo === stages.find((stage) => stage.id === edge.sourceStageId)?.attemptNo
+      )));
     const index = stages.findIndex((stage) => (
       stage.id === stageId && stage.nodeType === 'task' && stage.agentId && (stage.status === 'queued' || stage.status === 'failed')
     ));
-    if (index < 0 || !dependenciesDone) return null;
+    if (index < 0 || !dependenciesDone || hasCurrentTransitionError || hasMissingRuleCheckpoint) return null;
     const updated = { ...stages[index], status: 'running' as const, progress: Math.max(1, stages[index].progress) };
     const next = [...stages];
     next[index] = updated;
@@ -687,16 +1048,21 @@ export class MemoryPlatformStore implements PlatformStore {
   }
 
   async enqueueDispatches(missionId: string, stageIds: string[], now: string): Promise<DispatchOutboxItem[]> {
+    const mission = this.missions.get(missionId);
+    if (mission?.status !== 'running' || this.escrows.get(missionId)?.status !== 'held' || this.missionControls.get(missionId)?.pausedAt) return [];
     const queued: DispatchOutboxItem[] = [];
     const expiresAt = new Date(Date.parse(now) + 2 * 60 * 60 * 1_000).toISOString();
     for (const stageId of stageIds) {
       const existing = [...this.dispatchOutbox.values()].find((item) => item.missionId === missionId && item.stageId === stageId);
+      const refreshRun = existing?.status === 'done'
+        || (existing?.status === 'pending' && Date.parse(existing.expiresAt) <= Date.parse(now));
       const item = existing
         ? {
           ...existing,
-          status: existing.status === 'done' ? 'pending' as const : existing.status,
-          runId: existing.status === 'done' ? crypto.randomUUID() : existing.runId,
-          expiresAt: existing.status === 'done' ? expiresAt : existing.expiresAt,
+          status: refreshRun ? 'pending' as const : existing.status,
+          runId: refreshRun ? crypto.randomUUID() : existing.runId,
+          expiresAt: refreshRun ? expiresAt : existing.expiresAt,
+          attempts: refreshRun ? 0 : existing.attempts,
           nextAttemptAt: now,
           updatedAt: now,
         }
@@ -718,21 +1084,47 @@ export class MemoryPlatformStore implements PlatformStore {
     return queued;
   }
 
+  async recoverExpiredStageDispatches(missionId: string, now: string): Promise<string[]> {
+    const mission = this.missions.get(missionId);
+    if (mission?.status !== 'running' || this.escrows.get(missionId)?.status !== 'held'
+      || this.missionControls.get(missionId)?.pausedAt) return [];
+    const stages = this.stages.get(missionId) ?? [];
+    const recovered: string[] = [];
+    const nextStages = stages.map((stage) => {
+      if (stage.status !== 'running') return stage;
+      const outbox = [...this.dispatchOutbox.values()].find((item) => (
+        item.missionId === missionId && item.stageId === stage.id
+      ));
+      const dispatch = outbox ? this.agentDispatches.get(outbox.runId) : null;
+      if (!outbox || !dispatch || dispatch.completedAt || dispatch.attemptNo !== stage.attemptNo
+        || Date.parse(dispatch.expiresAt) > Date.parse(now)) return stage;
+      dispatch.completedAt = now;
+      this.dispatchOutbox.set(outbox.id, { ...outbox, status: 'done', updatedAt: now });
+      recovered.push(stage.id);
+      return { ...stage, status: 'queued' as const, progress: 0, output: null, updatedAt: now };
+    });
+    if (recovered.length) this.stages.set(missionId, nextStages);
+    return recovered;
+  }
+
   async listPendingDispatches(limit: number, now: string): Promise<DispatchOutboxItem[]> {
     for (const [id, item] of this.dispatchOutbox) {
-      if (item.status === 'processing' && Date.parse(item.updatedAt) <= Date.parse(now) - 2 * 60 * 1_000) {
+      if (item.status === 'processing' && !this.missionControls.get(item.missionId)?.pausedAt && Date.parse(item.updatedAt) <= Date.parse(now) - 2 * 60 * 1_000) {
         this.dispatchOutbox.set(id, { ...item, status: 'pending', nextAttemptAt: now, updatedAt: now });
       }
     }
     return copy([...this.dispatchOutbox.values()]
-      .filter((item) => item.status === 'pending' && Date.parse(item.nextAttemptAt) <= Date.parse(now))
+      .filter((item) => item.status === 'pending' && !this.missionControls.get(item.missionId)?.pausedAt && Date.parse(item.nextAttemptAt) <= Date.parse(now))
       .sort((left, right) => left.nextAttemptAt.localeCompare(right.nextAttemptAt) || left.createdAt.localeCompare(right.createdAt))
       .slice(0, limit));
   }
 
   async claimDispatch(id: string, now: string): Promise<boolean> {
     const item = this.dispatchOutbox.get(id);
-    if (!item || item.status !== 'pending' || Date.parse(item.nextAttemptAt) > Date.parse(now)) return false;
+    const mission = item ? this.missions.get(item.missionId) : null;
+    if (!item || item.status !== 'pending' || Date.parse(item.nextAttemptAt) > Date.parse(now)
+      || mission?.status !== 'running' || this.escrows.get(item.missionId)?.status !== 'held'
+      || this.missionControls.get(item.missionId)?.pausedAt) return false;
     this.dispatchOutbox.set(id, { ...item, status: 'processing', attempts: item.attempts + 1, updatedAt: now });
     return true;
   }
@@ -762,6 +1154,31 @@ export class MemoryPlatformStore implements PlatformStore {
     next[index] = updated;
     this.stages.set(missionId, next);
     if (updated.agentId && (status === 'done' || status === 'failed')) this.recordAgentPerformance(stageId, updated.agentId, status);
+    return copy(updated);
+  }
+
+  async transitionStage(
+    missionId: string,
+    stageId: string,
+    expectedStatus: WorkflowStage['status'],
+    status: WorkflowStage['status'],
+    output?: Record<string, unknown> | null,
+  ): Promise<WorkflowStage | null> {
+    const stages = this.stages.get(missionId) ?? [];
+    const index = stages.findIndex((stage) => stage.id === stageId);
+    const mission = this.missions.get(missionId);
+    const escrow = this.escrows.get(missionId);
+    if (index < 0 || stages[index].status !== expectedStatus || mission?.status !== 'running'
+      || escrow?.status !== 'held' || this.missionControls.get(missionId)?.pausedAt) return null;
+    const updated: WorkflowStage = {
+      ...stages[index],
+      status,
+      progress: status === 'done' ? 100 : status === 'queued' ? 0 : stages[index].progress,
+      ...(output === undefined ? {} : { output: copy(output) }),
+    };
+    const next = [...stages];
+    next[index] = updated;
+    this.stages.set(missionId, next);
     return copy(updated);
   }
 
@@ -810,8 +1227,14 @@ export class MemoryPlatformStore implements PlatformStore {
   }
 
   async addDeliverable(deliverable: Deliverable): Promise<Deliverable> {
-    this.deliverables.set(deliverable.missionId, [...(this.deliverables.get(deliverable.missionId) ?? []), copy(deliverable)]);
-    return copy(deliverable);
+    const stage = deliverable.stageId
+      ? (this.stages.get(deliverable.missionId) ?? []).find((candidate) => candidate.id === deliverable.stageId)
+      : null;
+    const attemptNo = stage ? deliverable.attemptNo ?? stage.attemptNo : null;
+    if (deliverable.stageId && (!stage || attemptNo !== stage.attemptNo)) throw new Error('STALE_STAGE_ATTEMPT');
+    const stored = { ...deliverable, attemptNo };
+    this.deliverables.set(deliverable.missionId, [...(this.deliverables.get(deliverable.missionId) ?? []), copy(stored)]);
+    return copy(stored);
   }
 
   async listDeliverables(missionId: string): Promise<Deliverable[]> {
@@ -846,12 +1269,35 @@ export class MemoryPlatformStore implements PlatformStore {
     return { account: await this.getWalletAccount(userId), credited };
   }
 
+  private latestDisputeProposal(disputeId: string): ArbitrationProposal | null {
+    return [...(this.disputeProposals.get(disputeId) ?? [])].sort((left, right) => right.round - left.round)[0] ?? null;
+  }
+
+  private disputeParty(dispute: Dispute, userId: string): boolean {
+    const mission = this.missions.get(dispute.missionId);
+    if (dispute.openedBy === userId || mission?.requesterId === userId) return true;
+    return (this.stages.get(dispute.missionId) ?? []).some((stage) => (
+      stage.agentId ? this.agents.get(stage.agentId)?.ownerId === userId : false
+    ));
+  }
+
+  private arbitrationConflicts(dispute: Dispute): Set<string> {
+    const conflicts = new Set<string>([dispute.openedBy]);
+    const mission = this.missions.get(dispute.missionId);
+    if (mission) conflicts.add(mission.requesterId);
+    for (const stage of this.stages.get(dispute.missionId) ?? []) {
+      const ownerId = stage.agentId ? this.agents.get(stage.agentId)?.ownerId : null;
+      if (ownerId) conflicts.add(ownerId);
+    }
+    return conflicts;
+  }
+
   async listDisputes(user: UserContext): Promise<Dispute[]> {
     const all = [...this.disputes.values()].flat();
     if (user.role === 'admin' || this.arbitrationMembers.get(user.id)?.status === 'active') return copy(all);
     return copy(all.filter((dispute) => {
-      if (this.missions.get(dispute.missionId)?.requesterId === user.id || dispute.openedBy === user.id) return true;
-      const proposal = this.disputeProposals.get(dispute.id);
+      if (this.disputeParty(dispute, user.id)) return true;
+      const proposal = this.latestDisputeProposal(dispute.id);
       return proposal ? (this.disputeElectorate.get(proposal.id) ?? []).some((elector) => elector.userId === user.id) : false;
     }));
   }
@@ -874,13 +1320,18 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(dispute);
   }
 
-  async startDisputeReview(id: string, actorId: string, startedAt = new Date().toISOString()): Promise<Dispute | null> {
+  async startDisputeReview(
+    id: string,
+    actorId: string,
+    startedAt = new Date().toISOString(),
+    weightMode: ArbitrationProposal['weightMode'] = 'one_person_one_vote',
+  ): Promise<Dispute | null> {
     for (const [missionId, disputes] of this.disputes) {
       const index = disputes.findIndex((dispute) => dispute.id === id);
       if (index < 0) continue;
       const existing = disputes[index];
       if (!['open', 'reviewing'].includes(existing.status)) return copy(existing);
-      if (this.disputeProposals.has(id)) {
+      if ((this.disputeProposals.get(id) ?? []).length > 0) {
         if (existing.status === 'open') {
           const next = [...disputes];
           next[index] = { ...existing, status: 'reviewing' };
@@ -905,28 +1356,34 @@ export class MemoryPlatformStore implements PlatformStore {
           });
         }
       }
-      const mission = this.missions.get(missionId);
-      const conflictIds = new Set<string>([existing.openedBy]);
-      if (mission) conflictIds.add(mission.requesterId);
-      for (const stage of this.stages.get(missionId) ?? []) {
-        const ownerId = stage.agentId ? this.agents.get(stage.agentId)?.ownerId : null;
-        if (ownerId) conflictIds.add(ownerId);
-      }
+      const conflictIds = this.arbitrationConflicts(existing);
       const eligibleMembers = [...this.arbitrationMembers.values()]
         .filter((member) => member.status === 'active' && !conflictIds.has(member.userId))
         .sort((left, right) => left.userId.localeCompare(right.userId));
       if (eligibleMembers.length === 0) throw new Error('ARBITRATION_NO_ELIGIBLE_MEMBERS');
       const proposalId = `PROP-${crypto.randomUUID()}`;
+      const electorate = eligibleMembers.map((member) => ({
+        userId: member.userId,
+        displayName: member.displayName,
+        powerSnapshot: member.power,
+        voteWeight: arbitrationVoteWeight(weightMode, member.power),
+      }));
+      const eligibleWeight = electorate.reduce((sum, member) => sum + member.voteWeight, 0);
       const proposal: ArbitrationProposal = {
         id: proposalId,
         disputeId: id,
         proposerId: actorId,
         status: 'active',
-        weightMode: 'one_person_one_vote',
+        weightMode,
+        weightVersion: arbitrationWeightVersion(weightMode),
+        round: 0,
+        parentProposalId: null,
+        appealReason: null,
+        appealDeadlineAt: null,
         votingStartsAt: startedAt,
         votingEndsAt: arbitrationVotingEndsAt(startedAt),
-        quorumRequired: arbitrationQuorum(eligibleMembers.length),
-        eligibleWeight: eligibleMembers.length,
+        quorumRequired: arbitrationQuorum(eligibleWeight),
+        eligibleWeight,
         supportVotes: 0,
         opposeVotes: 0,
         abstainVotes: 0,
@@ -937,13 +1394,8 @@ export class MemoryPlatformStore implements PlatformStore {
         executedBy: null,
         createdAt: startedAt,
       };
-      this.disputeProposals.set(id, proposal);
-      this.disputeElectorate.set(proposalId, eligibleMembers.map((member) => ({
-        userId: member.userId,
-        displayName: member.displayName,
-        powerSnapshot: member.power,
-        voteWeight: 1,
-      })));
+      this.disputeProposals.set(id, [proposal]);
+      this.disputeElectorate.set(proposalId, electorate);
       this.disputeVotes.set(proposalId, []);
       const updated = { ...existing, status: 'reviewing' as const };
       const next = [...disputes];
@@ -951,7 +1403,7 @@ export class MemoryPlatformStore implements PlatformStore {
       this.disputes.set(missionId, next);
       this.disputeActions.set(id, [...(this.disputeActions.get(id) ?? []), {
         id: `${id}:review_started`, disputeId: id, actorId, action: 'review_started',
-        note: `DAO proposal ${proposalId} created with ${eligibleMembers.length} eligible voters`, createdAt: startedAt,
+        note: `DAO proposal ${proposalId} created in ${weightMode} mode with ${eligibleWeight} eligible weight`, createdAt: startedAt,
       }]);
       return copy(updated);
     }
@@ -961,18 +1413,42 @@ export class MemoryPlatformStore implements PlatformStore {
   async getDisputeGovernance(id: string, userId: string, now = new Date().toISOString()): Promise<DisputeGovernance | null> {
     const dispute = [...this.disputes.values()].flat().find((item) => item.id === id);
     if (!dispute) return null;
-    const proposal = this.disputeProposals.get(id) ?? null;
+    const proposals = [...(this.disputeProposals.get(id) ?? [])].sort((left, right) => left.round - right.round);
+    const proposal = proposals.at(-1) ?? null;
     if (!proposal) {
-      return { proposal: null, electorate: [], votes: [], currentUser: { eligible: false, canVote: false, hasVoted: false, choice: null } };
+      return {
+        proposal: null, electorate: [], votes: [], rounds: [], execution: null, executionReady: false,
+        appeal: { used: false, deadlineAt: null, canAppeal: false, reason: null, appellantId: null, createdAt: null },
+        currentUser: { eligible: false, canVote: false, hasVoted: false, choice: null },
+      };
     }
     const electorate = this.disputeElectorate.get(proposal.id) ?? [];
     const votes = this.disputeVotes.get(proposal.id) ?? [];
     const currentVote = votes.find((vote) => vote.voterId === userId);
     const eligible = electorate.some((elector) => elector.userId === userId);
+    const appealProposal = proposals.find((item) => item.round === 1) ?? null;
+    const initialProposal = proposals.find((item) => item.round === 0) ?? null;
     return copy({
       proposal,
       electorate,
       votes,
+      rounds: proposals.map((item) => ({
+        proposal: item,
+        electorate: this.disputeElectorate.get(item.id) ?? [],
+        votes: this.disputeVotes.get(item.id) ?? [],
+      })),
+      appeal: {
+        used: Boolean(appealProposal),
+        deadlineAt: initialProposal?.appealDeadlineAt ?? null,
+        canAppeal: !appealProposal && initialProposal?.status !== 'active' && initialProposal?.status !== 'executed'
+          && !this.governanceExecutionQueue.has(id) && Boolean(initialProposal?.appealDeadlineAt)
+          && Date.parse(now) < Date.parse(initialProposal!.appealDeadlineAt!) && this.disputeParty(dispute, userId),
+        reason: appealProposal?.appealReason ?? null,
+        appellantId: appealProposal?.proposerId ?? null,
+        createdAt: appealProposal?.createdAt ?? null,
+      },
+      execution: this.governanceExecutionQueue.get(id) ?? null,
+      executionReady: arbitrationExecutionReady(proposal, Boolean(appealProposal), now),
       currentUser: {
         eligible,
         canVote: eligible && !currentVote && proposal.status === 'active'
@@ -1005,13 +1481,13 @@ export class MemoryPlatformStore implements PlatformStore {
       createdAt: votedAt,
     };
     this.disputeVotes.set(governance.proposal.id, [...governance.votes, vote]);
-    const proposal = this.disputeProposals.get(id)!;
-    this.disputeProposals.set(id, {
+    const proposals = this.disputeProposals.get(id) ?? [];
+    this.disputeProposals.set(id, proposals.map((proposal) => proposal.id === governance.proposal!.id ? {
       ...proposal,
       supportVotes: proposal.supportVotes + (choice === 'support_refund' ? elector.voteWeight : 0),
       opposeVotes: proposal.opposeVotes + (choice === 'oppose_refund' ? elector.voteWeight : 0),
       abstainVotes: proposal.abstainVotes + (choice === 'abstain' ? elector.voteWeight : 0),
-    });
+    } : proposal));
     const finalized = await this.finalizeDisputeProposal(id, voterId, votedAt);
     if (finalized.state === 'missing') return { state: 'missing' };
     return { state: 'applied', governance: finalized.governance };
@@ -1023,31 +1499,124 @@ export class MemoryPlatformStore implements PlatformStore {
     if (governance.proposal.status !== 'active') return { state: 'finalized', governance };
     const evaluation = evaluateArbitrationProposal(governance.proposal, finalizedAt);
     if (!evaluation.finalizable) return { state: 'not_ready', governance };
-    this.disputeProposals.set(id, {
-      ...governance.proposal,
+    const proposals = this.disputeProposals.get(id) ?? [];
+    this.disputeProposals.set(id, proposals.map((proposal) => proposal.id === governance.proposal!.id ? {
+      ...proposal,
       status: evaluation.status,
       outcome: evaluation.outcome,
       finalizedAt,
       finalizedBy: actorId,
-    });
+      appealDeadlineAt: proposal.round === 0 ? arbitrationAppealEndsAt(finalizedAt) : null,
+    } : proposal));
     return { state: 'finalized', governance: (await this.getDisputeGovernance(id, actorId, finalizedAt))! };
+  }
+
+  async createDisputeAppeal(id: string, appellantId: string, reason: string, createdAt: string): Promise<DisputeAppealResult> {
+    const dispute = [...this.disputes.values()].flat().find((item) => item.id === id);
+    if (!dispute) return { state: 'missing' };
+    if (!this.disputeParty(dispute, appellantId)) return { state: 'not_allowed' };
+    const proposals = this.disputeProposals.get(id) ?? [];
+    if (proposals.some((proposal) => proposal.round === 1)) return { state: 'already_appealed' };
+    const initial = proposals.find((proposal) => proposal.round === 0);
+    if (!initial || initial.status === 'active' || initial.status === 'executed' || !initial.appealDeadlineAt) {
+      return { state: 'not_finalized' };
+    }
+    if (Date.parse(createdAt) >= Date.parse(initial.appealDeadlineAt)) return { state: 'expired' };
+    if (this.governanceExecutionQueue.has(id)) return { state: 'execution_queued' };
+    const originalElectorate = this.disputeElectorate.get(initial.id) ?? [];
+    const originalIds = new Set(originalElectorate.map((member) => member.userId));
+    const currentEligible = [...this.arbitrationMembers.values()]
+      .filter((member) => member.status === 'active' && !this.arbitrationConflicts(dispute).has(member.userId));
+    if (!currentEligible.some((member) => !originalIds.has(member.userId))) return { state: 'no_expanded_electorate' };
+    const currentById = new Map(this.arbitrationMembers.values().map((member) => [member.userId, member]));
+    const electorateById = new Map(originalElectorate.map((member) => [member.userId, {
+      ...member,
+      powerSnapshot: currentById.get(member.userId)?.power ?? member.powerSnapshot,
+    }]));
+    for (const member of currentEligible) {
+      electorateById.set(member.userId, {
+        userId: member.userId, displayName: member.displayName, powerSnapshot: member.power,
+        voteWeight: arbitrationVoteWeight(initial.weightMode, member.power),
+      });
+    }
+    const electorate = [...electorateById.values()].sort((left, right) => left.userId.localeCompare(right.userId))
+      .map((member) => ({ ...member, voteWeight: arbitrationVoteWeight(initial.weightMode, member.powerSnapshot) }));
+    const eligibleWeight = electorate.reduce((sum, member) => sum + member.voteWeight, 0);
+    const proposal: ArbitrationProposal = {
+      id: `PROP-${crypto.randomUUID()}`, disputeId: id, proposerId: appellantId, status: 'active',
+      weightMode: initial.weightMode, weightVersion: initial.weightVersion, round: 1, parentProposalId: initial.id,
+      appealReason: reason, appealDeadlineAt: null, votingStartsAt: createdAt, votingEndsAt: arbitrationVotingEndsAt(createdAt),
+      quorumRequired: arbitrationQuorum(eligibleWeight), eligibleWeight, supportVotes: 0, opposeVotes: 0, abstainVotes: 0,
+      outcome: null, finalizedAt: null, finalizedBy: null, executedAt: null, executedBy: null, createdAt,
+    };
+    this.disputeProposals.set(id, [...proposals, proposal]);
+    this.disputeElectorate.set(proposal.id, electorate);
+    this.disputeVotes.set(proposal.id, []);
+    this.disputeActions.set(id, [...(this.disputeActions.get(id) ?? []), {
+      id: `${id}:appeal`, disputeId: id, actorId: appellantId, action: 'appeal_created', note: reason, createdAt,
+    }]);
+    return { state: 'created', governance: (await this.getDisputeGovernance(id, appellantId, createdAt))! };
+  }
+
+  async queueDisputeExecution(id: string, actorId: string, queuedAt: string, web3: boolean): Promise<DisputeExecutionQueueResult> {
+    const governance = await this.getDisputeGovernance(id, actorId, queuedAt);
+    if (!governance?.proposal) return { state: 'missing' };
+    const existing = this.governanceExecutionQueue.get(id);
+    if (existing?.status === 'executed') return { state: 'already_executed' };
+    if (existing) return { state: 'replayed', governance };
+    const dispute = [...this.disputes.values()].flat().find((item) => item.id === id)!;
+    if (this.escrows.get(dispute.missionId)?.status !== 'frozen') return { state: 'escrow_not_frozen' };
+    if (dispute.status !== 'reviewing' || !governance.executionReady) return { state: 'not_ready' };
+    const action = governance.proposal.outcome === 'refund_requester' ? 'refund_requester' : 'reject_dispute';
+    const payloadHash = await arbitrationExecutionPayloadHash(id, governance.proposal.id, action);
+    const concurrentExecution = this.governanceExecutionQueue.get(id);
+    if (concurrentExecution?.status === 'executed') return { state: 'already_executed' };
+    if (concurrentExecution) {
+      return { state: 'replayed', governance: (await this.getDisputeGovernance(id, actorId, queuedAt))! };
+    }
+    const currentProposals = [...(this.disputeProposals.get(id) ?? [])].sort((left, right) => left.round - right.round);
+    const currentProposal = currentProposals.at(-1) ?? null;
+    const currentDispute = [...this.disputes.values()].flat().find((item) => item.id === id);
+    if (currentDispute?.status !== 'reviewing'
+      || this.escrows.get(currentDispute.missionId)?.status !== 'frozen'
+      || currentProposal?.id !== governance.proposal.id
+      || !arbitrationExecutionReady(currentProposal, currentProposals.some((proposal) => proposal.round === 1), queuedAt)) {
+      return { state: 'not_ready' };
+    }
+    const item: GovernanceExecutionItem = {
+      id: `GEXEC-${crypto.randomUUID()}`, scope: 'task_dispute', sourceId: id, proposalId: governance.proposal.id,
+      action, payloadHash,
+      status: web3 ? 'awaiting_transaction' : 'queued', requestedBy: actorId, requestedAt: queuedAt,
+      txHash: null, executedBy: null, executedAt: null,
+    };
+    this.governanceExecutionQueue.set(id, item);
+    this.disputeActions.set(id, [...(this.disputeActions.get(id) ?? []), {
+      id: `${id}:execution_queued`, disputeId: id, actorId, action: 'execution_queued', note: item.payloadHash, createdAt: queuedAt,
+    }]);
+    return { state: 'queued', governance: (await this.getDisputeGovernance(id, actorId, queuedAt))! };
   }
 
   async resolveDispute(id: string, resolution: string, status: 'resolved' | 'rejected', actorId: string, resolutionTxHash: string | null) {
     for (const [missionId, disputes] of this.disputes) {
       const index = disputes.findIndex((dispute) => dispute.id === id);
       if (index < 0) continue;
-      const proposal = this.disputeProposals.get(id);
+      const proposal = this.latestDisputeProposal(id);
+      const execution = this.governanceExecutionQueue.get(id);
       const authorized = status === 'resolved'
-        ? proposal?.status === 'succeeded' && proposal.outcome === 'refund_requester'
-        : proposal?.status === 'defeated' && proposal.outcome === 'reject_dispute';
+        ? proposal?.status === 'succeeded' && proposal.outcome === 'refund_requester' && execution?.action === 'refund_requester'
+        : proposal?.status === 'defeated' && proposal.outcome === 'reject_dispute' && execution?.action === 'reject_dispute';
       if (disputes[index].status !== 'reviewing' || !authorized) return { dispute: copy(disputes[index]), applied: false };
       const resolvedAt = new Date().toISOString();
       const updated = { ...disputes[index], status, resolution, resolutionTxHash, resolvedAt };
       const next = [...disputes];
       next[index] = updated;
       this.disputes.set(missionId, next);
-      this.disputeProposals.set(id, { ...proposal!, status: 'executed', executedAt: resolvedAt, executedBy: actorId });
+      this.disputeProposals.set(id, (this.disputeProposals.get(id) ?? []).map((item) => item.id === proposal!.id
+        ? { ...item, status: 'executed', executedAt: resolvedAt, executedBy: actorId }
+        : item));
+      this.governanceExecutionQueue.set(id, {
+        ...execution!, status: 'executed', txHash: resolutionTxHash, executedBy: actorId, executedAt: resolvedAt,
+      });
       const escrow = this.escrows.get(missionId);
       if (escrow?.status === 'frozen') {
         this.escrows.set(missionId, { ...escrow, status: status === 'resolved' ? 'refunded' : 'held', resolutionTxHash });
@@ -1070,8 +1639,10 @@ export class MemoryPlatformStore implements PlatformStore {
       }
       this.disputeActions.set(id, [...(this.disputeActions.get(id) ?? []), {
         id: `${id}:${status}`, disputeId: id, actorId, action: status, note: resolution, createdAt: resolvedAt,
+      }, {
+        id: `${id}:execution_executed`, disputeId: id, actorId, action: 'execution_executed', note: execution!.payloadHash, createdAt: resolvedAt,
       }]);
-      for (const vote of this.disputeVotes.get(id) ?? []) {
+      for (const vote of this.disputeVotes.get(proposal!.id) ?? []) {
         await this.recordRewardActivity({
           id: `YDACT-${id}-arb-${vote.voterId}`,
           sourceKey: `${id}:arbitration:${vote.voterId}`,
@@ -1102,7 +1673,12 @@ export class MemoryPlatformStore implements PlatformStore {
 
   async createAgentDispatch(dispatch: AgentDispatch): Promise<void> {
     if (this.agentDispatches.has(dispatch.runId)) return;
-    this.agentDispatches.set(dispatch.runId, { ...copy(dispatch), completedAt: null, callbackIds: new Set() });
+    const stage = (this.stages.get(dispatch.missionId) ?? []).find((candidate) => candidate.id === dispatch.stageId && candidate.status === 'running');
+    if (!stage) throw new Error('STALE_STAGE_ATTEMPT');
+    this.agentDispatches.set(dispatch.runId, {
+      ...copy(dispatch), attemptNo: stage.attemptNo, completedAt: null,
+      callbackIds: new Set(), appliedCallbackIds: new Set(),
+    });
   }
 
   async applyAgentCallback(update: AgentCallbackUpdate) {
@@ -1112,14 +1688,19 @@ export class MemoryPlatformStore implements PlatformStore {
       || dispatch.stageId !== update.stageId
       || dispatch.agentId !== update.agentId
       || dispatch.expiresAt !== update.expiresAt) return { state: 'missing' as const };
-    if (dispatch.callbackIds.has(update.callbackId)) return { state: 'duplicate' as const };
+    if (dispatch.appliedCallbackIds.has(update.callbackId)) return { state: 'duplicate' as const };
     if (dispatch.completedAt || Date.parse(dispatch.expiresAt) <= Date.parse(update.now)) return { state: 'expired' as const };
 
     const mission = this.missions.get(update.missionId);
+    const paused = Boolean(this.missionControls.get(update.missionId)?.pausedAt);
     const escrow = this.escrows.get(update.missionId);
     const stages = this.stages.get(update.missionId) ?? [];
     const index = stages.findIndex((stage) => stage.id === update.stageId && stage.agentId === update.agentId);
-    if (mission?.status !== 'running' || escrow?.status !== 'held' || index < 0 || stages[index].status !== 'running') {
+    if (mission?.status !== 'running' || escrow?.status !== 'held' || index < 0 || stages[index].status !== 'running'
+      || dispatch.attemptNo !== stages[index].attemptNo
+      || update.artifacts?.some((artifact) => artifact.attemptNo !== undefined
+        && artifact.attemptNo !== null && artifact.attemptNo !== stages[index].attemptNo)
+      || (paused && update.status === 'running')) {
       return { state: 'invalid' as const };
     }
 
@@ -1138,7 +1719,7 @@ export class MemoryPlatformStore implements PlatformStore {
     if (update.artifacts?.length) {
       this.deliverables.set(update.missionId, [
         ...(this.deliverables.get(update.missionId) ?? []),
-        ...update.artifacts.map(copy),
+        ...update.artifacts.map((artifact) => copy({ ...artifact, attemptNo: stage.attemptNo })),
       ]);
     }
     this.missions.set(update.missionId, {
@@ -1148,6 +1729,7 @@ export class MemoryPlatformStore implements PlatformStore {
       updatedAt: update.now,
     });
     dispatch.callbackIds.add(update.callbackId);
+    dispatch.appliedCallbackIds.add(update.callbackId);
     if (update.status === 'done' || update.status === 'failed') {
       dispatch.completedAt = update.now;
       const outbox = [...this.dispatchOutbox.values()].find((item) => item.runId === update.runId);
@@ -1156,12 +1738,23 @@ export class MemoryPlatformStore implements PlatformStore {
     return { state: 'applied' as const, stage: copy(stage) };
   }
 
-  async claimAgentCallback(runId: string, callbackId: string, now: string): Promise<'accepted' | 'duplicate' | 'expired' | 'missing'> {
-    const dispatch = this.agentDispatches.get(runId);
+  async claimAgentCallback(input: {
+    runId: string; callbackId: string; missionId: string; stageId: string; agentId: string;
+    expiresAt: string; now: string; status: WorkflowStage['status'];
+  }): Promise<'accepted' | 'duplicate' | 'expired' | 'missing' | 'invalid'> {
+    const dispatch = this.agentDispatches.get(input.runId);
     if (!dispatch) return 'missing';
-    if (dispatch.completedAt || Date.parse(dispatch.expiresAt) <= Date.parse(now)) return 'expired';
-    if (dispatch.callbackIds.has(callbackId)) return 'duplicate';
-    dispatch.callbackIds.add(callbackId);
+    if (dispatch.missionId !== input.missionId || dispatch.stageId !== input.stageId
+      || dispatch.agentId !== input.agentId || dispatch.expiresAt !== input.expiresAt) return 'missing';
+    if (dispatch.appliedCallbackIds.has(input.callbackId)) return 'duplicate';
+    if (dispatch.completedAt || Date.parse(dispatch.expiresAt) <= Date.parse(input.now)) return 'expired';
+    const mission = this.missions.get(input.missionId);
+    const stage = (this.stages.get(input.missionId) ?? []).find((candidate) => candidate.id === input.stageId);
+    const paused = Boolean(this.missionControls.get(input.missionId)?.pausedAt);
+    if (mission?.status !== 'running' || this.escrows.get(input.missionId)?.status !== 'held'
+      || !stage || stage.agentId !== input.agentId || stage.status !== 'running'
+      || stage.attemptNo !== dispatch.attemptNo || (paused && !['done', 'failed'].includes(input.status))) return 'invalid';
+    dispatch.callbackIds.add(input.callbackId);
     return 'accepted';
   }
 
@@ -1212,7 +1805,7 @@ export class MemoryPlatformStore implements PlatformStore {
       .sort((left, right) => left.status.localeCompare(right.status) || left.displayName.localeCompare(right.displayName)));
   }
 
-  async setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string): Promise<ArbitrationMember | null> {
+  async setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string, power?: number): Promise<ArbitrationMember | null> {
     const profile = this.profiles.get(userId);
     if (!profile) return null;
     const existing = this.arbitrationMembers.get(userId);
@@ -1222,7 +1815,7 @@ export class MemoryPlatformStore implements PlatformStore {
       email: profile.email,
       role: profile.role,
       status: active ? 'active' : 'inactive',
-      power: existing?.power ?? 1,
+      power: power === undefined ? existing?.power ?? 1 : Math.max(1, Math.floor(power)),
       appointedBy: existing?.appointedBy ?? actorId,
       appointedAt: existing?.appointedAt ?? updatedAt,
       updatedAt,
@@ -1305,6 +1898,225 @@ export class MemoryPlatformStore implements PlatformStore {
         nextCursor: hasMore && lastEntry ? { createdAt: lastEntry.createdAt, id: lastEntry.id } : null,
       },
     });
+  }
+
+  private ledgerExportView(source: LedgerExportJob & {
+    ownerId: string; exportType: 'developer_ledger'; leaseOwner: string | null; leaseExpiresAt: string | null;
+    snapshotCreatedAt: string; snapshotId: string;
+  }): LedgerExportJob {
+    const value = copy(source) as LedgerExportJob & {
+      ownerId?: string; exportType?: string; leaseOwner?: string | null; leaseExpiresAt?: string | null;
+      snapshotCreatedAt?: string; snapshotId?: string;
+    };
+    delete value.ownerId;
+    delete value.exportType;
+    delete value.leaseOwner;
+    delete value.leaseExpiresAt;
+    delete value.snapshotCreatedAt;
+    delete value.snapshotId;
+    return value;
+  }
+
+  private expireDeveloperLedgerExports(now: string): void {
+    for (const [id, job] of this.ledgerExportJobs) {
+      const expired = ['queued', 'processing'].includes(job.status) && Date.parse(now) >= Date.parse(job.expiresAt)
+        || job.status === 'completed' && job.artifact !== null && Date.parse(now) >= Date.parse(job.artifact.expiresAt);
+      if (!expired) continue;
+      const expiresAt = job.artifact?.expiresAt ?? job.expiresAt;
+      this.ledgerExportJobs.set(id, {
+        ...job, status: 'expired', artifact: null, expiresAt, leaseOwner: null, leaseExpiresAt: null, updatedAt: now,
+      });
+      this.ledgerExportEvents.push({
+        id: `${id}:expired:${job.attempt}`, jobId: id, actorType: 'system', actorId: null,
+        action: 'expired', detail: { reason: 'retention' }, createdAt: now,
+      });
+    }
+  }
+
+  async requestDeveloperLedgerExport(ownerId: string, token: string, requestedAt: string): Promise<LedgerExportRequestResult> {
+    this.expireDeveloperLedgerExports(requestedAt);
+    const ownedAgentIds = new Set([...this.agents.values()].filter((agent) => agent.ownerId === ownerId).map((agent) => agent.id));
+    const matchingEntries = this.ledgerEntries.filter((entry) => ownedAgentIds.has(entry.agentId) && entry.token === token)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id));
+    const rowCount = matchingEntries.length;
+    if (rowCount <= MAX_DIRECT_LEDGER_EXPORT_ROWS) return { mode: 'direct', rowCount };
+    const existing = [...this.ledgerExportJobs.values()].find((job) => (
+      job.ownerId === ownerId && job.token === token && ['queued', 'processing', 'completed'].includes(job.status)
+    ));
+    if (existing) return { mode: 'async', job: this.ledgerExportView(existing) };
+    const id = `EXPORT-${crypto.randomUUID()}`;
+    const job = {
+      id, ownerId, exportType: 'developer_ledger' as const, token, status: 'queued' as const,
+      totalRows: rowCount, processedRows: 0, progress: 0, attempt: 1, errorCode: null, errorMessage: null,
+      startedAt: null, completedAt: null, cancelledAt: null, expiresAt: exportJobExpiresAt(requestedAt),
+      createdAt: requestedAt, updatedAt: requestedAt, artifact: null, leaseOwner: null, leaseExpiresAt: null,
+      snapshotCreatedAt: matchingEntries[0].createdAt, snapshotId: matchingEntries[0].id,
+    };
+    this.ledgerExportJobs.set(id, job);
+    this.ledgerExportEvents.push({
+      id: `${id}:created`, jobId: id, actorType: 'user', actorId: ownerId, action: 'created',
+      detail: { token, totalRows: rowCount, attempt: 1 }, createdAt: requestedAt,
+    });
+    return { mode: 'async', job: this.ledgerExportView(job) };
+  }
+
+  async listDeveloperLedgerExports(ownerId: string, now: string): Promise<LedgerExportJob[]> {
+    this.expireDeveloperLedgerExports(now);
+    return [...this.ledgerExportJobs.values()].filter((job) => job.ownerId === ownerId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id))
+      .slice(0, 50).map((job) => this.ledgerExportView(job));
+  }
+
+  async getDeveloperLedgerExport(ownerId: string, id: string, now: string): Promise<LedgerExportJob | null> {
+    this.expireDeveloperLedgerExports(now);
+    const job = this.ledgerExportJobs.get(id);
+    return job?.ownerId === ownerId ? this.ledgerExportView(job) : null;
+  }
+
+  async cancelDeveloperLedgerExport(ownerId: string, id: string, cancelledAt: string): Promise<LedgerExportMutationResult> {
+    this.expireDeveloperLedgerExports(cancelledAt);
+    const job = this.ledgerExportJobs.get(id);
+    if (!job || job.ownerId !== ownerId) return { state: 'missing' };
+    if (job.status === 'cancelled') return { state: 'unchanged', job: this.ledgerExportView(job) };
+    if (!['queued', 'processing'].includes(job.status)) return { state: 'invalid_state' };
+    const updated = { ...job, status: 'cancelled' as const, cancelledAt, updatedAt: cancelledAt, leaseOwner: null, leaseExpiresAt: null };
+    this.ledgerExportJobs.set(id, updated);
+    this.ledgerExportEvents.push({
+      id: `${id}:cancelled:${job.attempt}`, jobId: id, actorType: 'user', actorId: ownerId,
+      action: 'cancelled', detail: { attempt: job.attempt }, createdAt: cancelledAt,
+    });
+    return { state: 'applied', job: this.ledgerExportView(updated) };
+  }
+
+  async retryDeveloperLedgerExport(ownerId: string, id: string, retriedAt: string): Promise<LedgerExportMutationResult> {
+    this.expireDeveloperLedgerExports(retriedAt);
+    const job = this.ledgerExportJobs.get(id);
+    if (!job || job.ownerId !== ownerId) return { state: 'missing' };
+    const activeSibling = [...this.ledgerExportJobs.values()].some((candidate) => (
+      candidate.id !== id && candidate.ownerId === ownerId && candidate.token === job.token
+      && ['queued', 'processing', 'completed'].includes(candidate.status)
+    ));
+    if (job.status !== 'failed' || Date.parse(retriedAt) >= Date.parse(job.expiresAt) || activeSibling) {
+      return { state: 'invalid_state' };
+    }
+    const attempt = job.attempt + 1;
+    const updated = {
+      ...job, status: 'queued' as const, processedRows: 0, progress: 0, attempt,
+      errorCode: null, errorMessage: null, startedAt: null, completedAt: null, cancelledAt: null,
+      updatedAt: retriedAt, artifact: null, leaseOwner: null, leaseExpiresAt: null,
+    };
+    this.ledgerExportJobs.set(id, updated);
+    this.ledgerExportEvents.push({
+      id: `${id}:retried:${attempt}`, jobId: id, actorType: 'user', actorId: ownerId,
+      action: 'retried', detail: { attempt }, createdAt: retriedAt,
+    });
+    return { state: 'applied', job: this.ledgerExportView(updated) };
+  }
+
+  async claimDeveloperLedgerExport(workerId: string, claimedAt: string): Promise<LedgerExportClaim | null> {
+    this.expireDeveloperLedgerExports(claimedAt);
+    for (const [id, job] of this.ledgerExportJobs) {
+      if (job.status !== 'processing' || !job.leaseExpiresAt || Date.parse(job.leaseExpiresAt) > Date.parse(claimedAt)) continue;
+      this.ledgerExportEvents.push({
+        id: `${id}:lease_expired:${job.attempt}`, jobId: id, actorType: 'system', actorId: null,
+        action: 'retried', detail: { attempt: job.attempt + 1, reason: 'lease_expired' }, createdAt: claimedAt,
+      });
+      this.ledgerExportJobs.set(id, {
+        ...job, status: 'queued', processedRows: 0, progress: 0, attempt: job.attempt + 1,
+        leaseOwner: null, leaseExpiresAt: null, errorCode: 'LEASE_EXPIRED',
+        errorMessage: 'Previous export worker lease expired', updatedAt: claimedAt,
+      });
+    }
+    const candidate = [...this.ledgerExportJobs.values()].filter((job) => job.status === 'queued')
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0];
+    if (!candidate) return null;
+    const updated = {
+      ...candidate, status: 'processing' as const, startedAt: candidate.startedAt ?? claimedAt,
+      leaseOwner: workerId, leaseExpiresAt: exportLeaseExpiresAt(claimedAt), errorCode: null, errorMessage: null, updatedAt: claimedAt,
+    };
+    this.ledgerExportJobs.set(candidate.id, updated);
+    this.ledgerExportEvents.push({
+      id: `${candidate.id}:claimed:${candidate.attempt}`, jobId: candidate.id, actorType: 'service', actorId: workerId,
+      action: 'claimed', detail: { attempt: candidate.attempt, workerId }, createdAt: claimedAt,
+    });
+    return {
+      job: this.ledgerExportView(updated), ownerId: candidate.ownerId, exportType: 'developer_ledger',
+      snapshot: { createdAt: candidate.snapshotCreatedAt, id: candidate.snapshotId },
+    };
+  }
+
+  async updateDeveloperLedgerExportProgress(id: string, workerId: string, attempt: number, processedRows: number, updatedAt: string): Promise<LedgerExportJob | null> {
+    this.expireDeveloperLedgerExports(updatedAt);
+    const job = this.ledgerExportJobs.get(id);
+    if (!job || job.status !== 'processing' || job.leaseOwner !== workerId || job.attempt !== attempt
+      || !job.leaseExpiresAt || Date.parse(job.leaseExpiresAt) <= Date.parse(updatedAt)
+      || processedRows < job.processedRows || processedRows > job.totalRows) return null;
+    const updated = {
+      ...job, processedRows, progress: exportProgress(processedRows, job.totalRows),
+      leaseExpiresAt: exportLeaseExpiresAt(updatedAt), updatedAt,
+    };
+    this.ledgerExportJobs.set(id, updated);
+    const eventId = `${id}:progress:${job.attempt}:${processedRows}`;
+    if (!this.ledgerExportEvents.some((event) => event.id === eventId)) {
+      this.ledgerExportEvents.push({
+        id: eventId, jobId: id, actorType: 'service', actorId: workerId,
+        action: 'progressed', detail: { attempt: job.attempt, processedRows, totalRows: job.totalRows }, createdAt: updatedAt,
+      });
+    }
+    return this.ledgerExportView(updated);
+  }
+
+  async completeDeveloperLedgerExport(input: {
+    id: string; workerId: string; attempt: number; objectKey: string; sha256: string; rowCount: number; byteSize: number; completedAt: string;
+  }): Promise<LedgerExportJob | null> {
+    this.expireDeveloperLedgerExports(input.completedAt);
+    const job = this.ledgerExportJobs.get(input.id);
+    if (!job || job.status !== 'processing' || job.leaseOwner !== input.workerId || job.attempt !== input.attempt
+      || !job.leaseExpiresAt || Date.parse(job.leaseExpiresAt) <= Date.parse(input.completedAt) || input.rowCount !== job.totalRows
+      || !input.objectKey.startsWith(`private/exports/${input.id}/`)) return null;
+    const artifact: LedgerExportPrivateArtifact = {
+      id: `EXPORT-ARTIFACT-${crypto.randomUUID()}`, objectKey: input.objectKey, sha256: input.sha256,
+      contentType: 'text/csv', rowCount: input.rowCount, byteSize: input.byteSize,
+      createdAt: input.completedAt, expiresAt: exportArtifactExpiresAt(input.completedAt),
+    };
+    this.ledgerExportArtifacts.set(input.id, artifact);
+    const { objectKey: _objectKey, ...publicArtifact } = artifact;
+    void _objectKey;
+    const updated = {
+      ...job, status: 'completed' as const, processedRows: job.totalRows, progress: 100,
+      completedAt: input.completedAt, expiresAt: artifact.expiresAt, updatedAt: input.completedAt,
+      artifact: publicArtifact, leaseOwner: null, leaseExpiresAt: null,
+    };
+    this.ledgerExportJobs.set(input.id, updated);
+    this.ledgerExportEvents.push({
+      id: `${input.id}:completed:${job.attempt}`, jobId: input.id, actorType: 'service', actorId: input.workerId,
+      action: 'completed', detail: { attempt: job.attempt, rowCount: input.rowCount, byteSize: input.byteSize }, createdAt: input.completedAt,
+    });
+    return this.ledgerExportView(updated);
+  }
+
+  async failDeveloperLedgerExport(id: string, workerId: string, attempt: number, errorCode: string, errorMessage: string, failedAt: string): Promise<LedgerExportJob | null> {
+    this.expireDeveloperLedgerExports(failedAt);
+    const job = this.ledgerExportJobs.get(id);
+    if (!job || job.status !== 'processing' || job.leaseOwner !== workerId || job.attempt !== attempt
+      || !job.leaseExpiresAt || Date.parse(job.leaseExpiresAt) <= Date.parse(failedAt)) return null;
+    const updated = {
+      ...job, status: 'failed' as const, errorCode, errorMessage, updatedAt: failedAt, leaseOwner: null, leaseExpiresAt: null,
+    };
+    this.ledgerExportJobs.set(id, updated);
+    this.ledgerExportEvents.push({
+      id: `${id}:failed:${job.attempt}`, jobId: id, actorType: 'service', actorId: workerId,
+      action: 'failed', detail: { attempt: job.attempt, errorCode }, createdAt: failedAt,
+    });
+    return this.ledgerExportView(updated);
+  }
+
+  async getDeveloperLedgerExportArtifact(ownerId: string, id: string, now: string): Promise<LedgerExportPrivateArtifact | null> {
+    this.expireDeveloperLedgerExports(now);
+    const job = this.ledgerExportJobs.get(id);
+    const artifact = this.ledgerExportArtifacts.get(id);
+    return job?.ownerId === ownerId && job.status === 'completed' && artifact && Date.parse(now) < Date.parse(artifact.expiresAt)
+      ? copy(artifact) : null;
   }
 
   async recordRewardActivity(activity: RewardActivity): Promise<boolean> {

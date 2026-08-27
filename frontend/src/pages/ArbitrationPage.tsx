@@ -60,6 +60,14 @@ function percent(value: number, total: number) {
   return total > 0 ? Math.min(100, Math.round((value / total) * 100)) : 0;
 }
 
+function actionLabel(action: DisputeAction['action']) {
+  if (action === 'review_started') return 'DAO 首轮提案已创建';
+  if (action === 'appeal_created') return '上诉提案已创建';
+  if (action === 'execution_queued') return '最终裁决已进入执行队列';
+  if (action === 'execution_executed') return '执行队列已封存';
+  return action === 'resolved' ? '退款裁决已执行' : '驳回裁决已执行';
+}
+
 export function ArbitrationPage() {
   const { onchainSettlement, refundEscrow, unfreezeEscrow } = useAuth();
   const disputes = useAppStore((state) => state.disputes);
@@ -78,6 +86,8 @@ export function ArbitrationPage() {
   const [voteReason, setVoteReason] = useState('');
   const [resolveOpen, setResolveOpen] = useState(false);
   const [rationale, setRationale] = useState('');
+  const [weightMode, setWeightMode] = useState<'one_person_one_vote' | 'power'>('one_person_one_vote');
+  const [appealReason, setAppealReason] = useState('');
 
   const selectedCase = disputes.find((item) => item.id === selectedId) ?? disputes[0] ?? null;
   const selectedMission = useMemo(
@@ -88,7 +98,7 @@ export function ArbitrationPage() {
   const canAdminister = profile?.role === 'admin';
   const decision = proposal?.status === 'succeeded' ? 'resolved' as const : 'rejected' as const;
   const canExecute = canAdminister && selectedCase?.status === 'reviewing'
-    && (proposal?.status === 'succeeded' || proposal?.status === 'defeated');
+    && governance?.executionReady === true && governance.execution?.status !== 'executed';
   const legacyClosed = !proposal && Boolean(selectedCase && ['resolved', 'rejected'].includes(selectedCase.status));
   const votingEnded = proposal ? Date.now() >= Date.parse(proposal.votingEndsAt) : false;
   const openCount = disputes.filter((item) => item.status === 'open' || item.status === 'reviewing').length;
@@ -139,7 +149,7 @@ export function ArbitrationPage() {
     setBusy(true);
     setError('');
     try {
-      await startDisputeReview(selectedCase.id);
+      await startDisputeReview(selectedCase.id, weightMode);
       await refreshGovernance();
       showToast('仲裁提案已创建，投票成员与 Power 已完成快照。', 'success');
     } catch (reviewError) {
@@ -179,6 +189,23 @@ export function ArbitrationPage() {
     }
   };
 
+  const submitAppeal = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!selectedCase || !governance?.appeal.canAppeal || appealReason.trim().length < 20) return;
+    setBusy(true);
+    setError('');
+    try {
+      setGovernance(await api.createDisputeAppeal(selectedCase.id, appealReason.trim()));
+      setAppealReason('');
+      await refreshGovernance();
+      showToast('上诉提案已创建，原提案与投票保持不可变。', 'success');
+    } catch (appealError) {
+      setError(appealError instanceof Error ? appealError.message : '上诉创建失败。');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submitResolution = async (event: FormEvent) => {
     event.preventDefault();
     if (!selectedCase || !canExecute || rationale.trim().length < 20) return;
@@ -187,6 +214,7 @@ export function ArbitrationPage() {
     try {
       const usesWeb3 = selectedMission ? isWeb3Payment(selectedMission.paymentMethod) : false;
       if (usesWeb3 && !onchainSettlement) throw new Error('Sepolia 托管合约尚未配置，无法提交链上裁决。');
+      setGovernance(await api.queueDisputeExecution(selectedCase.id));
       const resolutionTxHash = usesWeb3
         ? decision === 'resolved'
           ? await refundEscrow(selectedCase.missionId)
@@ -211,8 +239,8 @@ export function ArbitrationPage() {
       <PageHeader
         eyebrow="DAO Resolution"
         title="仲裁治理"
-        description="案件以委员会提案表决；当前一人一票，同时冻结 Power 快照。投票形成裁决授权，资金执行继续经过托管与链上核验。"
-        actions={<span className="mono-chip">ONE MEMBER · ONE VOTE</span>}
+        description="案件支持显式一人一票或 Power 加权快照、至多一轮扩大委员上诉；最终裁决先入队，资金执行继续经过托管与链上核验。"
+        actions={<span className="mono-chip">SNAPSHOT · APPEAL · QUEUE</span>}
       />
 
       <section className="grid gap-3 sm:grid-cols-3">
@@ -255,10 +283,10 @@ export function ArbitrationPage() {
             </div>
           </section>
 
-          {loading ? <div className="flex min-h-72 items-center justify-center text-sm text-muted"><LoaderCircle className="mr-2 animate-spin" size={18} />同步治理状态…</div> : !proposal ? <section className="mt-5 rounded-2xl border border-dashed border-line bg-canvas/40 p-8 text-center"><Gavel className="mx-auto text-cyan" size={25} /><h3 className="mt-4 font-semibold">{legacyClosed ? '历史裁决记录' : '该案件尚未进入委员会投票'}</h3><p className="mx-auto mt-2 max-w-lg text-sm leading-6 text-muted">{legacyClosed ? selectedCase.resolution ?? '该案件在 DAO 仲裁上线前已经关闭，保留原处理轨迹且不会补造投票记录。' : '管理员发起提案后，系统会排除利益相关方并冻结当前委员会名单。已有提案的成员变更不会追溯影响本案。'}</p>{!legacyClosed && canAdminister ? <button type="button" className="btn-primary mt-5" disabled={busy || !['open', 'reviewing'].includes(selectedCase.status)} onClick={() => void beginReview()}>{busy ? <LoaderCircle className="animate-spin" size={15} /> : <Vote size={15} />}创建仲裁提案</button> : !legacyClosed ? <p className="mt-5 text-xs font-semibold text-warning">等待平台管理员发起治理提案</p> : null}</section> : <>
+          {loading ? <div className="flex min-h-72 items-center justify-center text-sm text-muted"><LoaderCircle className="mr-2 animate-spin" size={18} />同步治理状态…</div> : !proposal ? <section className="mt-5 rounded-2xl border border-dashed border-line bg-canvas/40 p-8 text-center"><Gavel className="mx-auto text-cyan" size={25} /><h3 className="mt-4 font-semibold">{legacyClosed ? '历史裁决记录' : '该案件尚未进入委员会投票'}</h3><p className="mx-auto mt-2 max-w-lg text-sm leading-6 text-muted">{legacyClosed ? selectedCase.resolution ?? '该案件在 DAO 仲裁上线前已经关闭，保留原处理轨迹且不会补造投票记录。' : '管理员发起提案后，系统会排除利益相关方并冻结当前委员会名单。已有提案的成员变更不会追溯影响本案。'}</p>{!legacyClosed && canAdminister ? <div className="mx-auto mt-5 max-w-sm text-left"><label><span className="field-label">首轮票权模式</span><select className="field" value={weightMode} onChange={(event) => setWeightMode(event.target.value as typeof weightMode)}><option value="one_person_one_vote">一人一票 · v1</option><option value="power">Power 加权 · v1</option></select></label><p className="mt-2 text-xs leading-5 text-muted">模式和委员 Power 会在创建时冻结，之后不可修改。</p><button type="button" className="btn-primary mt-4 w-full" disabled={busy || !['open', 'reviewing'].includes(selectedCase.status)} onClick={() => void beginReview()}>{busy ? <LoaderCircle className="animate-spin" size={15} /> : <Vote size={15} />}创建仲裁提案</button></div> : !legacyClosed ? <p className="mt-5 text-xs font-semibold text-warning">等待平台管理员发起治理提案</p> : null}</section> : <>
             <section className="mt-5 grid gap-5 2xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,.85fr)]">
               <article className="rounded-2xl border border-line p-5 sm:p-6">
-                <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-semibold">实时计票</h3><p className="mt-1 text-xs text-muted">弃权计入法定人数，但不决定多数方向</p></div><span className="font-mono text-[10px] text-muted">{proposal.weightMode === 'one_person_one_vote' ? '1 MEMBER = 1 VOTE' : 'POWER WEIGHTED'}</span></div>
+                <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-semibold">{proposal.round === 0 ? '首轮' : '上诉轮'}实时计票</h3><p className="mt-1 text-xs text-muted">弃权计入法定人数，但不决定多数方向</p></div><span className="font-mono text-[10px] text-muted">{proposal.weightMode === 'one_person_one_vote' ? '1 MEMBER = 1 VOTE' : 'POWER WEIGHTED'} · {proposal.weightVersion}</span></div>
                 <div className="mt-6 space-y-5">
                   {[
                     ['支持退款', proposal.supportVotes, 'bg-cyan'],
@@ -274,7 +302,8 @@ export function ArbitrationPage() {
                 <div className="flex items-center gap-2"><Vote className="text-cyan" size={18} /><h3 className="font-semibold">投出你的票</h3></div>
                 {governance?.currentUser.canVote ? <form className="mt-5" onSubmit={castVote}><fieldset><legend className="sr-only">投票选项</legend><div className="space-y-2">{voteOptions.map((option) => <label className={`block cursor-pointer rounded-xl border p-3.5 transition ${voteChoice === option.choice ? option.activeClass : 'border-line hover:bg-canvas/60'}`} key={option.choice}><input className="sr-only" type="radio" name="vote" checked={voteChoice === option.choice} onChange={() => setVoteChoice(option.choice)} /><span className="text-sm font-semibold">{option.title}</span><span className="mt-1 block text-xs text-muted">{option.detail}</span></label>)}</div></fieldset><label className="mt-4 block"><span className="field-label">投票理由</span><textarea className="field min-h-24" value={voteReason} onChange={(event) => setVoteReason(event.target.value)} placeholder="引用任务规格、交付证据或执行事件，至少 12 个字…" /></label><button className="btn-primary mt-4 w-full" type="submit" disabled={busy || voteReason.trim().length < 12}>{busy ? <LoaderCircle className="animate-spin" size={15} /> : <Vote size={15} />}确认投票 · 提交后不可修改</button></form> : <div className="mt-5 rounded-xl bg-canvas p-5 text-center"><ShieldCheck className="mx-auto text-cyan" size={22} /><p className="mt-3 text-sm font-semibold">{governance?.currentUser.hasVoted ? `你已投：${governance.currentUser.choice ? voteLabel[governance.currentUser.choice] : ''}` : governance?.currentUser.eligible ? '当前投票已结束' : '你不在本提案投票快照中'}</p><p className="mt-2 text-xs leading-5 text-muted">利益相关方会被自动排除；委员会变更不影响已创建提案。</p></div>}
                 {canAdminister && proposal.status === 'active' ? <button type="button" className="btn-secondary mt-4 w-full" disabled={busy || !votingEnded} onClick={() => void finalizeVote()}><Clock3 size={15} />{votingEnded ? '结束到期投票' : '截止后可手动定案'}</button> : null}
-                {canExecute ? <button type="button" className="mt-4 inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-ink px-4 text-sm font-semibold text-white" onClick={() => setResolveOpen(true)}><Gavel size={16} />执行已通过的裁决</button> : null}
+                {canExecute ? <button type="button" className="mt-4 inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-ink px-4 text-sm font-semibold text-white" onClick={() => setResolveOpen(true)}><Gavel size={16} />{governance?.execution ? '继续执行队列裁决' : '入队并执行最终裁决'}</button> : null}
+                {proposal.status !== 'active' && !governance?.executionReady && governance?.appeal.deadlineAt ? <p className="mt-4 rounded-xl bg-warning/10 p-3 text-xs leading-5 text-warning">上诉窗口开放至 {formatDate(governance.appeal.deadlineAt)}；窗口关闭前不能执行资金动作。</p> : null}
               </article>
             </section>
 
@@ -282,11 +311,16 @@ export function ArbitrationPage() {
               <article className="rounded-2xl border border-line p-5"><div className="flex items-center justify-between"><div className="flex items-center gap-2"><Users size={17} /><h3 className="font-semibold">委员会快照</h3></div><span className="font-mono text-[9px] text-muted">POWER SNAPSHOT</span></div><div className="mt-4 grid gap-2 sm:grid-cols-2">{governance?.electorate.map((elector) => { const vote = governance.votes.find((item) => item.voterId === elector.userId); return <div className="rounded-xl bg-canvas p-3" key={elector.userId}><div className="flex items-center justify-between gap-2"><span className="truncate text-xs font-semibold">{elector.displayName}</span><span className={`size-2 rounded-full ${vote ? 'bg-lime' : 'bg-muted/35'}`} /></div><p className="mt-1 font-mono text-[9px] text-muted">票权 {elector.voteWeight} · Power {elector.powerSnapshot}</p></div>; })}</div></article>
               <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><History size={17} /><h3 className="font-semibold">公开投票记录</h3></div>{governance?.votes.length ? <div className="mt-4 space-y-3">{governance.votes.map((vote) => <div className="rounded-xl border border-line p-3.5" key={vote.id}><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold">{vote.voterDisplayName}</p><span className="rounded-full bg-canvas px-2 py-1 text-[10px] font-semibold">{voteLabel[vote.choice]}</span></div><p className="mt-2 text-xs leading-5 text-muted">{vote.reason}</p><p className="mt-2 font-mono text-[9px] text-muted/70">{formatDate(vote.createdAt)}</p></div>)}</div> : <p className="mt-5 text-xs text-muted">尚无投票记录。</p>}</article>
             </section>
+
+            <section className="mt-5 grid gap-5 xl:grid-cols-2">
+              <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><Scale size={17} /><h3 className="font-semibold">一次上诉</h3></div>{governance?.appeal.canAppeal ? <form className="mt-4" onSubmit={submitAppeal}><p className="text-xs leading-5 text-muted">上诉会保留首轮记录，并要求至少新增一名无利益冲突委员。</p><label className="mt-3 block"><span className="field-label">上诉理由</span><textarea className="field min-h-24" value={appealReason} onChange={(event) => setAppealReason(event.target.value)} placeholder="说明首轮裁决需要复核的事实或程序问题，至少 20 个字…" /></label><button className="btn-secondary mt-3 w-full" type="submit" disabled={busy || appealReason.trim().length < 20}>创建扩大委员上诉提案</button></form> : <div className="mt-4 rounded-xl bg-canvas p-4 text-xs leading-5 text-muted">{governance?.appeal.used ? `本案已使用上诉：${governance.appeal.reason ?? '已创建上诉提案'}` : governance?.appeal.deadlineAt ? `上诉期限：${formatDate(governance.appeal.deadlineAt)}` : '首轮定案后开放 72 小时上诉窗口。'}</div>}</article>
+              <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><History size={17} /><h3 className="font-semibold">不可变轮次历史</h3></div><div className="mt-4 space-y-3">{governance?.rounds.map((round) => <div className="rounded-xl border border-line p-3.5" key={round.proposal.id}><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold">{round.proposal.round === 0 ? '首轮提案' : '上诉提案'}</p><span className="font-mono text-[9px] text-muted">{round.proposal.weightVersion}</span></div><p className="mt-2 text-xs text-muted">委员 {round.electorate.length} · 总票权 {round.proposal.eligibleWeight} · 已投 {round.votes.length}</p>{round.proposal.appealReason ? <p className="mt-2 text-xs leading-5 text-muted">{round.proposal.appealReason}</p> : null}</div>)}</div>{governance?.execution ? <div className="mt-4 rounded-xl border border-cyan/25 bg-cyan/[0.06] p-3"><p className="text-xs font-semibold text-cyan">执行队列 · {governance.execution.status}</p><p className="mt-1 break-all font-mono text-[9px] text-muted">{governance.execution.payloadHash}</p></div> : null}</article>
+            </section>
           </>}
 
           <section className="mt-5 grid gap-5 xl:grid-cols-2">
             <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><FileSearch size={17} /><h3 className="font-semibold">案件证据</h3></div>{selectedCase.evidence.length ? <ul className="mt-4 space-y-2">{selectedCase.evidence.map((item) => <li key={`${item.label}-${item.uri}`}><a className="flex items-center gap-2 text-xs text-muted hover:text-cyan" href={item.uri} target="_blank" rel="noreferrer"><CheckCircle2 size={14} className="text-cyan" />{item.label}</a></li>)}</ul> : <p className="mt-4 text-xs leading-5 text-muted">没有外部附件；可在关联任务中核对规格、执行事件和交付哈希。</p>}<Link className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-cyan" to={`/missions/${selectedCase.missionId}/acceptance`}>查看任务与交付 <ArrowRight size={13} /></Link></article>
-            <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><History size={17} /><h3 className="font-semibold">执行轨迹</h3></div>{actions.length ? <ol className="mt-4 space-y-4 border-l border-line pl-4">{actions.map((item) => <li className="relative" key={item.id}><span className="absolute -left-[21px] top-1 size-2 rounded-full bg-cyan" /><p className="text-xs font-semibold">{item.action === 'review_started' ? 'DAO 提案已创建' : item.action === 'resolved' ? '退款裁决已执行' : '驳回裁决已执行'}</p><p className="mt-1 font-mono text-[9px] text-muted">{item.actorId} · {formatDate(item.createdAt)}</p>{item.note ? <p className="mt-2 text-xs leading-5 text-muted">{item.note}</p> : null}</li>)}</ol> : <p className="mt-4 text-xs text-muted">尚无治理执行记录。</p>}</article>
+            <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><History size={17} /><h3 className="font-semibold">执行轨迹</h3></div>{actions.length ? <ol className="mt-4 space-y-4 border-l border-line pl-4">{actions.map((item) => <li className="relative" key={item.id}><span className="absolute -left-[21px] top-1 size-2 rounded-full bg-cyan" /><p className="text-xs font-semibold">{actionLabel(item.action)}</p><p className="mt-1 font-mono text-[9px] text-muted">{item.actorId} · {formatDate(item.createdAt)}</p>{item.note ? <p className="mt-2 text-xs leading-5 text-muted">{item.note}</p> : null}</li>)}</ol> : <p className="mt-4 text-xs text-muted">尚无治理执行记录。</p>}</article>
           </section>
         </main>
       </div> : <section className="panel py-16 text-center"><Scale className="mx-auto text-cyan" size={25} /><h2 className="mt-5 text-lg font-semibold">当前没有争议提案</h2><p className="mt-2 text-sm text-muted">从任务验收页发起争议后，冻结状态和治理提案会出现在这里。</p></section>}

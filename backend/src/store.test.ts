@@ -291,7 +291,7 @@ describe('D1PlatformStore concurrency invariants', () => {
     `).run()).toThrow('WORKFLOW_LOCKED');
   });
 
-  it('keeps one outbox run ID during recovery and rotates it only for an explicit rerun', async () => {
+  it('keeps one fresh outbox run ID and rotates it after expiry or completion', async () => {
     database.db.exec(`
       INSERT INTO missions
         (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json)
@@ -310,11 +310,16 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect(duplicate.runId).toBe(first.runId);
     expect(duplicate.expiresAt).toBe(first.expiresAt);
 
-    expect(await store.claimDispatch(first.id, '2026-08-22T00:00:30.000Z')).toBe(true);
-    await store.completeDispatch(first.id, 'done', '2026-08-22T00:01:00.000Z');
-    const [rerun] = await store.enqueueDispatches('TASK-D1-OUTBOX', ['stage-d1-outbox'], '2026-08-22T00:02:00.000Z');
-    expect(rerun.runId).not.toBe(first.runId);
-    expect(rerun.expiresAt).not.toBe(first.expiresAt);
+    const [refreshed] = await store.enqueueDispatches('TASK-D1-OUTBOX', ['stage-d1-outbox'], '2026-08-22T02:00:01.000Z');
+    expect(refreshed.runId).not.toBe(first.runId);
+    expect(refreshed.expiresAt).toBe('2026-08-22T04:00:01.000Z');
+    expect(refreshed.attempts).toBe(0);
+
+    expect(await store.claimDispatch(refreshed.id, '2026-08-22T02:00:01.000Z')).toBe(true);
+    await store.completeDispatch(refreshed.id, 'done', '2026-08-22T02:01:00.000Z');
+    const [rerun] = await store.enqueueDispatches('TASK-D1-OUTBOX', ['stage-d1-outbox'], '2026-08-22T02:02:00.000Z');
+    expect(rerun.runId).not.toBe(refreshed.runId);
+    expect(rerun.expiresAt).not.toBe(refreshed.expiresAt);
   });
 
   it('binds an idempotency key to the request hash', async () => {
@@ -441,10 +446,361 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect((await store.listStages(update.missionId)).find((stage) => stage.id === update.stageId)?.status).toBe('done');
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE id = ?').get(update.event.id)).toEqual({ count: 1 });
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM agent_performance_events WHERE stage_id = ?').get(update.stageId)).toEqual({ count: 1 });
-    expect(database.db.prepare('SELECT COUNT(*) AS count FROM deliverables WHERE id = ?').get('DEL-D1-ATOMIC')).toEqual({ count: 1 });
+    expect(database.db.prepare('SELECT COUNT(*) AS count, attempt_no FROM deliverables WHERE id = ?').get('DEL-D1-ATOMIC'))
+      .toEqual({ count: 1, attempt_no: 1 });
     expect(database.db.prepare('SELECT status FROM workflow_dispatch_outbox WHERE id = ?').get('OUTBOX-D1-ATOMIC')).toEqual({ status: 'done' });
     expect(database.db.prepare('SELECT success_rate FROM agents WHERE id = ?').get(update.agentId)).toEqual({ success_rate: 83.3 });
     expect(database.db.prepare('SELECT processing_token, applied_at FROM agent_callback_events WHERE run_id = ? AND callback_id = ?').get(runId, callbackId)).toEqual(expect.objectContaining({ applied_at: update.now }));
+  });
+
+  it('uses the pause row as the outbox claim gate and records resume checkpoints', async () => {
+    const now = '2026-08-18T13:00:00.000Z';
+    database.db.prepare(`
+      INSERT INTO workflow_dispatch_outbox
+        (id, mission_id, stage_id, run_id, expires_at, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+    `).run('OUTBOX-PAUSE-GATE', 'TASK-2026-0815', 'stage-visual', 'run-pause-gate', '2026-08-19T00:00:00.000Z', now, now, now);
+
+    const paused = await store.pauseMission('TASK-2026-0815', 'demo-requester', 'requester', '核对原始素材后再恢复。', now);
+    expect(paused).toMatchObject({ state: 'applied', mission: { status: 'paused', pauseMode: 'requester' } });
+    if (paused.state !== 'applied') throw new Error('pause should apply');
+    expect(await store.listPendingDispatches(10, now)).toEqual([]);
+    expect(await store.claimDispatch('OUTBOX-PAUSE-GATE', now)).toBe(false);
+    expect(await store.transitionStage('TASK-2026-0815', 'stage-motion', 'queued', 'running')).toBeNull();
+
+    const emergency = await store.pauseMission(
+      'TASK-2026-0815', 'demo-arbitrator', 'emergency', '平台风险要求升级为紧急暂停。', '2026-08-18T13:02:00.000Z',
+    );
+    expect(emergency).toMatchObject({
+      state: 'applied', mission: { status: 'paused', pauseMode: 'emergency', pauseReason: '平台风险要求升级为紧急暂停。' },
+      schedulerRevision: 2,
+    });
+    expect((await store.resumeMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', paused.schedulerRevision, '2026-08-18T13:03:00.000Z',
+    )).state).toBe('invalid');
+    if (emergency.state !== 'applied') throw new Error('emergency escalation should apply');
+
+    const resumed = await store.resumeMission(
+      'TASK-2026-0815', 'demo-arbitrator', 'emergency', emergency.schedulerRevision, '2026-08-18T13:05:00.000Z',
+    );
+    expect(resumed).toMatchObject({ state: 'applied', mission: { status: 'running' } });
+    expect(await store.listPendingDispatches(10, '2026-08-18T13:05:00.000Z')).toContainEqual(expect.objectContaining({ id: 'OUTBOX-PAUSE-GATE', runId: 'run-pause-gate' }));
+    expect(await store.transitionStage('TASK-2026-0815', 'stage-motion', 'queued', 'running')).toMatchObject({ status: 'running' });
+    expect(await store.transitionStage('TASK-2026-0815', 'stage-motion', 'queued', 'running')).toBeNull();
+    expect((await store.listWorkflowCheckpoints('TASK-2026-0815')).map((item) => item.kind)).toEqual(['resume', 'pause', 'pause']);
+  });
+
+  it('does not let a stale resume clear a newer pause with the same mode', async () => {
+    const firstPause = await store.pauseMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', '第一次暂停。', '2026-08-18T13:10:00.000Z',
+    );
+    expect(firstPause.state).toBe('applied');
+    if (firstPause.state !== 'applied') throw new Error('first pause should apply');
+
+    expect((await store.resumeMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', firstPause.schedulerRevision, '2026-08-18T13:11:00.000Z',
+    )).state).toBe('applied');
+    const secondPause = await store.pauseMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', '新的风险要求再次暂停。', '2026-08-18T13:12:00.000Z',
+    );
+    expect(secondPause).toMatchObject({ state: 'applied', mission: { status: 'paused', pauseReason: '新的风险要求再次暂停。' } });
+
+    const staleResume = await store.resumeMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', firstPause.schedulerRevision, '2026-08-18T13:13:00.000Z',
+    );
+    expect(staleResume.state).toBe('invalid');
+    expect(await store.getMission('TASK-2026-0815')).toMatchObject({
+      status: 'paused', pauseReason: '新的风险要求再次暂停。',
+    });
+  });
+
+  it('rejects a late callback after a versioned stage attempt replaces its run', async () => {
+    const runId = 'run-stale-attempt';
+    const expiresAt = '2026-08-19T00:00:00.000Z';
+    await store.createAgentDispatch({ runId, missionId: 'TASK-2026-0815', stageId: 'stage-visual', agentId: 'visionboard', expiresAt });
+    database.db.prepare(`
+      INSERT INTO workflow_dispatch_outbox
+        (id, mission_id, stage_id, run_id, expires_at, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'processing', 1, ?, ?, ?)
+    `).run(
+      'OUTBOX-D1-STALE', 'TASK-2026-0815', 'stage-visual', runId, expiresAt,
+      '2026-08-18T13:59:00.000Z', '2026-08-18T13:59:00.000Z', '2026-08-18T13:59:00.000Z',
+    );
+    await store.updateStage('TASK-2026-0815', 'stage-visual', 'failed', { summary: '旧 attempt 失败' });
+    const paused = await store.pauseMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', '创建安全返工版本。', '2026-08-18T14:00:00.000Z',
+    );
+    expect(paused.state).toBe('applied');
+    const changed = await store.applyMissionChangeRequest({
+      id: 'CHANGE-D1-STALE', missionId: 'TASK-2026-0815', targetStageIds: ['stage-visual'], resetStageIds: ['stage-visual'],
+      reason: '重新生成视觉产物。', acceptanceCriteria: '新产物必须通过独立核验。',
+      requestedBy: 'demo-requester', createdAt: '2026-08-18T14:01:00.000Z',
+    });
+    expect(changed).toMatchObject({ state: 'applied', changeRequest: { version: 1 } });
+    expect(changed.state === 'applied' && changed.changeRequest.priorStageState[0]).toMatchObject({
+      input: expect.any(Object), output: { summary: '旧 attempt 失败' },
+    });
+    expect((await store.listStages('TASK-2026-0815')).find((stage) => stage.id === 'stage-visual')).toMatchObject({
+      attemptNo: 2,
+      status: 'queued',
+      input: { rework: { changeRequestId: 'CHANGE-D1-STALE', reason: '重新生成视觉产物。', isTarget: true } },
+    });
+    expect(database.db.prepare('SELECT status FROM workflow_dispatch_outbox WHERE id = ?').get('OUTBOX-D1-STALE')).toEqual({ status: 'done' });
+
+    expect((await store.resumeMission(
+      'TASK-2026-0815', 'demo-requester', 'requester',
+      changed.state === 'applied' ? changed.schedulerRevision : -1, '2026-08-18T14:01:30.000Z',
+    )).state).toBe('applied');
+    await store.enqueueDispatches('TASK-2026-0815', ['stage-visual'], '2026-08-18T14:01:31.000Z');
+    expect(database.db.prepare('SELECT status, run_id FROM workflow_dispatch_outbox WHERE id = ?').get('OUTBOX-D1-STALE')).toEqual({
+      status: 'pending', run_id: expect.not.stringMatching(/^run-stale-attempt$/),
+    });
+
+    const late = await store.applyAgentCallback({
+      runId, callbackId: 'late-old-attempt', missionId: 'TASK-2026-0815', stageId: 'stage-visual', agentId: 'visionboard',
+      expiresAt, now: '2026-08-18T14:02:00.000Z', status: 'done', output: { summary: '不应覆盖新版本' },
+      currentStage: '旧版回调', event: {
+        id: 'EVT-LATE-OLD-ATTEMPT', missionId: 'TASK-2026-0815', stageId: 'stage-visual', type: 'stage.done',
+        message: '旧 run 迟到', actorType: 'agent', actorId: 'visionboard', payload: {}, createdAt: '2026-08-18T14:02:00.000Z',
+      },
+    });
+    expect(late.state).toBe('invalid');
+    expect((await store.listStages('TASK-2026-0815')).find((stage) => stage.id === 'stage-visual')).toMatchObject({ attemptNo: 2, status: 'queued', output: null });
+  });
+
+  it('atomically recovers an expired current run for exactly one fresh dispatch', async () => {
+    const runId = 'run-expired-current-attempt';
+    const expiresAt = '2026-08-18T13:00:00.000Z';
+    await store.createAgentDispatch({ runId, missionId: 'TASK-2026-0815', stageId: 'stage-visual', agentId: 'visionboard', expiresAt });
+    database.db.prepare(`
+      INSERT INTO workflow_dispatch_outbox
+        (id, mission_id, stage_id, run_id, expires_at, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'done', 1, ?, ?, ?)
+    `).run(
+      'OUTBOX-D1-EXPIRED-CURRENT', 'TASK-2026-0815', 'stage-visual', runId, expiresAt,
+      expiresAt, '2026-08-18T12:00:00.000Z', expiresAt,
+    );
+    const recoveredAt = '2026-08-18T14:00:00.000Z';
+
+    expect(await store.recoverExpiredStageDispatches('TASK-2026-0815', recoveredAt)).toEqual(['stage-visual']);
+    expect(await store.recoverExpiredStageDispatches('TASK-2026-0815', recoveredAt)).toEqual([]);
+    expect((await store.listStages('TASK-2026-0815')).find((stage) => stage.id === 'stage-visual')).toMatchObject({
+      status: 'queued', progress: 0, output: null, attemptNo: 1,
+    });
+    expect(database.db.prepare(`
+      SELECT status, run_id, started_at, completed_at FROM workflow_stage_attempts
+      WHERE mission_id = ? AND stage_id = ? AND is_current = 1
+    `).get('TASK-2026-0815', 'stage-visual')).toEqual({ status: 'queued', run_id: null, started_at: null, completed_at: null });
+    expect(database.db.prepare('SELECT completed_at FROM agent_dispatches WHERE run_id = ?').get(runId)).toEqual({ completed_at: recoveredAt });
+
+    const [fresh] = await store.enqueueDispatches('TASK-2026-0815', ['stage-visual'], recoveredAt);
+    expect(fresh).toMatchObject({ status: 'pending', expiresAt: '2026-08-18T16:00:00.000Z' });
+    expect(fresh.runId).not.toBe(runId);
+    const [duplicate] = await store.enqueueDispatches('TASK-2026-0815', ['stage-visual'], '2026-08-18T14:00:01.000Z');
+    expect(duplicate.runId).toBe(fresh.runId);
+  });
+
+  it('returns the current attempt metadata after progress and terminal stage updates', async () => {
+    await store.updateStage('TASK-2026-0815', 'stage-visual', 'failed', { summary: 'Attempt one failed' });
+    const paused = await store.pauseMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', 'Prepare a second attempt.', '2026-08-18T14:03:00.000Z',
+    );
+    expect(paused.state).toBe('applied');
+    const changed = await store.applyMissionChangeRequest({
+      id: 'CHANGE-D1-RETURN-ATTEMPT', missionId: 'TASK-2026-0815', targetStageIds: ['stage-visual'],
+      resetStageIds: ['stage-visual'], reason: 'Retry with current attempt metadata.',
+      acceptanceCriteria: 'Return attempt two from every Store mutation.', requestedBy: 'demo-requester',
+      createdAt: '2026-08-18T14:03:01.000Z',
+    });
+    expect(changed.state).toBe('applied');
+    if (changed.state !== 'applied') throw new Error('change request should apply');
+    expect((await store.resumeMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', changed.schedulerRevision, '2026-08-18T14:03:02.000Z',
+    )).state).toBe('applied');
+    expect(await store.claimStageForDispatch('TASK-2026-0815', 'stage-visual')).toMatchObject({ attemptNo: 2, status: 'running' });
+
+    expect(await store.setStageProgress('TASK-2026-0815', 'stage-visual', 45)).toMatchObject({
+      attemptNo: 2, status: 'running', progress: 45,
+      input: { rework: { changeRequestId: 'CHANGE-D1-RETURN-ATTEMPT', isTarget: true } },
+    });
+    expect(await store.transitionRunningStage('TASK-2026-0815', 'stage-visual', 'failed', { summary: 'Attempt two failed' })).toMatchObject({
+      attemptNo: 2, status: 'failed', output: { summary: 'Attempt two failed' },
+    });
+  });
+
+  it('persists one transition checkpoint per edge and current source attempt', async () => {
+    database.db.prepare("UPDATE escrows SET status = 'pending' WHERE mission_id = ?").run('TASK-2026-0815');
+    database.db.prepare(`
+      INSERT INTO workflow_edges (id, mission_id, source_stage_id, target_stage_id, created_at)
+      VALUES ('EDGE-D1-TRANSITION', 'TASK-2026-0815', 'stage-visual', 'stage-motion', '2026-08-18T14:04:00.000Z')
+    `).run();
+    database.db.prepare(`
+      INSERT INTO workflow_edge_rules (edge_id, mission_id, condition_json, mappings_json, created_at, updated_at)
+      VALUES ('EDGE-D1-TRANSITION', 'TASK-2026-0815', NULL, ?, '2026-08-18T14:04:00.000Z', '2026-08-18T14:04:00.000Z')
+    `).run(JSON.stringify([{ from: '/evidence/hash', to: '/request/hash', required: true }]));
+    database.db.prepare("UPDATE escrows SET status = 'held' WHERE mission_id = ?").run('TASK-2026-0815');
+    await store.updateStage('TASK-2026-0815', 'stage-visual', 'done', { summary: 'Source complete', evidence: { hash: 'abc' } });
+    const edge = (await store.listEdges('TASK-2026-0815')).find((candidate) => candidate.sourceStageId === 'stage-visual');
+    expect(edge).toBeDefined();
+    const checkpoint = {
+      id: 'TRANSITION-D1-1', missionId: 'TASK-2026-0815', edgeId: edge!.id,
+      sourceStageId: 'stage-visual', targetStageId: 'stage-motion', sourceAttemptNo: 1,
+      workflowVersion: 1, matched: true, mappedInput: { request: { hash: 'abc' } },
+      missingRequired: [], errorCode: null, createdAt: '2026-08-18T14:05:00.000Z',
+    };
+
+    expect(await store.claimStageForDispatch('TASK-2026-0815', 'stage-motion')).toBeNull();
+    expect(await store.recordWorkflowTransition(checkpoint)).toMatchObject({ applied: true, checkpoint });
+    expect(await store.claimStageForDispatch('TASK-2026-0815', 'stage-motion')).toMatchObject({ status: 'running' });
+    expect(await store.recordWorkflowTransition({ ...checkpoint, id: 'TRANSITION-D1-REPLAY' })).toMatchObject({
+      applied: false, checkpoint: { id: checkpoint.id, mappedInput: checkpoint.mappedInput },
+    });
+    expect(await store.listWorkflowTransitions('TASK-2026-0815')).toEqual([checkpoint]);
+    expect(await store.listCurrentWorkflowTransitions('TASK-2026-0815')).toEqual([checkpoint]);
+    await expect(store.recordWorkflowTransition({ ...checkpoint, id: 'TRANSITION-D1-STALE', sourceAttemptNo: 2 }))
+      .rejects.toThrow('WORKFLOW_TRANSITION_CONFLICT');
+
+    database.db.prepare('UPDATE workflow_stage_attempts SET is_current = 0 WHERE stage_id = ?').run('stage-visual');
+    database.db.prepare(`
+      INSERT INTO workflow_stage_attempts
+        (id, mission_id, stage_id, attempt_no, status, input_json, output_json, is_current, created_at, updated_at)
+      SELECT 'ATTEMPT-D1-TRANSITION-2', mission_id, id, 2, status, input_json, output_json, 1,
+        '2026-08-18T14:06:00.000Z', '2026-08-18T14:06:00.000Z'
+      FROM workflow_stages WHERE id = 'stage-visual'
+    `).run();
+    expect(await store.recordWorkflowTransition({ ...checkpoint, id: 'TRANSITION-D1-LATE-REPLAY' })).toMatchObject({
+      applied: false, checkpoint: { id: checkpoint.id },
+    });
+    expect(await store.listCurrentWorkflowTransitions('TASK-2026-0815')).toEqual([]);
+    expect(await store.listWorkflowTransitions('TASK-2026-0815')).toEqual([checkpoint]);
+    await expect(store.addDeliverable({
+      id: 'DEL-D1-STALE-ATTEMPT', missionId: 'TASK-2026-0815', stageId: 'stage-visual', attemptNo: 1,
+      agentId: 'visionboard', name: 'Stale attempt artifact', uri: 'ipfs://bafystalestageartifact',
+      contentHash: `sha256:${'d'.repeat(64)}`, mimeType: 'application/json', status: 'submitted',
+      createdAt: '2026-08-18T14:06:01.000Z',
+    })).rejects.toThrow('STALE_STAGE_ATTEMPT');
+    expect(await store.addDeliverable({
+      id: 'DEL-D1-CURRENT-ATTEMPT', missionId: 'TASK-2026-0815', stageId: 'stage-visual', attemptNo: 2,
+      agentId: 'visionboard', name: 'Current attempt artifact', uri: 'ipfs://bafycurrentstageartifact',
+      contentHash: `sha256:${'e'.repeat(64)}`, mimeType: 'application/json', status: 'submitted',
+      createdAt: '2026-08-18T14:06:02.000Z',
+    })).toMatchObject({ attemptNo: 2 });
+  });
+
+  it('stores owner-private immutable workflow template versions', async () => {
+    const sourceNodes = (await store.listStages('TASK-2026-0815')).map((stage, index) => ({
+      ...stage,
+      id: `NODE-${index + 1}`,
+      missionId: 'TEMPLATE-D1-1',
+      position: index + 1,
+      status: 'queued' as const,
+      agentId: null,
+      output: null,
+    }));
+    const sourceEdges = [{
+      id: 'EDGE-1', missionId: 'TEMPLATE-D1-1',
+      sourceStageId: sourceNodes[0].id, targetStageId: sourceNodes[1].id,
+      mappings: [{ from: '/summary', to: '/research/summary', required: true }],
+      createdAt: '2026-08-18T14:06:00.000Z',
+    }];
+    const input = {
+      id: 'TEMPLATE-D1-1', ownerId: 'demo-requester', name: 'D1 research flow', description: 'Versioned D1 fixture',
+      nodes: sourceNodes, edges: sourceEdges, entryIds: [sourceNodes[0].id], exitIds: [sourceNodes[1].id],
+      contentHash: `sha256:${'a'.repeat(64)}`, createdAt: '2026-08-18T14:06:00.000Z',
+    };
+
+    expect(await store.saveWorkflowTemplateVersion(input)).toMatchObject({
+      state: 'saved', detail: { template: { id: input.id, currentVersion: 1 }, version: { version: 1 } },
+    });
+    expect(await store.saveWorkflowTemplateVersion({ ...input, createdAt: '2026-08-18T14:06:30.000Z' })).toMatchObject({
+      state: 'unchanged', detail: { version: { version: 1 } },
+    });
+    expect(await store.saveWorkflowTemplateVersion({
+      ...input,
+      description: 'Metadata-only second revision',
+      createdAt: '2026-08-18T14:06:45.000Z',
+    })).toMatchObject({
+      state: 'saved', detail: { template: { currentVersion: 2 }, version: { version: 2, contentHash: input.contentHash } },
+    });
+    expect(await store.saveWorkflowTemplateVersion({
+      ...input,
+      description: 'Third immutable revision',
+      contentHash: `sha256:${'b'.repeat(64)}`,
+      createdAt: '2026-08-18T14:07:00.000Z',
+    })).toMatchObject({
+      state: 'saved', detail: { template: { currentVersion: 3 }, version: { version: 3 } },
+    });
+    expect(await store.saveWorkflowTemplateVersion({
+      ...input,
+      description: 'Historical content promoted again',
+      createdAt: '2026-08-18T14:07:30.000Z',
+    })).toMatchObject({
+      state: 'saved', detail: { template: { currentVersion: 4 }, version: { version: 4, contentHash: input.contentHash } },
+    });
+    expect(await store.getWorkflowTemplate('demo-requester', input.id, 1)).toMatchObject({
+      template: { currentVersion: 4 }, version: { version: 1, contentHash: input.contentHash },
+    });
+    expect(await store.getWorkflowTemplate('demo-requester', input.id)).toMatchObject({
+      template: { description: 'Historical content promoted again' }, version: { version: 4 },
+    });
+    expect(await store.getWorkflowTemplate('demo-developer', input.id)).toBeNull();
+    expect(await store.listWorkflowTemplates('demo-requester')).toHaveLength(1);
+  });
+
+  it('keeps review-state dirty checkpoints recoverable', async () => {
+    database.db.prepare(`
+      INSERT INTO mission_runtime_controls
+        (mission_id, scheduler_revision, scheduler_state, updated_at)
+      VALUES (?, 7, 'dirty', '2026-08-18T14:08:00.000Z')
+    `).run('TASK-2026-0809');
+
+    expect(await store.listDirtyMissionControls()).toContainEqual({
+      missionId: 'TASK-2026-0809', schedulerRevision: 7,
+    });
+  });
+
+  it('atomically replaces only an expected running approval Gate during versioned rework', async () => {
+    database.db.prepare("UPDATE escrows SET status = 'pending' WHERE mission_id = ?").run('TASK-2026-0815');
+    database.db.prepare(`
+      INSERT INTO workflow_stages
+        (id, mission_id, position, node_type, name, purpose, category, budget_usdc, status, agent_id, input_json)
+      VALUES (?, ?, 3, 'approval', 'Review gate', 'Approve current evidence', '人工审批', 0, 'running', NULL, '{}')
+    `).run('stage-review-gate', 'TASK-2026-0815');
+    database.db.prepare("UPDATE escrows SET status = 'held' WHERE mission_id = ?").run('TASK-2026-0815');
+    await store.updateStage('TASK-2026-0815', 'stage-motion', 'done', { summary: '需要 Gate 返工的上游输出' });
+    expect((await store.pauseMission(
+      'TASK-2026-0815', 'demo-requester', 'requester', '原子创建 Gate 返工版本。', '2026-08-18T14:10:00.000Z',
+    )).state).toBe('applied');
+
+    const unsafeTaskException = await store.applyMissionChangeRequest({
+      id: 'CHANGE-D1-UNSAFE-TASK', missionId: 'TASK-2026-0815', targetStageIds: ['stage-motion'],
+      resetStageIds: ['stage-motion', 'stage-visual'], expectedRunningStageIds: ['stage-visual'],
+      reason: '不应替换在途任务。', acceptanceCriteria: '在途任务必须保持当前 attempt。',
+      requestedBy: 'demo-requester', createdAt: '2026-08-18T14:10:30.000Z',
+    });
+    expect(unsafeTaskException.state).toBe('invalid');
+    expect((await store.listStages('TASK-2026-0815')).find((stage) => stage.id === 'stage-visual')).toMatchObject({
+      nodeType: 'task', status: 'running', attemptNo: 1,
+    });
+
+    const changed = await store.applyMissionChangeRequest({
+      id: 'CHANGE-D1-GATE', missionId: 'TASK-2026-0815', targetStageIds: ['stage-motion'],
+      resetStageIds: ['stage-motion', 'stage-review-gate'], expectedRunningStageIds: ['stage-review-gate'],
+      reason: 'Gate 驳回后重跑上游与审批阶段。', acceptanceCriteria: '新版输出需要重新通过审批。',
+      requestedBy: 'demo-requester', createdAt: '2026-08-18T14:11:00.000Z',
+    });
+
+    expect(changed).toMatchObject({ state: 'applied', changeRequest: { version: 1 } });
+    expect(await store.listStages('TASK-2026-0815')).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'stage-motion', status: 'queued', attemptNo: 2,
+        input: expect.objectContaining({ rework: expect.objectContaining({ isTarget: true, acceptanceCriteria: '新版输出需要重新通过审批。' }) }),
+      }),
+      expect.objectContaining({
+        id: 'stage-review-gate', nodeType: 'approval', status: 'queued', attemptNo: 2,
+        input: expect.objectContaining({ rework: expect.objectContaining({ isTarget: false, targetStageIds: ['stage-motion'] }) }),
+      }),
+    ]));
   });
 
   it('atomically reclaims a failed stage for dispatch', async () => {
@@ -483,6 +839,86 @@ describe('D1PlatformStore concurrency invariants', () => {
       progress: 100,
       currentStage: 'Agent 已全部完成，等待任务方验收',
     });
+  });
+
+  it('replays the mission runtime migration without duplicating controls or attempts', () => {
+    database.db.prepare(`
+      INSERT INTO agent_dispatches (run_id, mission_id, stage_id, agent_id, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      'run-active-during-migration', 'TASK-2026-0815', 'stage-visual', 'visionboard',
+      '2026-08-19T00:00:00.000Z', '2026-08-18T12:00:00.000Z',
+    );
+    const migration = readFileSync(join(import.meta.dirname, '../../db/021_mission_runtime_control.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM mission_runtime_controls WHERE mission_id = ?').get('TASK-2026-0815')).toEqual({ count: 1 });
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM workflow_stage_attempts WHERE stage_id = ? AND is_current = 1').get('stage-visual')).toEqual({ count: 1 });
+    expect(database.db.prepare('SELECT run_id FROM workflow_stage_attempts WHERE stage_id = ? AND is_current = 1').get('stage-visual')).toEqual({
+      run_id: 'run-active-during-migration',
+    });
+  });
+
+  it('replays advanced workflow metadata while preserving immutable rows', () => {
+    const migration = readFileSync(join(import.meta.dirname, '../../db/022_advanced_workflow.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+    expect(database.db.prepare(`
+      SELECT COUNT(*) AS count FROM workflow_edge_rules WHERE mission_id = ?
+    `).get('TASK-2026-0815')).toEqual(database.db.prepare(`
+      SELECT COUNT(*) AS count FROM workflow_edges WHERE mission_id = ?
+    `).get('TASK-2026-0815'));
+    database.db.prepare(`
+      INSERT INTO workflow_templates (id, owner_id, name, description, current_version, created_at, updated_at)
+      VALUES ('TEMPLATE-IMMUTABLE', 'demo-requester', 'Immutable fixture', '', 1, ?, ?)
+    `).run('2026-08-18T14:03:00.000Z', '2026-08-18T14:03:00.000Z');
+    database.db.prepare(`
+      INSERT INTO workflow_template_versions
+        (template_id, version, nodes_json, edges_json, entry_ids_json, exit_ids_json, content_hash, created_at)
+      VALUES ('TEMPLATE-IMMUTABLE', 1, '[]', '[]', '[]', '[]', ?, ?)
+    `).run(`sha256:${'f'.repeat(64)}`, '2026-08-18T14:03:00.000Z');
+    expect(() => database.db.prepare(`
+      UPDATE workflow_template_versions SET content_hash = ? WHERE template_id = ?
+    `).run(`sha256:${'e'.repeat(64)}`, 'TEMPLATE-IMMUTABLE')).toThrow('WORKFLOW_TEMPLATE_VERSION_IMMUTABLE');
+  });
+
+  it('replays the deliverable-attempt migration without losing attempt identity', () => {
+    database.db.prepare(`
+      UPDATE workflow_stage_attempts SET is_current = 0, updated_at = ?
+      WHERE mission_id = ? AND stage_id = ? AND is_current = 1
+    `).run('2026-08-18T13:00:00.000Z', 'TASK-2026-0815', 'stage-visual');
+    database.db.prepare(`
+      INSERT INTO workflow_stage_attempts
+        (id, mission_id, stage_id, attempt_no, status, input_json, output_json, is_current, created_at, updated_at)
+      VALUES (?, ?, ?, 2, 'done', '{}', '{}', 1, ?, ?)
+    `).run(
+      'ATTEMPT-replay-2', 'TASK-2026-0815', 'stage-visual',
+      '2026-08-18T13:00:00.000Z', '2026-08-18T13:00:00.000Z',
+    );
+    database.db.prepare(`
+      INSERT INTO deliverables
+        (id, mission_id, stage_id, attempt_no, agent_id, name, uri, content_hash, mime_type, status, created_at)
+      VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, 'submitted', ?)
+    `).run(
+      'DELIVERABLE-attempt-2', 'TASK-2026-0815', 'stage-visual', 'visionboard', 'Attempt two result',
+      'https://example.test/attempt-2.json', `sha256:${'2'.repeat(64)}`, 'application/json', '2026-08-18T14:00:00.000Z',
+    );
+    database.db.prepare(`
+      INSERT INTO deliverables
+        (id, mission_id, stage_id, attempt_no, agent_id, name, uri, content_hash, mime_type, status, created_at)
+      VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, 'submitted', ?)
+    `).run(
+      'DELIVERABLE-mission-level', 'TASK-2026-0815', 'Mission result',
+      'https://example.test/mission.json', `sha256:${'3'.repeat(64)}`, 'application/json', '2026-08-18T14:01:00.000Z',
+    );
+
+    const migration = readFileSync(join(import.meta.dirname, '../../db/023_deliverable_attempts.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+
+    expect(database.db.prepare('SELECT attempt_no FROM deliverables WHERE id = ?').get('DELIVERABLE-attempt-2')).toEqual({ attempt_no: 2 });
+    expect(database.db.prepare('SELECT attempt_no FROM deliverables WHERE id = ?').get('DELIVERABLE-mission-level')).toEqual({ attempt_no: null });
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM deliverables').get()).toEqual({ count: 2 });
   });
 
   it('reopens the affected review mission without releasing escrow when its engineering artifact is missing', async () => {
@@ -597,6 +1033,13 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect((await store.acceptMission(dispute.missionId, 'demo-requester', null))?.applied).toBe(false);
     expect((await store.getEscrow(dispute.missionId))?.status).toBe('frozen');
 
+    expect((await store.queueDisputeExecution(
+      dispute.id, 'demo-arbitrator', '2026-08-18T00:05:00.000Z', false,
+    )).state).toBe('not_ready');
+    expect((await store.queueDisputeExecution(
+      dispute.id, 'demo-arbitrator', '2026-08-22T00:05:00.000Z', false,
+    )).state).toBe('queued');
+
     const first = await store.resolveDispute(dispute.id, '首次裁决生效，后续请求不能覆盖结果或重复退款。', 'resolved', 'demo-requester', null);
     const second = await store.resolveDispute(dispute.id, '迟到裁决不得生效，也不得改变首次退款结果。', 'rejected', 'demo-requester', null);
 
@@ -608,5 +1051,271 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect((await store.getWalletAccount('demo-requester')).balance).toBe(1_200);
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM dispute_actions WHERE dispute_id = ?').get(dispute.id)).toEqual({ count: 2 });
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM reward_activities WHERE dispute_id = ? AND role = 'arbitrator'").get(dispute.id)).toEqual({ count: 2 });
+  });
+
+  it('persists immutable Power rounds and one expanded-council appeal', async () => {
+    const migration = readFileSync(join(import.meta.dirname, '../../db/024_power_arbitration_appeals.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+    database.db.exec(`
+      UPDATE arbitration_members SET power = 2 WHERE user_id = 'demo-arbitrator';
+      UPDATE arbitration_members SET power = 5 WHERE user_id = 'demo-arbitrator-2';
+      INSERT INTO profiles (id, email, display_name, role)
+      VALUES ('demo-arbitrator-3', 'arbitrator-3@test.invalid', 'Test Arbitrator Three', 'requester');
+    `);
+    const dispute: Dispute = {
+      id: 'DSP-D1-POWER-APPEAL', missionId: 'TASK-2026-0815', openedBy: 'demo-requester',
+      reason: '验证 Power 提案、冻结快照、扩大委员上诉和最终执行队列。', evidence: [], status: 'open',
+      resolution: null, freezeTxHash: null, resolutionTxHash: null,
+      createdAt: '2026-08-18T01:00:00.000Z', resolvedAt: null,
+    };
+    await store.createDispute(dispute);
+    await store.startDisputeReview(dispute.id, 'demo-arbitrator', '2026-08-18T01:00:00.000Z', 'power');
+    const initial = await store.getDisputeGovernance(dispute.id, 'demo-arbitrator-2', '2026-08-18T01:00:01.000Z');
+    expect(initial?.proposal).toMatchObject({ round: 0, weightVersion: 'member_power.v1', eligibleWeight: 7, quorumRequired: 5 });
+    expect(initial?.electorate.find((member) => member.userId === 'demo-arbitrator-2')).toMatchObject({ powerSnapshot: 5, voteWeight: 5 });
+    const firstVote = await store.castDisputeVote(
+      dispute.id, 'demo-arbitrator-2', 'support_refund', '高 Power 委员依据冻结证据支持退款。', '2026-08-18T01:01:00.000Z',
+    );
+    expect(firstVote.state).toBe('applied');
+    if (firstVote.state === 'applied') expect(firstVote.governance.proposal?.status).toBe('succeeded');
+
+    await store.setArbitrationMember('demo-arbitrator-2', true, 'demo-arbitrator', '2026-08-18T01:02:00.000Z', 9);
+    await store.setArbitrationMember('demo-arbitrator-3', true, 'demo-arbitrator', '2026-08-18T01:02:00.000Z', 3);
+    const appeal = await store.createDisputeAppeal(
+      dispute.id, 'demo-requester', '首轮证据解释存在重大分歧，请扩大委员会重新审查任务交付。', '2026-08-18T01:03:00.000Z',
+    );
+    expect(appeal.state).toBe('created');
+    if (appeal.state !== 'created') return;
+    expect(appeal.governance.rounds).toHaveLength(2);
+    expect(appeal.governance.rounds[0].electorate.find((member) => member.userId === 'demo-arbitrator-2')).toMatchObject({ voteWeight: 5 });
+    expect(appeal.governance.electorate.find((member) => member.userId === 'demo-arbitrator-2')).toMatchObject({ voteWeight: 9 });
+    expect(appeal.governance.electorate.find((member) => member.userId === 'demo-arbitrator-3')).toMatchObject({ voteWeight: 3 });
+    expect((await store.createDisputeAppeal(
+      dispute.id, 'demo-requester', '第二次上诉必须被唯一轮次约束拒绝且不得覆盖历史。', '2026-08-18T01:04:00.000Z',
+    )).state).toBe('already_appealed');
+    expect((await store.queueDisputeExecution(
+      dispute.id, 'demo-arbitrator', '2026-08-18T01:04:00.000Z', false,
+    )).state).toBe('not_ready');
+
+    const appealVote = await store.castDisputeVote(
+      dispute.id, 'demo-arbitrator-2', 'oppose_refund', '扩大委员会复核后反对退款并恢复任务。', '2026-08-18T01:05:00.000Z',
+    );
+    expect(appealVote.state).toBe('applied');
+    if (appealVote.state === 'applied') expect(appealVote.governance.proposal).toMatchObject({ round: 1, status: 'defeated' });
+    expect((await store.queueDisputeExecution(
+      dispute.id, 'demo-arbitrator', '2026-08-18T01:06:00.000Z', false,
+    )).state).toBe('queued');
+    expect(database.db.prepare(`
+      SELECT action_type, status FROM governance_execution_queue WHERE source_id = ?
+    `).get(dispute.id)).toEqual({ action_type: 'reject_dispute', status: 'queued' });
+  });
+
+  it('allows non-directional appeals and makes appeal creation exclusive with execution queueing', async () => {
+    database.db.exec(`
+      INSERT INTO profiles (id, email, display_name, role)
+      VALUES ('demo-arbitrator-3', 'arbitrator-3@test.invalid', 'Test Arbitrator Three', 'requester');
+    `);
+    const nonDirectional: Dispute = {
+      id: 'DSP-D1-NON-DIRECTIONAL', missionId: 'TASK-2026-0815', openedBy: 'demo-requester',
+      reason: '验证首轮没有方向性结果时仍可在期限内创建唯一上诉。', evidence: [], status: 'open',
+      resolution: null, freezeTxHash: null, resolutionTxHash: null,
+      createdAt: '2026-08-18T02:00:00.000Z', resolvedAt: null,
+    };
+    await store.createDispute(nonDirectional);
+    await store.startDisputeReview(nonDirectional.id, 'demo-arbitrator', '2026-08-18T02:00:00.000Z');
+    const quorumFailure = await store.finalizeDisputeProposal(
+      nonDirectional.id, 'demo-arbitrator', '2026-08-22T02:00:00.000Z',
+    );
+    expect(quorumFailure.state).toBe('finalized');
+    if (quorumFailure.state === 'finalized') expect(quorumFailure.governance.proposal).toMatchObject({ status: 'quorum_failed', outcome: null });
+    await store.setArbitrationMember(
+      'demo-arbitrator-3', true, 'demo-arbitrator', '2026-08-22T02:01:00.000Z', 1,
+    );
+    expect((await store.getDisputeGovernance(
+      nonDirectional.id, 'demo-requester', '2026-08-23T02:00:00.000Z',
+    ))?.appeal.canAppeal).toBe(true);
+    expect((await store.createDisputeAppeal(
+      nonDirectional.id,
+      'demo-requester',
+      '首轮未达到法定票权，请求扩大无利益冲突委员会完成复核。',
+      '2026-08-23T02:00:00.000Z',
+    )).state).toBe('created');
+
+    database.db.exec(`
+      INSERT INTO missions
+        (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json)
+      VALUES
+        ('TASK-2026-QUEUED-RACE', 'demo-requester', 'Queued race mission', 'Exercises appeal and queue mutual exclusion.',
+         '视频生产', 80, '2026-09-01', 'running', 50, 'Reviewing delivery', '["visionboard"]');
+      INSERT INTO workflow_stages
+        (id, mission_id, position, name, purpose, category, budget_usdc, status, agent_id, output_json)
+      VALUES
+        ('stage-queued-race', 'TASK-2026-QUEUED-RACE', 1, 'Queued race stage', 'Verify governance ordering',
+         '图像生成', 80, 'done', 'visionboard', '{"verified":true}');
+      INSERT INTO escrows (id, mission_id, amount, token, network, payment_method, status)
+      VALUES ('ESC-QUEUED-RACE', 'TASK-2026-QUEUED-RACE', 80, 'CREDIT', 'agentmesh', 'web2_balance', 'held');
+    `);
+    const queuedRace: Dispute = {
+      ...nonDirectional,
+      id: 'DSP-D1-QUEUED-RACE',
+      missionId: 'TASK-2026-QUEUED-RACE',
+      reason: '验证已经入队的首轮结果与较早时间戳上诉请求严格互斥。',
+      createdAt: '2026-08-18T03:00:00.000Z',
+    };
+    await store.createDispute(queuedRace);
+    await store.startDisputeReview(queuedRace.id, 'demo-arbitrator', '2026-08-18T03:00:00.000Z');
+    await store.castDisputeVote(
+      queuedRace.id, 'demo-arbitrator', 'support_refund', '第一名委员依据冻结证据支持退款。', '2026-08-18T03:01:00.000Z',
+    );
+    await store.castDisputeVote(
+      queuedRace.id, 'demo-arbitrator-2', 'support_refund', '第二名委员复核后支持退款形成多数。', '2026-08-18T03:02:00.000Z',
+    );
+    expect((await store.queueDisputeExecution(
+      queuedRace.id, 'demo-arbitrator', '2026-08-22T03:02:00.000Z', false,
+    )).state).toBe('queued');
+    expect((await store.getDisputeGovernance(
+      queuedRace.id, 'demo-requester', '2026-08-19T03:02:00.000Z',
+    ))?.appeal.canAppeal).toBe(false);
+    expect((await store.createDisputeAppeal(
+      queuedRace.id,
+      'demo-requester',
+      '该请求携带窗口内时间，但首轮执行已经先行入队，不能再创建上诉。',
+      '2026-08-19T03:02:00.000Z',
+    )).state).toBe('execution_queued');
+  });
+
+  it('persists private async export progress, retries, ownership and retention without ledger content in audit', async () => {
+    const migration = readFileSync(join(import.meta.dirname, '../../db/025_async_export_jobs.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+    database.db.exec(`
+      WITH RECURSIVE sequence(value) AS (
+        SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 5001
+      )
+      INSERT INTO ledger_entries
+        (id, settlement_key, mission_id, agent_id, entry_type, amount, token, status, created_at)
+      SELECT 'large-d1-' || value, 'large-d1-key-' || value, 'TASK-2026-0815', 'visionboard',
+        'agent_payout', value, 'mUSDC', 'settled', '2026-08-18T04:00:00.000Z'
+      FROM sequence;
+    `);
+
+    expect(await store.requestDeveloperLedgerExport(
+      'demo-developer', 'sETH', '2026-08-18T04:01:00.000Z',
+    )).toEqual({ mode: 'direct', rowCount: 0 });
+    const created = await store.requestDeveloperLedgerExport(
+      'demo-developer', 'mUSDC', '2026-08-18T04:01:00.000Z',
+    );
+    expect(created).toMatchObject({ mode: 'async', job: { status: 'queued', totalRows: 5_001, attempt: 1 } });
+    if (created.mode !== 'async') return;
+    const exportId = created.job.id;
+    const duplicate = await store.requestDeveloperLedgerExport(
+      'demo-developer', 'mUSDC', '2026-08-18T04:02:00.000Z',
+    );
+    expect(duplicate.mode === 'async' ? duplicate.job.id : null).toBe(exportId);
+    expect(await store.getDeveloperLedgerExport('demo-requester', exportId, '2026-08-18T04:02:00.000Z')).toBeNull();
+
+    const claim = await store.claimDeveloperLedgerExport('d1-export-worker-1', '2026-08-18T04:03:00.000Z');
+    expect(claim).toMatchObject({ ownerId: 'demo-developer', job: { id: exportId, status: 'processing' } });
+    expect(await store.claimDeveloperLedgerExport('d1-export-worker-2', '2026-08-18T04:03:01.000Z')).toBeNull();
+    expect(await store.updateDeveloperLedgerExportProgress(
+      exportId, 'd1-export-worker-1', 1, 2_500, '2026-08-18T04:04:00.000Z',
+    )).toMatchObject({ processedRows: 2_500, progress: 49 });
+    expect(await store.failDeveloperLedgerExport(
+      exportId, 'd1-export-worker-1', 1, 'STORAGE_ERROR', 'Private export storage failed', '2026-08-18T04:05:00.000Z',
+    )).toMatchObject({ status: 'failed', errorCode: 'STORAGE_ERROR' });
+    expect(await store.retryDeveloperLedgerExport(
+      'demo-developer', exportId, '2026-08-18T04:06:00.000Z',
+    )).toMatchObject({ state: 'applied', job: { status: 'queued', attempt: 2, processedRows: 0 } });
+    await store.claimDeveloperLedgerExport('d1-export-worker-2', '2026-08-18T04:07:00.000Z');
+    const completed = await store.completeDeveloperLedgerExport({
+      id: exportId, workerId: 'd1-export-worker-2', attempt: 2, objectKey: `private/exports/${exportId}/ledger.csv`,
+      sha256: 'b'.repeat(64), rowCount: 5_001, byteSize: 234_567, completedAt: '2026-08-18T04:08:00.000Z',
+    });
+    expect(completed).toMatchObject({ status: 'completed', progress: 100, artifact: { rowCount: 5_001, byteSize: 234_567 } });
+    expect(completed).not.toHaveProperty('artifact.objectKey');
+    expect(await store.getDeveloperLedgerExportArtifact(
+      'demo-developer', exportId, '2026-08-18T04:09:00.000Z',
+    )).toMatchObject({ objectKey: `private/exports/${exportId}/ledger.csv` });
+    expect(await store.getDeveloperLedgerExportArtifact(
+      'demo-requester', exportId, '2026-08-18T04:09:00.000Z',
+    )).toBeNull();
+
+    expect(await store.getDeveloperLedgerExport(
+      'demo-developer', exportId, '2026-08-19T04:08:01.000Z',
+    )).toMatchObject({ status: 'expired', artifact: null, expiresAt: '2026-08-19T04:08:00.000Z' });
+    expect(await store.getDeveloperLedgerExportArtifact(
+      'demo-developer', exportId, '2026-08-19T04:08:01.000Z',
+    )).toBeNull();
+    const unsafeAudit = database.db.prepare(`
+      SELECT COUNT(*) AS count FROM export_job_events
+      WHERE detail_json LIKE '%large-d1-%' OR detail_json LIKE '%Private row%'
+    `).get();
+    expect(unsafeAudit).toEqual({ count: 0 });
+
+    const replacement = await store.requestDeveloperLedgerExport(
+      'demo-developer', 'mUSDC', '2026-08-19T04:09:00.000Z',
+    );
+    expect(replacement.mode).toBe('async');
+    if (replacement.mode === 'async') {
+      const replacementId = replacement.job.id;
+      const originalExpiry = replacement.job.expiresAt;
+      expect(await store.claimDeveloperLedgerExport(
+        'd1-reused-worker', '2026-08-19T04:10:00.000Z',
+      )).toMatchObject({ job: { id: replacementId, attempt: 1 } });
+      expect(await store.updateDeveloperLedgerExportProgress(
+        replacementId, 'd1-reused-worker', 1, 100, '2026-08-19T04:15:00.000Z',
+      )).toBeNull();
+      expect(await store.claimDeveloperLedgerExport(
+        'd1-reused-worker', '2026-08-19T04:15:01.000Z',
+      )).toMatchObject({ job: { id: replacementId, attempt: 2 } });
+      expect(await store.updateDeveloperLedgerExportProgress(
+        replacementId, 'd1-reused-worker', 1, 100, '2026-08-19T04:15:02.000Z',
+      )).toBeNull();
+      expect(await store.completeDeveloperLedgerExport({
+        id: replacementId, workerId: 'd1-reused-worker', attempt: 1,
+        objectKey: `private/exports/${replacementId}/stale.csv`, sha256: 'c'.repeat(64),
+        rowCount: 5_001, byteSize: 10_000, completedAt: '2026-08-19T04:15:02.000Z',
+      })).toBeNull();
+      expect(await store.failDeveloperLedgerExport(
+        replacementId, 'd1-reused-worker', 1, 'STORAGE_ERROR', 'Private export storage failed', '2026-08-19T04:15:02.000Z',
+      )).toBeNull();
+      expect(await store.updateDeveloperLedgerExportProgress(
+        replacementId, 'd1-reused-worker', 2, 250, '2026-08-19T04:15:02.000Z',
+      )).toMatchObject({ processedRows: 250, attempt: 2 });
+      expect(await store.failDeveloperLedgerExport(
+        replacementId, 'd1-reused-worker', 2, 'STORAGE_ERROR', 'Private export storage failed', '2026-08-19T04:16:00.000Z',
+      )).toMatchObject({ status: 'failed', attempt: 2 });
+
+      const sibling = await store.requestDeveloperLedgerExport(
+        'demo-developer', 'mUSDC', '2026-08-19T04:17:00.000Z',
+      );
+      expect(sibling.mode).toBe('async');
+      if (sibling.mode === 'async') {
+        expect((await store.retryDeveloperLedgerExport(
+          'demo-developer', replacementId, '2026-08-19T04:17:01.000Z',
+        )).state).toBe('invalid_state');
+        expect(await store.cancelDeveloperLedgerExport(
+          'demo-developer', sibling.job.id, '2026-08-19T04:17:02.000Z',
+        )).toMatchObject({ state: 'applied', job: { status: 'cancelled' } });
+      }
+
+      expect(await store.retryDeveloperLedgerExport(
+        'demo-developer', replacementId, '2026-08-25T04:00:00.000Z',
+      )).toMatchObject({ state: 'applied', job: { status: 'queued', attempt: 3, expiresAt: originalExpiry } });
+      expect(await store.claimDeveloperLedgerExport(
+        'd1-expiry-worker', '2026-08-25T04:01:00.000Z',
+      )).toMatchObject({ job: { id: replacementId, attempt: 3 } });
+      database.db.prepare('UPDATE export_jobs SET lease_expires_at = ? WHERE id = ?')
+        .run('2026-08-27T04:00:00.000Z', replacementId);
+      expect(await store.completeDeveloperLedgerExport({
+        id: replacementId, workerId: 'd1-expiry-worker', attempt: 3,
+        objectKey: `private/exports/${replacementId}/late.csv`, sha256: 'd'.repeat(64),
+        rowCount: 5_001, byteSize: 10_000, completedAt: '2026-08-26T04:09:01.000Z',
+      })).toBeNull();
+      expect(await store.getDeveloperLedgerExport(
+        'demo-developer', replacementId, '2026-08-26T04:09:01.000Z',
+      )).toMatchObject({ status: 'expired', artifact: null });
+    }
   });
 });

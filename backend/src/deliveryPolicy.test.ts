@@ -7,6 +7,7 @@ function stage(mode: 'analyze' | 'implement' | 'review', output: WorkflowStage['
     id: `stage-${mode}`, missionId: 'TASK-delivery-policy', position: 1, nodeType: 'task',
     positionX: 0, positionY: 0, progress: 100, name: mode, purpose: mode, category: '软件开发',
     budget: 100, status: 'done', agentId: 'engineering-agent', input: { executionMode: mode }, output,
+    attemptNo: 1, attemptCreatedAt: '2026-08-23T00:00:00.000Z',
     createdAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:00:00.000Z',
   };
 }
@@ -14,6 +15,7 @@ function stage(mode: 'analyze' | 'implement' | 'review', output: WorkflowStage['
 function artifact(stageId: string, status: Deliverable['status'] = 'submitted'): Deliverable {
   return {
     id: 'DEL-policy', missionId: 'TASK-delivery-policy', stageId, agentId: 'engineering-agent',
+    attemptNo: 1,
     name: 'Source archive', uri: 'ipfs://bafydeliverypolicy', contentHash: `sha256:${'a'.repeat(64)}`,
     mimeType: 'application/zip', status, createdAt: '2026-08-23T00:00:00.000Z',
   };
@@ -38,6 +40,23 @@ describe('workflow delivery policy', () => {
     expect(workflowDeliveryReadiness([implementation], []).code).toBe('ARTIFACT_REQUIRED');
     expect(workflowDeliveryReadiness([implementation], [artifact(implementation.id, 'rejected')]).code).toBe('ARTIFACT_REQUIRED');
     expect(workflowDeliveryReadiness([implementation], [artifact(implementation.id)])).toMatchObject({ ready: true, code: 'READY' });
+  });
+
+  it('does not let an artifact from an older attempt satisfy rework delivery', () => {
+    const implementation = {
+      ...stage('implement', { summary: 'Reworked', verified: true }),
+      attemptNo: 2,
+      attemptCreatedAt: '2026-08-24T00:00:00.000Z',
+    };
+    const oldArtifact = artifact(implementation.id);
+    const currentArtifact = {
+      ...oldArtifact,
+      id: 'DEL-policy-v2',
+      attemptNo: 2,
+      createdAt: oldArtifact.createdAt,
+    };
+    expect(workflowDeliveryReadiness([implementation], [oldArtifact])).toMatchObject({ ready: false, code: 'ARTIFACT_REQUIRED' });
+    expect(workflowDeliveryReadiness([implementation], [oldArtifact, currentArtifact])).toMatchObject({ ready: true, code: 'READY' });
   });
 
   it('infers the middle implementation node for legacy three-stage workflows', () => {

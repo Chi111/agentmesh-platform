@@ -3,10 +3,12 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   CircleDollarSign,
+  Clock3,
   Download,
   Landmark,
   LoaderCircle,
   RefreshCw,
+  RotateCcw,
   TrendingUp,
   WalletCards,
 } from 'lucide-react';
@@ -16,7 +18,7 @@ import { PageHeader } from '../components/ui/PageHeader';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { api } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
-import type { DeveloperLedger, LedgerEntry } from '../types/domain';
+import type { DeveloperLedger, LedgerEntry, LedgerExportJob } from '../types/domain';
 
 const emptyLedger: DeveloperLedger = {
   token: 'CREDIT',
@@ -97,13 +99,20 @@ export function EarningsPage() {
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportJobs, setExportJobs] = useState<LedgerExportJob[]>([]);
+  const [exportJobBusy, setExportJobBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const loadLedger = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setLedger(await api.getDeveloperLedger(40, null, token));
+      const [nextLedger, jobs] = await Promise.all([
+        api.getDeveloperLedger(40, null, token),
+        api.listDeveloperLedgerExports(),
+      ]);
+      setLedger(nextLedger);
+      setExportJobs(jobs);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '账本同步失败。');
     } finally {
@@ -112,6 +121,14 @@ export function EarningsPage() {
   }, [token]);
 
   useEffect(() => { void loadLedger(); }, [loadLedger]);
+
+  useEffect(() => {
+    if (!exportJobs.some((job) => job.status === 'queued' || job.status === 'processing')) return undefined;
+    const timer = window.setInterval(() => {
+      void api.listDeveloperLedgerExports().then(setExportJobs).catch(() => undefined);
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [exportJobs]);
 
   const series = useMemo(() => serverWeeklySeries(ledger.weekly), [ledger.weekly]);
   const maxSeriesAmount = Math.max(1, ...series.map((item) => item.amount));
@@ -138,6 +155,12 @@ export function EarningsPage() {
     if (!ledger.entries.length) return;
     setExporting(true);
     try {
+      const prepared = await api.requestDeveloperLedgerExport(token);
+      if (prepared.mode === 'async') {
+        setExportJobs((current) => [prepared.job, ...current.filter((job) => job.id !== prepared.job.id)]);
+        showToast(`已创建 ${prepared.job.totalRows.toLocaleString()} 行异步导出作业。`, 'success');
+        return;
+      }
       let entries = ledger.entries;
       let cursor = ledger.pageInfo.nextCursor;
       while (cursor && entries.length < 5_000) {
@@ -155,6 +178,27 @@ export function EarningsPage() {
     }
   };
 
+  const mutateExportJob = async (job: LedgerExportJob, action: 'cancel' | 'retry' | 'download') => {
+    setExportJobBusy(`${job.id}:${action}`);
+    setError(null);
+    try {
+      if (action === 'download') {
+        const issued = await api.getDeveloperLedgerExportDownload(job.id);
+        window.location.assign(issued.url);
+        return;
+      }
+      const updated = action === 'cancel'
+        ? await api.cancelDeveloperLedgerExport(job.id)
+        : await api.retryDeveloperLedgerExport(job.id, job.attempt);
+      setExportJobs((current) => current.map((item) => item.id === updated.id ? updated : item));
+      showToast(action === 'cancel' ? '导出作业已取消。' : '导出作业已重新排队。', 'success');
+    } catch (jobError) {
+      setError(jobError instanceof Error ? jobError.message : '导出作业操作失败。');
+    } finally {
+      setExportJobBusy(null);
+    }
+  };
+
   return (
     <div className="space-y-7">
       <PageHeader
@@ -167,6 +211,17 @@ export function EarningsPage() {
       <div className="flex flex-wrap gap-2" aria-label="选择结算资产">
         {(['CREDIT', 'mUSDC', 'sETH'] as const).map((item) => <button key={item} type="button" className={item === token ? 'btn-primary' : 'btn-secondary'} onClick={() => setToken(item)}>{item}</button>)}
       </div>
+
+      {exportJobs.length ? <section className="panel p-5 md:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold">异步导出作业</h2><p className="mt-1 text-xs text-muted">超过 5,000 行时由私有导出服务处理；制品完成后保留 24 小时。</p></div><StatusBadge tone="neutral">PRIVATE EXPORT</StatusBadge></div>
+        <div className="mt-4 space-y-3">{exportJobs.slice(0, 5).map((job) => {
+          const active = job.status === 'queued' || job.status === 'processing';
+          const tone = job.status === 'completed' ? 'success' : job.status === 'failed' ? 'danger' : active ? 'warning' : 'neutral';
+          return <article className="rounded-xl border border-line bg-canvas/30 p-4" key={job.id}>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center"><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><StatusBadge tone={tone}>{job.status.toUpperCase()}</StatusBadge><span className="font-mono text-[10px] text-muted">{job.token} · {job.totalRows.toLocaleString()} 行 · attempt {job.attempt}</span></div><div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line"><span className="block h-full rounded-full bg-cyan transition-all" style={{ width: `${job.progress}%` }} /></div><p className="mt-2 text-[10px] text-muted">{job.status === 'queued' ? '等待已批准的私有导出服务领取' : job.status === 'failed' ? `${job.errorCode ?? 'EXPORT_FAILED'} · ${job.errorMessage ?? '可重试'}` : `${job.processedRows.toLocaleString()} / ${job.totalRows.toLocaleString()} · ${job.progress}%`} · <Clock3 className="inline" size={10} /> {new Date(job.expiresAt).toLocaleString('zh-CN', { hour12: false })}</p></div><div className="flex shrink-0 gap-2">{active ? <button type="button" className="btn-secondary" disabled={exportJobBusy !== null} onClick={() => void mutateExportJob(job, 'cancel')}>取消</button> : null}{job.status === 'failed' ? <button type="button" className="btn-secondary" disabled={exportJobBusy !== null} onClick={() => void mutateExportJob(job, 'retry')}><RotateCcw size={14} />重试</button> : null}{job.status === 'completed' ? <button type="button" className="btn-primary" disabled={exportJobBusy !== null} onClick={() => void mutateExportJob(job, 'download')}><Download size={14} />短期下载</button> : null}</div></div>
+          </article>;
+        })}</div>
+      </section> : null}
 
       {error ? <div className="flex flex-col gap-3 rounded-xl border border-danger/25 bg-danger/10 p-4 text-sm text-danger sm:flex-row sm:items-center sm:justify-between" role="alert"><span className="inline-flex items-center gap-2"><AlertTriangle size={16} />{error}</span><button type="button" className="btn-secondary shrink-0" onClick={() => void loadLedger()}><RefreshCw size={15} />重试</button></div> : null}
 

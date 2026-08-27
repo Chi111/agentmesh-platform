@@ -83,6 +83,9 @@ interface AppState {
   startMission: (missionId: string, depositTxHash?: string | null) => Promise<void>;
   respondStageOffer: (missionId: string, offerId: string, decision: 'accepted' | 'declined') => Promise<void>;
   dispatchMission: (missionId: string) => Promise<void>;
+  pauseMission: (missionId: string, reason: string) => Promise<void>;
+  resumeMission: (missionId: string) => Promise<void>;
+  createMissionChangeRequest: (missionId: string, input: { targetStageIds: string[]; reason: string; acceptanceCriteria: string }) => Promise<void>;
   decideGate: (missionId: string, nodeId: string, decision: 'approved' | 'rejected', feedback?: string, reworkNodeIds?: string[]) => Promise<void>;
   retryNode: (missionId: string, nodeId: string) => Promise<void>;
   submitDeliverable: (missionId: string, input: NewDeliverableInput) => Promise<void>;
@@ -93,7 +96,7 @@ interface AppState {
   toggleAgentStatus: (agentId: string) => Promise<void>;
   releasePayment: (missionId: string, releaseTxHash?: string | null) => Promise<void>;
   createDispute: (missionId: string, reason: string, freezeTxHash?: string | null) => Promise<void>;
-  startDisputeReview: (disputeId: string) => Promise<void>;
+  startDisputeReview: (disputeId: string, weightMode?: 'one_person_one_vote' | 'power') => Promise<void>;
   resolveDispute: (disputeId: string, resolution: string, status: 'resolved' | 'rejected', resolutionTxHash?: string | null) => Promise<void>;
   showToast: (message: string, tone?: ToastTone) => void;
   dismissToast: () => void;
@@ -310,6 +313,24 @@ export const useAppStore = create<AppState>((set, get) => ({
       ? `${result.agent.name} 已接收“${result.stage.name}”，本轮共派发 ${result.dispatches.length} 个节点。`
       : `本轮已处理 ${result.dispatches.length} 个派发请求。`) });
   },
+  pauseMission: async (missionId, reason) => {
+    requireApiSession();
+    const detail = await api.pauseMission(missionId, reason);
+    get().applyMissionDetail(detail);
+    set({ toast: notice(detail.mission.pauseMode === 'emergency' ? '任务已紧急暂停，新调度已阻断。' : '任务已暂停，在途终态回调仍会留痕。', 'info') });
+  },
+  resumeMission: async (missionId) => {
+    requireApiSession();
+    const detail = await api.resumeMission(missionId);
+    get().applyMissionDetail(detail);
+    set({ toast: notice('任务已恢复，调度检查点已对账。') });
+  },
+  createMissionChangeRequest: async (missionId, input) => {
+    requireApiSession();
+    const detail = await api.createMissionChangeRequest(missionId, input);
+    get().applyMissionDetail(detail);
+    set({ toast: notice(`返工 v${detail.changeRequests[0]?.version ?? ''} 已创建，旧 attempt 和输出已保留。`, 'info') });
+  },
   decideGate: async (missionId, nodeId, decision, feedback, reworkNodeIds) => {
     requireApiSession();
     await api.decideGate(missionId, nodeId, { decision, feedback, reworkNodeIds });
@@ -396,9 +417,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     });
   },
-  startDisputeReview: async (disputeId) => {
+  startDisputeReview: async (disputeId, weightMode = 'one_person_one_vote') => {
     requireApiSession();
-    const dispute = await api.startDisputeReview(disputeId);
+    const dispute = await api.startDisputeReview(disputeId, weightMode);
     set((state) => ({
       disputes: state.disputes.map((item) => item.id === disputeId ? dispute : item),
       toast: notice('仲裁提案已创建，委员会快照已写入 D1。'),

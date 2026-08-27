@@ -1,3 +1,5 @@
+import type { WorkflowCondition, WorkflowFieldMapping } from './workflowDsl';
+
 export type UserRole = 'requester' | 'developer' | 'admin';
 export type AgentStatus = 'trial' | 'active' | 'paused';
 export type AgentMarketplaceStatus = 'registered' | 'verifying' | 'trial' | 'listed' | 'degraded' | 'suspended' | 'retired';
@@ -21,7 +23,8 @@ export type AgentMetricEventType =
   | 'security_incident'
   | 'security_resolved'
   | 'admin_adjustment';
-export type MissionStatus = 'draft' | 'matching' | 'running' | 'review' | 'completed' | 'cancelled';
+export type MissionStatus = 'draft' | 'matching' | 'running' | 'paused' | 'review' | 'completed' | 'cancelled';
+export type MissionPauseMode = 'requester' | 'emergency';
 export type StageStatus = 'queued' | 'running' | 'done' | 'failed';
 export type WorkflowNodeType = 'task' | 'approval';
 export type PaymentMethod = 'web2_balance' | 'web3_musdc' | 'web3_seth';
@@ -225,6 +228,11 @@ export interface Mission {
   compiledSpec: Record<string, unknown> | null;
   workflowVersion: number;
   workflowViewport: WorkflowViewport;
+  pausedAt: string | null;
+  pausedBy: string | null;
+  pauseReason: string | null;
+  pauseMode: MissionPauseMode | null;
+  schedulerRevision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -257,8 +265,45 @@ export interface WorkflowStage {
   agentId: string | null;
   input: Record<string, unknown>;
   output: Record<string, unknown> | null;
+  attemptNo: number;
+  attemptCreatedAt: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface MissionChangeRequest {
+  id: string;
+  missionId: string;
+  version: number;
+  targetStageIds: string[];
+  resetStageIds: string[];
+  reason: string;
+  acceptanceCriteria: string;
+  requestedBy: string;
+  priorStageState: Array<{
+    stageId: string;
+    attemptNo: number;
+    status: StageStatus;
+    progress: number;
+    input: Record<string, unknown>;
+    output: Record<string, unknown> | null;
+  }>;
+  status: 'applied';
+  createdAt: string;
+}
+
+export interface WorkflowCheckpoint {
+  id: string;
+  missionId: string;
+  sequence: number;
+  kind: 'pause' | 'resume' | 'change_request' | 'reconciled';
+  workflowVersion: number;
+  schedulerRevision: number;
+  changeVersion: number;
+  schedulerState: 'clean' | 'dirty';
+  payload: Record<string, unknown>;
+  createdBy: string | null;
+  createdAt: string;
 }
 
 export interface WorkflowEdge {
@@ -266,8 +311,55 @@ export interface WorkflowEdge {
   missionId: string;
   sourceStageId: string;
   targetStageId: string;
+  condition?: WorkflowCondition | null;
+  mappings?: WorkflowFieldMapping[];
   createdAt: string;
 }
+
+export interface WorkflowTransitionCheckpoint {
+  id: string;
+  missionId: string;
+  edgeId: string;
+  sourceStageId: string;
+  targetStageId: string;
+  sourceAttemptNo: number;
+  workflowVersion: number;
+  matched: boolean;
+  mappedInput: Record<string, unknown>;
+  missingRequired: string[];
+  errorCode: string | null;
+  createdAt: string;
+}
+
+export interface WorkflowTemplate {
+  id: string;
+  ownerId: string;
+  name: string;
+  description: string;
+  currentVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkflowTemplateVersion {
+  templateId: string;
+  version: number;
+  nodes: WorkflowStage[];
+  edges: WorkflowEdge[];
+  entryIds: string[];
+  exitIds: string[];
+  contentHash: string;
+  createdAt: string;
+}
+
+export interface WorkflowTemplateDetail {
+  template: WorkflowTemplate;
+  version: WorkflowTemplateVersion;
+}
+
+export type WorkflowTemplateSaveResult =
+  | { state: 'saved' | 'unchanged'; detail: WorkflowTemplateDetail }
+  | { state: 'conflict'; detail: WorkflowTemplateDetail | null };
 
 export interface WorkflowViewport {
   x: number;
@@ -291,6 +383,7 @@ export interface Deliverable {
   id: string;
   missionId: string;
   stageId: string | null;
+  attemptNo?: number | null;
   agentId: string | null;
   name: string;
   uri: string;
@@ -374,6 +467,11 @@ export interface ArbitrationProposal {
   proposerId: string;
   status: ArbitrationProposalStatus;
   weightMode: 'one_person_one_vote' | 'power';
+  weightVersion: 'one_person_one_vote.v1' | 'member_power.v1';
+  round: 0 | 1;
+  parentProposalId: string | null;
+  appealReason: string | null;
+  appealDeadlineAt: string | null;
   votingStartsAt: string;
   votingEndsAt: string;
   quorumRequired: number;
@@ -387,6 +485,29 @@ export interface ArbitrationProposal {
   executedAt: string | null;
   executedBy: string | null;
   createdAt: string;
+}
+
+export interface DisputeGovernanceRound {
+  proposal: ArbitrationProposal;
+  electorate: ArbitrationElector[];
+  votes: DisputeVote[];
+}
+
+export type GovernanceExecutionStatus = 'queued' | 'awaiting_transaction' | 'executed' | 'cancelled';
+
+export interface GovernanceExecutionItem {
+  id: string;
+  scope: 'task_dispute' | 'ecosystem';
+  sourceId: string;
+  proposalId: string;
+  action: 'refund_requester' | 'reject_dispute';
+  payloadHash: string;
+  status: GovernanceExecutionStatus;
+  requestedBy: string;
+  requestedAt: string;
+  txHash: string | null;
+  executedBy: string | null;
+  executedAt: string | null;
 }
 
 export interface ArbitrationElector {
@@ -411,6 +532,17 @@ export interface DisputeGovernance {
   proposal: ArbitrationProposal | null;
   electorate: ArbitrationElector[];
   votes: DisputeVote[];
+  rounds: DisputeGovernanceRound[];
+  appeal: {
+    used: boolean;
+    deadlineAt: string | null;
+    canAppeal: boolean;
+    reason: string | null;
+    appellantId: string | null;
+    createdAt: string | null;
+  };
+  execution: GovernanceExecutionItem | null;
+  executionReady: boolean;
   currentUser: {
     eligible: boolean;
     canVote: boolean;
@@ -418,6 +550,14 @@ export interface DisputeGovernance {
     choice: DisputeVoteChoice | null;
   };
 }
+
+export type DisputeAppealResult =
+  | { state: 'created'; governance: DisputeGovernance }
+  | { state: 'missing' | 'not_allowed' | 'not_finalized' | 'expired' | 'already_appealed' | 'no_expanded_electorate' | 'execution_queued' };
+
+export type DisputeExecutionQueueResult =
+  | { state: 'queued' | 'replayed'; governance: DisputeGovernance }
+  | { state: 'missing' | 'not_ready' | 'escrow_not_frozen' | 'already_executed' };
 
 export type DisputeVoteMutationResult =
   | { state: 'applied'; governance: DisputeGovernance }
@@ -621,7 +761,7 @@ export interface DisputeAction {
   id: string;
   disputeId: string;
   actorId: string;
-  action: 'review_started' | 'resolved' | 'rejected';
+  action: 'review_started' | 'appeal_created' | 'execution_queued' | 'execution_executed' | 'resolved' | 'rejected';
   note: string | null;
   createdAt: string;
 }
@@ -683,6 +823,56 @@ export interface DeveloperLedger {
   };
 }
 
+export type LedgerExportStatus = 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'expired';
+
+export interface LedgerExportArtifact {
+  id: string;
+  sha256: string;
+  contentType: 'text/csv';
+  rowCount: number;
+  byteSize: number;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface LedgerExportJob {
+  id: string;
+  token: string;
+  status: LedgerExportStatus;
+  totalRows: number;
+  processedRows: number;
+  progress: number;
+  attempt: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  cancelledAt: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+  artifact: LedgerExportArtifact | null;
+}
+
+export type LedgerExportRequestResult =
+  | { mode: 'direct'; rowCount: number }
+  | { mode: 'async'; job: LedgerExportJob };
+
+export type LedgerExportMutationResult =
+  | { state: 'applied' | 'unchanged'; job: LedgerExportJob }
+  | { state: 'missing' | 'invalid_state' };
+
+export interface LedgerExportClaim {
+  job: LedgerExportJob;
+  ownerId: string;
+  exportType: 'developer_ledger';
+  snapshot: LedgerCursor;
+}
+
+export interface LedgerExportPrivateArtifact extends LedgerExportArtifact {
+  objectKey: string;
+}
+
 export interface CandidateMatch {
   stageId: string;
   stageName: string;
@@ -702,7 +892,20 @@ export interface MissionDetail {
   deliverables: Deliverable[];
   escrow: Escrow | null;
   disputes: Dispute[];
+  changeRequests: MissionChangeRequest[];
+  checkpoints: WorkflowCheckpoint[];
+  transitions: WorkflowTransitionCheckpoint[];
 }
+
+export type MissionControlResult =
+  | { state: 'applied'; mission: Mission; schedulerRevision: number }
+  | { state: 'unchanged'; mission: Mission }
+  | { state: 'invalid'; mission: Mission | null };
+
+export type MissionChangeRequestResult =
+  | { state: 'applied'; mission: Mission; changeRequest: MissionChangeRequest; schedulerRevision: number }
+  | { state: 'blocked_running_stage'; mission: Mission }
+  | { state: 'invalid'; mission: Mission | null };
 
 export interface IdempotentResult {
   status: number;
@@ -820,21 +1023,69 @@ export interface PlatformStore {
     requesterWalletAddress?: string | null,
   ): Promise<MissionStartResult | null>;
   submitMissionForReview(id: string, reviewDueAt: string): Promise<Mission | null>;
+  pauseMission(id: string, actorId: string, mode: MissionPauseMode, reason: string, pausedAt: string): Promise<MissionControlResult>;
+  resumeMission(
+    id: string,
+    actorId: string,
+    expectedMode: MissionPauseMode,
+    expectedSchedulerRevision: number,
+    resumedAt: string,
+  ): Promise<MissionControlResult>;
+  applyMissionChangeRequest(input: {
+    id: string;
+    missionId: string;
+    targetStageIds: string[];
+    resetStageIds: string[];
+    reason: string;
+    acceptanceCriteria: string;
+    requestedBy: string;
+    createdAt: string;
+    expectedRunningStageIds?: string[];
+  }): Promise<MissionChangeRequestResult>;
+  listMissionChangeRequests(missionId: string): Promise<MissionChangeRequest[]>;
+  listWorkflowCheckpoints(missionId: string, limit?: number): Promise<WorkflowCheckpoint[]>;
+  listDirtyMissionControls(limit?: number): Promise<Array<{ missionId: string; schedulerRevision: number }>>;
+  markMissionCheckpointClean(missionId: string, schedulerRevision: number, actorId: string | null, reconciledAt: string): Promise<boolean>;
   acceptMission(id: string, actorId: string, releaseTxHash: string | null): Promise<AcceptanceResult | null>;
   listStages(missionId: string): Promise<WorkflowStage[]>;
   listEdges(missionId: string): Promise<WorkflowEdge[]>;
+  recordWorkflowTransition(checkpoint: WorkflowTransitionCheckpoint): Promise<{ applied: boolean; checkpoint: WorkflowTransitionCheckpoint }>;
+  listWorkflowTransitions(missionId: string, limit?: number): Promise<WorkflowTransitionCheckpoint[]>;
+  listCurrentWorkflowTransitions(missionId: string): Promise<WorkflowTransitionCheckpoint[]>;
+  saveWorkflowTemplateVersion(input: {
+    id: string;
+    ownerId: string;
+    name: string;
+    description: string;
+    nodes: WorkflowStage[];
+    edges: WorkflowEdge[];
+    entryIds: string[];
+    exitIds: string[];
+    contentHash: string;
+    createdAt: string;
+  }): Promise<WorkflowTemplateSaveResult>;
+  listWorkflowTemplates(ownerId: string): Promise<WorkflowTemplateDetail[]>;
+  getWorkflowTemplate(ownerId: string, templateId: string, version?: number): Promise<WorkflowTemplateDetail | null>;
   listStageOffers(missionId: string, now?: string): Promise<StageOffer[]>;
   getStageOffer(id: string, now?: string): Promise<StageOffer | null>;
   respondStageOffer(id: string, ownerId: string, decision: 'accepted' | 'declined', respondedAt: string): Promise<StageOffer | null>;
   claimStageForDispatch(missionId: string, stageId: string): Promise<WorkflowStage | null>;
   resetStageDispatch(missionId: string, stageId: string): Promise<void>;
   updateStage(missionId: string, stageId: string, status: StageStatus, output?: Record<string, unknown> | null): Promise<WorkflowStage | null>;
+  transitionStage(
+    missionId: string,
+    stageId: string,
+    expectedStatus: StageStatus,
+    status: StageStatus,
+    output?: Record<string, unknown> | null,
+  ): Promise<WorkflowStage | null>;
   transitionRunningStage(missionId: string, stageId: string, status: Exclude<StageStatus, 'queued'>, output?: Record<string, unknown> | null): Promise<WorkflowStage | null>;
   setStageProgress(missionId: string, stageId: string, progress: number): Promise<WorkflowStage | null>;
   resetWorkflowNodes(missionId: string, stageIds: string[], gateId?: string): Promise<void>;
   updateMissionWorkflowState(missionId: string, progress: number, currentStage: string): Promise<Mission | null>;
 
   enqueueDispatches(missionId: string, stageIds: string[], now: string): Promise<DispatchOutboxItem[]>;
+  recoverExpiredStageDispatches(missionId: string, now: string): Promise<string[]>;
   listPendingDispatches(limit: number, now: string): Promise<DispatchOutboxItem[]>;
   claimDispatch(id: string, now: string): Promise<boolean>;
   completeDispatch(id: string, status: 'done' | 'pending', now: string, nextAttemptAt?: string): Promise<void>;
@@ -850,16 +1101,27 @@ export interface PlatformStore {
   listDisputes(user: UserContext): Promise<Dispute[]>;
   getDisputes(missionId: string): Promise<Dispute[]>;
   createDispute(dispute: Dispute): Promise<Dispute>;
-  startDisputeReview(id: string, actorId: string, startedAt?: string): Promise<Dispute | null>;
+  startDisputeReview(id: string, actorId: string, startedAt?: string, weightMode?: ArbitrationProposal['weightMode']): Promise<Dispute | null>;
   getDisputeGovernance(id: string, userId: string, now?: string): Promise<DisputeGovernance | null>;
   castDisputeVote(id: string, voterId: string, choice: DisputeVoteChoice, reason: string, votedAt: string): Promise<DisputeVoteMutationResult>;
   finalizeDisputeProposal(id: string, actorId: string, finalizedAt: string): Promise<DisputeFinalizeResult>;
+  createDisputeAppeal(id: string, appellantId: string, reason: string, createdAt: string): Promise<DisputeAppealResult>;
+  queueDisputeExecution(id: string, actorId: string, queuedAt: string, web3: boolean): Promise<DisputeExecutionQueueResult>;
   resolveDispute(id: string, resolution: string, status: 'resolved' | 'rejected', actorId: string, resolutionTxHash: string | null): Promise<DisputeResolutionResult | null>;
   listDisputeActions(disputeId: string): Promise<DisputeAction[]>;
 
   createAgentDispatch(dispatch: AgentDispatch): Promise<void>;
   applyAgentCallback(update: AgentCallbackUpdate): Promise<AgentCallbackApplyResult>;
-  claimAgentCallback(runId: string, callbackId: string, now: string): Promise<'accepted' | 'duplicate' | 'expired' | 'missing'>;
+  claimAgentCallback(input: {
+    runId: string;
+    callbackId: string;
+    missionId: string;
+    stageId: string;
+    agentId: string;
+    expiresAt: string;
+    now: string;
+    status: StageStatus;
+  }): Promise<'accepted' | 'duplicate' | 'expired' | 'missing' | 'invalid'>;
   completeAgentDispatch(runId: string, now: string): Promise<void>;
 
   listNotifications(userId: string): Promise<Notification[]>;
@@ -870,12 +1132,31 @@ export interface PlatformStore {
 
   listAdminUsers(limit: number): Promise<AdminUser[]>;
   listArbitrationMembers(): Promise<ArbitrationMember[]>;
-  setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string): Promise<ArbitrationMember | null>;
+  setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string, power?: number): Promise<ArbitrationMember | null>;
   countProfilesByRole(role: UserRole): Promise<number>;
   updateAdminUserRole(targetId: string, role: UserRole, actorId: string, createdAt: string): Promise<{ profile: AdminUser; action: AdminAction | null } | null>;
   listAdminActions(limit: number): Promise<AdminAction[]>;
   getDeveloperSummary(ownerId: string): Promise<{ jobs: number; activeAgents: number; volume: number; pending: number }>;
   getDeveloperLedger(ownerId: string, limit: number, cursor: LedgerCursor | null, token: string): Promise<DeveloperLedger>;
+  requestDeveloperLedgerExport(ownerId: string, token: string, requestedAt: string): Promise<LedgerExportRequestResult>;
+  listDeveloperLedgerExports(ownerId: string, now: string): Promise<LedgerExportJob[]>;
+  getDeveloperLedgerExport(ownerId: string, id: string, now: string): Promise<LedgerExportJob | null>;
+  cancelDeveloperLedgerExport(ownerId: string, id: string, cancelledAt: string): Promise<LedgerExportMutationResult>;
+  retryDeveloperLedgerExport(ownerId: string, id: string, retriedAt: string): Promise<LedgerExportMutationResult>;
+  claimDeveloperLedgerExport(workerId: string, claimedAt: string): Promise<LedgerExportClaim | null>;
+  updateDeveloperLedgerExportProgress(id: string, workerId: string, attempt: number, processedRows: number, updatedAt: string): Promise<LedgerExportJob | null>;
+  completeDeveloperLedgerExport(input: {
+    id: string;
+    workerId: string;
+    attempt: number;
+    objectKey: string;
+    sha256: string;
+    rowCount: number;
+    byteSize: number;
+    completedAt: string;
+  }): Promise<LedgerExportJob | null>;
+  failDeveloperLedgerExport(id: string, workerId: string, attempt: number, errorCode: string, errorMessage: string, failedAt: string): Promise<LedgerExportJob | null>;
+  getDeveloperLedgerExportArtifact(ownerId: string, id: string, now: string): Promise<LedgerExportPrivateArtifact | null>;
 
   recordRewardActivity(activity: RewardActivity): Promise<boolean>;
   createRewardEpoch(epoch: RewardEpoch): Promise<RewardEpoch>;

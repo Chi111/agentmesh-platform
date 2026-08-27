@@ -26,6 +26,11 @@ const mission: Mission = {
   compiledSpec: null,
   workflowVersion: 1,
   workflowViewport: { x: 0, y: 0, zoom: 1 },
+  pausedAt: null,
+  pausedBy: null,
+  pauseReason: null,
+  pauseMode: null,
+  schedulerRevision: 0,
   createdAt: now,
   updatedAt: now,
 };
@@ -43,6 +48,8 @@ function stage(input: Partial<WorkflowStage> & Pick<WorkflowStage, 'id' | 'posit
     agentId: 'AGENT-engineering',
     input: { executionMode: 'implement' },
     output: null,
+    attemptNo: 1,
+    attemptCreatedAt: now,
     createdAt: now,
     updatedAt: now,
     ...input,
@@ -111,5 +118,63 @@ describe('workflow layout validation', () => {
     const laidOut = layoutWorkflowStages(stages, edges);
     expect(hasWorkflowStageOverlap(laidOut)).toBe(false);
     expect(validateWorkflowGraph({ mission, stages: laidOut, edges })).toHaveLength(2);
+  });
+
+  it('accepts mapped task input and only terminal conditional approval Gates', () => {
+    const source = stage({ id: 'STAGE-source', position: 1, budget: 100, status: 'queued' });
+    const target = stage({ id: 'STAGE-target', position: 2, budget: 200, status: 'queued' });
+    const gate: WorkflowStage = {
+      ...stage({ id: 'STAGE-risk-gate', position: 3, budget: 0, status: 'queued' }),
+      nodeType: 'approval', agentId: null, category: '人工审批',
+      input: { approvalCriteria: '高风险输出需要人工批准。' },
+    };
+    const edges: WorkflowEdge[] = [
+      {
+        id: 'EDGE-mapped', missionId, sourceStageId: source.id, targetStageId: target.id,
+        mappings: [{ from: '/result/id', to: '/request/sourceId', required: true }], createdAt: now,
+      },
+      {
+        id: 'EDGE-condition', missionId, sourceStageId: target.id, targetStageId: gate.id,
+        condition: { op: 'eq', path: '/risk', value: 'high' }, createdAt: now,
+      },
+    ];
+    expect(validateWorkflowGraph({ mission, stages: [source, target, gate], edges })).toHaveLength(3);
+
+    expect(() => validateWorkflowGraph({
+      mission,
+      stages: [source, target, gate],
+      edges: [
+        { ...edges[0], condition: { op: 'exists', path: '/result' }, mappings: [] },
+        edges[1],
+      ],
+    })).toThrow('Conditional edges may only target terminal approval Gates');
+    expect(() => validateWorkflowGraph({
+      mission,
+      stages: [source, target, gate],
+      edges: [
+        edges[0],
+        edges[1],
+        { id: 'EDGE-gate-downstream', missionId, sourceStageId: gate.id, targetStageId: target.id, createdAt: now },
+      ],
+    })).toThrow();
+  });
+
+  it('rejects ancestor and descendant mapping targets across incoming edges', () => {
+    const left = stage({ id: 'STAGE-left', position: 1, budget: 100, status: 'queued' });
+    const right = stage({ id: 'STAGE-right', position: 2, budget: 100, status: 'queued' });
+    const target = stage({ id: 'STAGE-merge', position: 3, budget: 100, status: 'queued' });
+    const edges: WorkflowEdge[] = [
+      {
+        id: 'EDGE-left-merge', missionId, sourceStageId: left.id, targetStageId: target.id,
+        mappings: [{ from: '/result', to: '/request', required: true }], createdAt: now,
+      },
+      {
+        id: 'EDGE-right-merge', missionId, sourceStageId: right.id, targetStageId: target.id,
+        mappings: [{ from: '/id', to: '/request/id', required: true }], createdAt: now,
+      },
+    ];
+
+    expect(() => validateWorkflowGraph({ mission, stages: [left, right, target], edges }))
+      .toThrow('overlapping mappedInput pointers');
   });
 });

@@ -1,19 +1,19 @@
 {
   "version": 1,
-  "status": "completed",
+  "status": "waiting-approval",
   "route": "dynamic",
-  "reason": "Agent market quality spans append-only metrics, deterministic scoring, endpoint trials, settlement and dispute events, feedback authorization, matching eligibility and public/admin UI.",
-  "activeCommand": null,
-  "currentStage": "completed",
-  "currentFeature": "specs/006-agent-market-quality",
-  "currentTaskId": "T9",
+  "reason": "MeshPin branding and PinMe IPFS evidence cross public token naming, shared deliverable contracts, additive D1 schema, untrusted manifest validation, privacy, acceptance snapshots and dispute evidence. The user explicitly requires plan approval before implementation.",
+  "activeCommand": "/chill-ai start specs/008-meshpin-ipfs-evidence",
+  "currentStage": "approval",
+  "currentFeature": "specs/008-meshpin-ipfs-evidence",
+  "currentTaskId": "T1",
   "lastSafeCheckpoint": {
-    "stage": "qa",
-    "completedAt": "2026-08-23T17:32:00+08:00",
-    "summary": "Agent quality Phase 1–5 implemented and reviewed: Trial v3, append-only metrics, deterministic scoring, unified shadow/enforce gate, structured feedback and admin risk operations. Backend 101/101, browser 20/20 and production builds passed."
+    "stage": "specs",
+    "completedAt": "2026-08-27T19:58:59+08:00",
+    "summary": "Created requirements, design and 12-task plan for backward-compatible MeshPin/MPIN branding plus CLI-assisted PinMe IPFS deliverable version evidence. No business code, migration, contract, cloud resource or deployment mutation was performed."
   },
-  "nextSafeCommand": "/chill-ai deploy specs/006-agent-market-quality after PinMe/DS Trial v3 endpoints are ready",
-  "blockedGateId": null,
+  "nextSafeCommand": "/chill-ai approve meshpin-ipfs-evidence-004 option 1",
+  "blockedGateId": "meshpin-ipfs-evidence-004",
   "autoRun": false,
-  "updatedAt": "2026-08-23T17:32:00+08:00"
+  "updatedAt": "2026-08-27T19:58:59+08:00"
 }

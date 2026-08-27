@@ -37,10 +37,16 @@ test('public contract showcase remains useful without authentication or RPC avai
 });
 
 test('private workspace routes require authentication instead of local fallback data', async ({ page }) => {
-  for (const route of ['/dashboard', '/missions/new', '/developer', '/arbitration', '/settings', '/wallet/test-funds']) {
+  await page.goto('/#/dashboard');
+  await expect(page.getByRole('heading', { name: '让复杂任务完成，让真实贡献沉淀。' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '登录进入工作台' })).toBeVisible();
+  await expect(page.getByText('本地演示数据')).toHaveCount(0);
+
+  for (const route of ['/missions/new', '/developer', '/arbitration', '/settings', '/wallet/test-funds']) {
     await page.goto(`/#${route}`);
     await expect(page.getByRole('heading', { name: '登录后进入正式工作区' })).toBeVisible();
-    await expect(page.getByText('本地演示数据')).toBeVisible();
+    await expect(page.getByText('任务、Agent、交付证据和结算只通过已认证的 Worker 与 D1 流程处理。')).toBeVisible();
+    await expect(page.getByText('本地演示数据')).toHaveCount(0);
   }
 
   await page.getByRole('button', { name: '登录 AgentMesh' }).click();
@@ -68,7 +74,8 @@ test('mobile navigation remains accessible with the authentication gate', async 
   await expect(page.locator('#app-sidebar')).not.toHaveAttribute('aria-hidden', 'true');
   await page.keyboard.press('Escape');
   await expect(menuButton).toHaveAttribute('aria-expanded', 'false');
-  await expect(page.getByRole('heading', { name: '登录后进入正式工作区' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '让复杂任务完成，让真实贡献沉淀。' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '登录进入工作台' })).toBeVisible();
 });
 
 test('public API failure never restores showcase records', async ({ page }) => {
@@ -81,6 +88,52 @@ test('public API failure never restores showcase records', async ({ page }) => {
   await page.goto('/#/agents');
   await expect(page.getByText('0 AGENTS AVAILABLE')).toBeVisible();
   await expect(page.getByRole('link', { name: /ScriptSmith|VisionBoard|MotionCraft/ })).toHaveCount(0);
+});
+
+test('large developer ledgers switch from browser CSV to a private async export job', async ({ page }) => {
+  await page.addInitScript(() => window.sessionStorage.setItem('agentmesh:e2e-auth', 'true'));
+  const profile = { id: 'export-developer', email: 'export@example.test', displayName: 'Export Developer', role: 'developer' };
+  const ledger = {
+    token: 'CREDIT',
+    entries: [{
+      id: 'ledger-visible-1', missionId: 'TASK-EXPORT', missionTitle: 'Visible ledger row', agentId: 'agent-export',
+      agentName: 'Export Agent', entryType: 'agent_payout', amount: 12, token: 'CREDIT', status: 'settled',
+      txHash: null, createdAt: '2026-08-27T00:00:00.000Z',
+    }],
+    totals: { settled: 12, pending: 0, failed: 0 }, weekly: [],
+    pageInfo: { hasMore: true, nextCursor: 'opaque-next-page' },
+  };
+  const job = {
+    id: 'EXPORT-E2E-1', token: 'CREDIT', status: 'queued', totalRows: 5_001, processedRows: 0, progress: 0,
+    attempt: 1, errorCode: null, errorMessage: null, startedAt: null, completedAt: null, cancelledAt: null,
+    expiresAt: '2026-09-03T00:00:00.000Z', createdAt: '2026-08-27T00:00:00.000Z',
+    updatedAt: '2026-08-27T00:00:00.000Z', artifact: null,
+  };
+  await page.route('**/api/bootstrap', (route) => route.fulfill({ json: { data: {
+    profile, missions: [], agents: [], notifications: [], developer: { jobs: 1, activeAgents: 1, volume: 12, pending: 0 },
+  } } }));
+  await page.route('**/api/developer/ledger?**', (route) => route.fulfill({ json: { data: ledger } }));
+  await page.route('**/api/developer/ledger/export-jobs', (route) => route.fulfill({
+    status: route.request().method() === 'POST' ? 202 : 200,
+    json: { data: route.request().method() === 'POST' ? { mode: 'async', job } : [] },
+  }));
+
+  await page.goto('/#/agents');
+  await page.evaluate(async (nextProfile) => {
+    const [{ setApiTokenProvider }, { useAppStore }] = await Promise.all([
+      import('/src/services/api.ts'),
+      import('/src/store/useAppStore.ts'),
+    ]);
+    setApiTokenProvider(async () => 'test-export-token');
+    useAppStore.setState({ profile: nextProfile, role: 'developer', developerSummary: { jobs: 1, activeAgents: 1, volume: 12, pending: 0 } });
+  }, profile);
+  await page.evaluate(() => { window.location.hash = '/developer/earnings'; });
+  await expect(page.getByRole('heading', { name: '收益中心' })).toBeVisible();
+  await page.getByRole('button', { name: '导出 CSV' }).click();
+  await expect(page.getByRole('heading', { name: '异步导出作业' })).toBeVisible();
+  await expect(page.getByText('5,001 行 · attempt 1')).toBeVisible();
+  await expect(page.getByText('等待已批准的私有导出服务领取')).toBeVisible();
+  await expect(page.getByRole('button', { name: '取消' })).toBeVisible();
 });
 
 test('public Agent directory remains available when private workspace hydration fails', async ({ page }) => {
@@ -248,6 +301,7 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
   };
   const proposal = {
     id: 'PROP-DAO-E2E', disputeId: dispute.id, proposerId: profile.id, status: 'active', weightMode: 'one_person_one_vote',
+    weightVersion: 'one_person_one_vote.v1', round: 0, parentProposalId: null, appealReason: null, appealDeadlineAt: null,
     votingStartsAt: '2026-08-23T00:00:00.000Z', votingEndsAt: '2026-08-26T00:00:00.000Z', quorumRequired: 1, eligibleWeight: 1,
     supportVotes: 0, opposeVotes: 0, abstainVotes: 0, outcome: null, finalizedAt: null, finalizedBy: null, executedAt: null, executedBy: null,
     createdAt: '2026-08-23T00:00:00.000Z',
@@ -256,6 +310,10 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
     proposal,
     electorate: [{ userId: profile.id, displayName: profile.displayName, powerSnapshot: 1, voteWeight: 1 }],
     votes: [] as Array<Record<string, unknown>>,
+    rounds: [{ proposal, electorate: [{ userId: profile.id, displayName: profile.displayName, powerSnapshot: 1, voteWeight: 1 }], votes: [] as Array<Record<string, unknown>> }],
+    appeal: { used: false, deadlineAt: null, canAppeal: false, reason: null, appellantId: null, createdAt: null },
+    execution: null as Record<string, unknown> | null,
+    executionReady: false,
     currentUser: { eligible: true, canVote: true, hasVoted: false, choice: null as string | null },
   };
   const token = [
@@ -286,6 +344,10 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
         proposal: { ...proposal, status: 'succeeded', supportVotes: 1, outcome: 'refund_requester', finalizedAt: '2026-08-23T00:05:00.000Z', finalizedBy: profile.id },
         electorate: governance.electorate,
         votes: [{ id: 'VOTE-DAO-E2E', proposalId: proposal.id, voterId: profile.id, voterDisplayName: profile.displayName, choice: input.choice, reason: input.reason, voteWeight: 1, createdAt: '2026-08-23T00:05:00.000Z' }],
+        rounds: governance.rounds,
+        appeal: governance.appeal,
+        execution: null,
+        executionReady: true,
         currentUser: { eligible: true, canVote: false, hasVoted: true, choice: input.choice },
       };
       return fulfill(governance, 201);
@@ -302,10 +364,13 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
 
   await expect(page.getByRole('heading', { name: '仲裁治理' })).toBeVisible();
   await expect(page.getByText('1 MEMBER = 1 VOTE')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '一次上诉' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '不可变轮次历史' })).toBeVisible();
+  await expect(page.getByText('one_person_one_vote.v1').first()).toBeVisible();
   await page.getByLabel('投票理由').fill('依据任务规格和交付证据，支持争议方退款并终止任务。');
   await page.getByRole('button', { name: /确认投票/ }).click();
   await expect(page.getByText('退款提案通过').first()).toBeVisible();
-  await expect(page.getByRole('button', { name: '执行已通过的裁决' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '入队并执行最终裁决' })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
 });
 

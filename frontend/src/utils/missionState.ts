@@ -23,6 +23,7 @@ export function missionStatusMeta(mission: Pick<MissionSummary, 'status' | 'team
   const statusMeta = {
     draft: { label: '草稿', tone: 'neutral' as const },
     running: { label: '执行中', tone: 'info' as const },
+    paused: { label: '已暂停', tone: 'warning' as const },
     review: { label: '待验收', tone: 'warning' as const },
     completed: { label: '已完成', tone: 'success' as const },
     cancelled: { label: '已退款终止', tone: 'neutral' as const },

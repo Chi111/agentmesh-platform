@@ -28,7 +28,7 @@ export interface AdminAction {
 
 export type SyncStatus = 'idle' | 'loading' | 'ready' | 'error';
 
-export type MissionStatus = 'draft' | 'matching' | 'running' | 'review' | 'completed' | 'cancelled';
+export type MissionStatus = 'draft' | 'matching' | 'running' | 'paused' | 'review' | 'completed' | 'cancelled';
 
 export type AgentStatus = 'trial' | 'active' | 'paused';
 export type AgentMarketplaceStatus = 'registered' | 'verifying' | 'trial' | 'listed' | 'degraded' | 'suspended' | 'retired';
@@ -143,6 +143,7 @@ export interface AdminAgentQualityRow {
 
 export interface Mission {
   id: string;
+  requesterId: string;
   title: string;
   description: string;
   category: string;
@@ -161,6 +162,11 @@ export interface Mission {
   reviewDueAt: string | null;
   workflowVersion: number;
   workflowViewport: WorkflowViewport;
+  pausedAt: string | null;
+  pausedBy: string | null;
+  pauseReason: string | null;
+  pauseMode: 'requester' | 'emergency' | null;
+  schedulerRevision: number;
 }
 
 export interface WorkflowViewport {
@@ -185,6 +191,43 @@ export interface WorkflowStage {
   progress: number;
   input?: Record<string, unknown>;
   output?: Record<string, unknown> | null;
+  attemptNo: number;
+  attemptCreatedAt?: string;
+}
+
+export interface MissionChangeRequest {
+  id: string;
+  missionId: string;
+  version: number;
+  targetStageIds: string[];
+  resetStageIds: string[];
+  reason: string;
+  acceptanceCriteria: string;
+  requestedBy: string;
+  priorStageState: Array<{
+    stageId: string;
+    attemptNo: number;
+    status: WorkflowStage['status'];
+    progress: number;
+    input: Record<string, unknown>;
+    output: Record<string, unknown> | null;
+  }>;
+  status: 'applied';
+  createdAt: string;
+}
+
+export interface WorkflowCheckpoint {
+  id: string;
+  missionId: string;
+  sequence: number;
+  kind: 'pause' | 'resume' | 'change_request' | 'reconciled';
+  workflowVersion: number;
+  schedulerRevision: number;
+  changeVersion: number;
+  schedulerState: 'clean' | 'dirty';
+  payload: Record<string, unknown>;
+  createdBy: string | null;
+  createdAt: string;
 }
 
 export interface WorkflowEdge {
@@ -192,7 +235,63 @@ export interface WorkflowEdge {
   missionId: string;
   sourceStageId: string;
   targetStageId: string;
+  condition?: WorkflowCondition | null;
+  mappings?: WorkflowFieldMapping[];
   createdAt?: string;
+}
+
+export type WorkflowCondition =
+  | { op: 'exists'; path: string }
+  | { op: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'; path: string; value: string | number | boolean | null }
+  | { op: 'in'; path: string; value: Array<string | number | boolean | null> }
+  | { op: 'and' | 'or'; conditions: WorkflowCondition[] }
+  | { op: 'not'; condition: WorkflowCondition };
+
+export interface WorkflowFieldMapping {
+  from: string;
+  to: string;
+  required?: boolean;
+}
+
+export interface WorkflowTransitionCheckpoint {
+  id: string;
+  missionId: string;
+  edgeId: string;
+  sourceStageId: string;
+  targetStageId: string;
+  sourceAttemptNo: number;
+  workflowVersion: number;
+  matched: boolean;
+  mappedInput: Record<string, unknown>;
+  missingRequired: string[];
+  errorCode: string | null;
+  createdAt: string;
+}
+
+export interface WorkflowTemplate {
+  id: string;
+  ownerId: string;
+  name: string;
+  description: string;
+  currentVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkflowTemplateVersion {
+  templateId: string;
+  version: number;
+  nodes: WorkflowStage[];
+  edges: WorkflowEdge[];
+  entryIds: string[];
+  exitIds: string[];
+  contentHash: string;
+  createdAt: string;
+}
+
+export interface WorkflowTemplateDetail {
+  template: WorkflowTemplate;
+  version: WorkflowTemplateVersion;
 }
 
 export interface StageOffer {
@@ -229,6 +328,7 @@ export interface Deliverable {
   id: string;
   missionId?: string;
   stageId?: string | null;
+  attemptNo?: number | null;
   agentId?: string | null;
   name: string;
   uri: string;
@@ -289,6 +389,11 @@ export interface ArbitrationProposal {
   proposerId: string;
   status: ArbitrationProposalStatus;
   weightMode: 'one_person_one_vote' | 'power';
+  weightVersion: 'one_person_one_vote.v1' | 'member_power.v1';
+  round: 0 | 1;
+  parentProposalId: string | null;
+  appealReason: string | null;
+  appealDeadlineAt: string | null;
   votingStartsAt: string;
   votingEndsAt: string;
   quorumRequired: number;
@@ -302,6 +407,27 @@ export interface ArbitrationProposal {
   executedAt: string | null;
   executedBy: string | null;
   createdAt: string;
+}
+
+export interface DisputeGovernanceRound {
+  proposal: ArbitrationProposal;
+  electorate: ArbitrationElector[];
+  votes: DisputeVote[];
+}
+
+export interface GovernanceExecutionItem {
+  id: string;
+  scope: 'task_dispute' | 'ecosystem';
+  sourceId: string;
+  proposalId: string;
+  action: 'refund_requester' | 'reject_dispute';
+  payloadHash: string;
+  status: 'queued' | 'awaiting_transaction' | 'executed' | 'cancelled';
+  requestedBy: string;
+  requestedAt: string;
+  txHash: string | null;
+  executedBy: string | null;
+  executedAt: string | null;
 }
 
 export interface ArbitrationElector {
@@ -326,6 +452,17 @@ export interface DisputeGovernance {
   proposal: ArbitrationProposal | null;
   electorate: ArbitrationElector[];
   votes: DisputeVote[];
+  rounds: DisputeGovernanceRound[];
+  appeal: {
+    used: boolean;
+    deadlineAt: string | null;
+    canAppeal: boolean;
+    reason: string | null;
+    appellantId: string | null;
+    createdAt: string | null;
+  };
+  execution: GovernanceExecutionItem | null;
+  executionReady: boolean;
   currentUser: {
     eligible: boolean;
     canVote: boolean;
@@ -338,7 +475,7 @@ export interface DisputeAction {
   id: string;
   disputeId: string;
   actorId: string;
-  action: 'review_started' | 'resolved' | 'rejected';
+  action: 'review_started' | 'appeal_created' | 'execution_queued' | 'execution_executed' | 'resolved' | 'rejected';
   note: string | null;
   createdAt: string;
 }
@@ -362,6 +499,9 @@ export interface MissionDetail {
   deliverables: Deliverable[];
   escrow: Escrow | null;
   disputes: Dispute[];
+  changeRequests: MissionChangeRequest[];
+  checkpoints: WorkflowCheckpoint[];
+  transitions: WorkflowTransitionCheckpoint[];
 }
 
 export interface NewDeliverableInput {
@@ -409,6 +549,39 @@ export interface DeveloperLedger {
     nextCursor: string | null;
   };
 }
+
+export type LedgerExportStatus = 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'expired';
+
+export interface LedgerExportJob {
+  id: string;
+  token: string;
+  status: LedgerExportStatus;
+  totalRows: number;
+  processedRows: number;
+  progress: number;
+  attempt: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  cancelledAt: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+  artifact: {
+    id: string;
+    sha256: string;
+    contentType: 'text/csv';
+    rowCount: number;
+    byteSize: number;
+    createdAt: string;
+    expiresAt: string;
+  } | null;
+}
+
+export type LedgerExportRequestResult =
+  | { mode: 'direct'; rowCount: number }
+  | { mode: 'async'; job: LedgerExportJob };
 
 export interface NewMissionInput {
   title: string;

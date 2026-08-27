@@ -1,4 +1,116 @@
 {
   "version": 1,
-  "blocked": []
+  "blocked": [
+    {
+      "id": "platform-completion-001",
+      "status": "approved",
+      "feature": "specs/007-platform-completion",
+      "agent": "planner",
+      "requestedAction": "Choose the implementation order and risk boundary for the remaining platform roadmap.",
+      "riskReason": "The request combines ordinary product features with payment economics, smart-contract authority, external cloud services, real-yield strategies, cross-chain supply and production deployment. Those choices materially change architecture and user funds.",
+      "recommendedOption": 1,
+      "options": [
+        {
+          "id": 1,
+          "label": "安全分阶段完成",
+          "description": "先完成无真实资金扩张的 Wave A，再分别审批基础设施、Escrow v2、Vault/跨链和部署；目标仍是全部完成，但每个资金边界独立验收。"
+        },
+        {
+          "id": 2,
+          "label": "资金协议优先",
+          "description": "先冻结保证金/罚没/补偿规则并开发 Escrow v2，产品工作流能力延后；需要立即补充经济参数和审计计划。"
+        },
+        {
+          "id": 3,
+          "label": "仅完善非资金产品",
+          "description": "完成任务控制、工作流、仲裁、导出、检索和 Runtime，继续排除真实 DeFi、跨链和主网资金。"
+        }
+      ],
+      "safeAlternative": "Keep the existing audited MVP behavior and implement no payment or cloud mutation until a rollout option is approved.",
+      "resumeCommand": "/chill-ai approve platform-completion-001 option 1",
+      "createdAt": "2026-08-26T17:36:20+08:00",
+      "selectedOption": 1,
+      "approvedAt": "2026-08-26T17:39:00+08:00"
+    },
+    {
+      "id": "platform-infrastructure-002",
+      "status": "pending",
+      "feature": "specs/007-platform-completion",
+      "agent": "planner",
+      "requestedAction": "Choose and authorize the non-funds infrastructure boundary for private exports, semantic retrieval and isolated Agent runtime.",
+      "riskReason": "T7/T8 and the T6 data plane require paid external resources, service credentials, retention/region choices and deployment-capable runtime bindings. Creating or configuring them is outside the approved Wave A code-only boundary.",
+      "recommendedOption": 1,
+      "options": [
+        {
+          "id": 1,
+          "label": "Cloudflare 原生 Wave B",
+          "description": "批准以现有 Workers/D1 架构为基线设计并创建开发环境 R2、Vectorize 和 Containers 资源，完成私有导出数据面、语义检索和隔离 Runtime；资金合约与生产发布仍不授权。"
+        },
+        {
+          "id": 2,
+          "label": "检索导出先行",
+          "description": "先批准 R2 与 Vectorize，完成私有导出数据面和 T7；Containers 隔离 Runtime 在 T8 前再次单独审批。"
+        },
+        {
+          "id": 3,
+          "label": "仅本地适配层",
+          "description": "只继续 provider-neutral 接口、模拟器和测试，不创建外部资源；T6 数据面与 T7/T8 不能视为完整交付。"
+        }
+      ],
+      "safeAlternative": "Keep the reviewed Wave A control planes fail-closed and create no external storage, vector index, container runtime or service credential.",
+      "resumeCommand": "/chill-ai approve platform-infrastructure-002 option 1",
+      "createdAt": "2026-08-27T18:46:30+08:00"
+    },
+    {
+      "id": "platform-wave-a-preview-003",
+      "status": "approved",
+      "feature": "specs/007-platform-completion",
+      "agent": "deploy",
+      "requestedAction": "Deploy the currently reviewed Wave A frontend, Worker and additive D1 migrations to the existing PinMe project for user preview.",
+      "riskReason": "pinme save mutates the existing hosted frontend, Worker and D1 schema; production data must remain compatible and rollback must retain the previous frontend CID.",
+      "recommendedOption": 1,
+      "options": [
+        {
+          "id": 1,
+          "label": "部署 Wave A 预览",
+          "description": "更新现有 PinMe 项目的前端、Worker 与增量 D1 迁移；不创建 R2、Vectorize、Containers，不部署合约。"
+        }
+      ],
+      "safeAlternative": "Keep the existing deployment at frontend CID bafybeicutpgs5dnaf2kibjwakn4tzun6u4zcnqxtica26xlhhlh6w4kosq and make no hosted changes.",
+      "resumeCommand": "/chill-ai deploy preview",
+      "createdAt": "2026-08-27T18:53:51+08:00",
+      "selectedOption": 1,
+      "approvedAt": "2026-08-27T18:53:51+08:00",
+      "approvalSource": "User requested: 先部署一版 我看看效果"
+    },
+    {
+      "id": "meshpin-ipfs-evidence-004",
+      "status": "pending",
+      "feature": "specs/008-meshpin-ipfs-evidence",
+      "agent": "planner",
+      "requestedAction": "Approve the product name and implementation boundary for MeshPin branding plus PinMe/IPFS versioned deliverable evidence.",
+      "riskReason": "The feature changes public token branding and future test-token metadata, adds shared deliverable/version contracts and D1 schema, fetches untrusted manifests through a gateway, and freezes evidence used by acceptance and disputes. Public IPFS privacy and the PinMe AppKey boundary must be explicit before implementation.",
+      "recommendedOption": 1,
+      "options": [
+        {
+          "id": 1,
+          "label": "MeshPin + IPFS 证据 MVP",
+          "description": "采用 MeshPin Contribution / MPIN；上传由 Agent/开发者自己的 PinMe CLI 完成，AgentMesh 保存并验证 CID、Manifest、版本链和纠纷快照；保持 legacy 兼容，不做浏览器 AppKey 直传。"
+        },
+        {
+          "id": 2,
+          "label": "先做 IPFS 证据",
+          "description": "实现相同的 PinMe/IPFS 版本与纠纷证据能力，但暂时保留 YD 品牌；降低品牌改动面，之后再独立决定代币名称。"
+        },
+        {
+          "id": 3,
+          "label": "只做 MeshPin 改名",
+          "description": "只调整用户可见品牌和未来测试代币 metadata，不实现 CID Manifest、版本链或纠纷冻结；交付核对能力保持现状。"
+        }
+      ],
+      "safeAlternative": "Keep the deployed Wave A behavior unchanged and make no business-code, D1, contract, cloud or deployment mutation until this plan is approved.",
+      "resumeCommand": "/chill-ai approve meshpin-ipfs-evidence-004 option 1",
+      "createdAt": "2026-08-27T19:58:59+08:00"
+    }
+  ]
 }

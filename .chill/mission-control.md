@@ -50,14 +50,14 @@ Resume:
 ## Current
 
 Mission Control
-Status: completed
-Active command: internal chill:finish
-Feature: specs/11.unified-login-route-auth
-Task: finish
-Agent: planner/backend/frontend/qa
-Gate: none
-Next safe action: none
-Resume: none
+Status: waiting-approval
+Active command: /chill-ai start specs/008-meshpin-ipfs-evidence
+Feature: specs/008-meshpin-ipfs-evidence
+Task: T1
+Agent: planner waiting
+Gate: meshpin-ipfs-evidence-004
+Next safe action: review the MeshPin/MPIN and PinMe IPFS evidence plan; implementation remains paused
+Resume: /chill-ai approve meshpin-ipfs-evidence-004 option 1
 
 Latest Feature:
-Unified login and route authorization completed. 10/10 tasks complete, review passed, QA passed, and pnpm typecheck/test/build passed. Browser automation was attempted but blocked by local host permissions; deterministic web route-guard tests and API integration tests cover URL/hash/session authorization behavior.
+MeshPin/MPIN branding and PinMe IPFS deliverable evidence specs are ready on `codex/meshpin-ipfs-evidence`. The recommended plan uses uploader-owned PinMe CLI authentication, canonical CID + Manifest version chains, immutable acceptance/dispute snapshots and legacy compatibility. No implementation or deployment has started. The separate `platform-infrastructure-002` gate remains pending and unapproved.

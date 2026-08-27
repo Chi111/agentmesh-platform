@@ -37,7 +37,17 @@ import {
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Agent, CandidateMatch, Mission, StageOffer, WorkflowEdge, WorkflowStage, WorkflowViewport } from '../../types/domain';
+import type {
+  Agent,
+  CandidateMatch,
+  Mission,
+  StageOffer,
+  WorkflowCondition,
+  WorkflowEdge,
+  WorkflowFieldMapping,
+  WorkflowStage,
+  WorkflowViewport,
+} from '../../types/domain';
 import { formatPaymentAmount } from '../../utils/payments';
 import {
   WORKFLOW_NODE_HEIGHT,
@@ -48,7 +58,19 @@ import {
 import { findFreeWorkflowNodePosition, hasWorkflowNodeOverlap, layoutWorkflowNodes } from './workflowLayout';
 
 type FlowNode = Node<WorkflowNodeData>;
-type Snapshot = { nodes: FlowNode[]; edges: Edge[] };
+type WorkflowEdgeData = {
+  condition?: WorkflowCondition | null;
+  mappings: WorkflowFieldMapping[];
+};
+type FlowEdge = Edge<WorkflowEdgeData>;
+type Snapshot = { nodes: FlowNode[]; edges: FlowEdge[] };
+
+function mappingTargetsOverlap(left: string, right: string): boolean {
+  const leftSegments = left.slice(1).split('/');
+  const rightSegments = right.slice(1).split('/');
+  const sharedLength = Math.min(leftSegments.length, rightSegments.length);
+  return leftSegments.slice(0, sharedLength).every((segment, index) => segment === rightSegments[index]);
+}
 
 interface Props {
   mission: Mission;
@@ -109,18 +131,23 @@ function resolveEdges(missionId: string, stages: WorkflowStage[], edges?: Workfl
   }));
 }
 
-function flowEdge(edge: WorkflowEdge): Edge {
+function flowEdge(edge: WorkflowEdge): FlowEdge {
+  const conditional = Boolean(edge.condition);
+  const mapped = Boolean(edge.mappings?.length);
   return {
     id: edge.id,
     source: edge.sourceStageId,
     target: edge.targetStageId,
     type: 'smoothstep',
     animated: true,
-    style: { stroke: '#00b8d9', strokeWidth: 1.5 },
+    data: { condition: edge.condition ?? null, mappings: edge.mappings ?? [] },
+    label: conditional ? '条件' : mapped ? `映射 ${edge.mappings?.length}` : undefined,
+    labelStyle: { fontSize: 9, fontWeight: 700, fill: conditional ? '#b45309' : '#475569' },
+    style: { stroke: conditional ? '#f59e0b' : mapped ? '#8b5cf6' : '#00b8d9', strokeWidth: 1.5, strokeDasharray: conditional ? '6 4' : undefined },
   };
 }
 
-function graphError(nodes: FlowNode[], edges: Edge[], mission: Mission, requireAssignments: boolean, activeAgentIds = new Set<string>()): string | null {
+function graphError(nodes: FlowNode[], edges: FlowEdge[], mission: Mission, requireAssignments: boolean, activeAgentIds = new Set<string>()): string | null {
   if (!nodes.length) return '工作流至少需要一个节点。';
   if (nodes.length > 30) return '首版最多支持 30 个节点。';
   if (edges.length > 80) return '首版最多支持 80 条边。';
@@ -145,6 +172,7 @@ function graphError(nodes: FlowNode[], edges: Edge[], mission: Mission, requireA
   }
   const ids = new Set(nodes.map((node) => node.id));
   const edgeKeys = new Set<string>();
+  const mappingTargetsByNode = new Map<string, string[]>();
   const indegree = new Map(nodes.map((node) => [node.id, 0]));
   const outgoing = new Map(nodes.map((node) => [node.id, [] as string[]]));
   const undirected = new Map(nodes.map((node) => [node.id, [] as string[]]));
@@ -158,6 +186,28 @@ function graphError(nodes: FlowNode[], edges: Edge[], mission: Mission, requireA
     outgoing.get(edge.source)?.push(edge.target);
     undirected.get(edge.source)?.push(edge.target);
     undirected.get(edge.target)?.push(edge.source);
+    const mappings = edge.data?.mappings ?? [];
+    if (edge.data?.condition) {
+      const target = nodes.find((node) => node.id === edge.target);
+      if (target?.data.stage.nodeType !== 'approval' || edges.some((candidate) => candidate.source === edge.target)) {
+        return '条件边只能指向没有下游的终态审批 Gate。';
+      }
+      if (mappings.length) return '同一条条件边不能同时配置字段映射。';
+    }
+    if (mappings.length && nodes.find((node) => node.id === edge.target)?.data.stage.nodeType !== 'task') {
+      return '字段映射只能写入 Agent 任务节点。';
+    }
+    if (mappings.some((mapping) => (mapping.from !== '' && !mapping.from.startsWith('/')) || !mapping.to.startsWith('/'))) {
+      return '字段映射须使用 JSON Pointer；来源可留空表示整个根对象，写入路径必须以 / 开头。';
+    }
+    const mappingTargets = mappingTargetsByNode.get(edge.target) ?? [];
+    for (const mapping of mappings) {
+      if (mappingTargets.some((target) => mappingTargetsOverlap(target, mapping.to))) {
+        return '同一节点的入边不能写入相同或互相包含的映射目标。';
+      }
+      mappingTargets.push(mapping.to);
+    }
+    mappingTargetsByNode.set(edge.target, mappingTargets);
   }
   if (nodes.length > 1) {
     const visited = new Set<string>();
@@ -193,7 +243,7 @@ function graphError(nodes: FlowNode[], edges: Edge[], mission: Mission, requireA
   return null;
 }
 
-function wouldCreateCycle(source: string, target: string, edges: Edge[]): boolean {
+function wouldCreateCycle(source: string, target: string, edges: FlowEdge[]): boolean {
   const outgoing = new Map<string, string[]>();
   edges.forEach((edge) => outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge.target]));
   const queue = [target];
@@ -208,19 +258,72 @@ function wouldCreateCycle(source: string, target: string, edges: Edge[]): boolea
   return false;
 }
 
+function edgeVisual(data: WorkflowEdgeData | undefined): Pick<FlowEdge, 'label' | 'labelStyle' | 'style'> {
+  const conditional = Boolean(data?.condition);
+  const mapped = Boolean(data?.mappings.length);
+  return {
+    label: conditional ? '条件' : mapped ? `映射 ${data?.mappings.length}` : undefined,
+    labelStyle: { fontSize: 9, fontWeight: 700, fill: conditional ? '#b45309' : '#475569' },
+    style: { stroke: conditional ? '#f59e0b' : mapped ? '#8b5cf6' : '#00b8d9', strokeWidth: 1.5, strokeDasharray: conditional ? '6 4' : undefined },
+  };
+}
+
+function parseConditionValue(value: string): string | number | boolean | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed === null || ['string', 'number', 'boolean'].includes(typeof parsed)
+      ? parsed as string | number | boolean | null
+      : value;
+  } catch {
+    return value;
+  }
+}
+
+function parseConditionDraft(value: string): WorkflowCondition {
+  const parsed = JSON.parse(value) as unknown;
+  const visit = (candidate: unknown): WorkflowCondition => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('条件必须是 JSON 对象。');
+    const record = candidate as Record<string, unknown>;
+    if (record.op === 'and' || record.op === 'or') {
+      if (!Array.isArray(record.conditions) || record.conditions.length === 0) throw new Error(`${record.op} 至少需要一个子条件。`);
+      return { op: record.op, conditions: record.conditions.map(visit) };
+    }
+    if (record.op === 'not') return { op: 'not', condition: visit(record.condition) };
+    if (!['exists', 'eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in'].includes(String(record.op))) {
+      throw new Error('条件包含不支持的运算符。');
+    }
+    if (typeof record.path !== 'string' || (record.path !== '' && !record.path.startsWith('/'))) {
+      throw new Error('叶子条件需要 JSON Pointer 路径。');
+    }
+    if (record.op === 'exists') return { op: 'exists', path: record.path };
+    const scalar = (item: unknown): item is string | number | boolean | null => item === null || ['string', 'number', 'boolean'].includes(typeof item);
+    if (record.op === 'in') {
+      if (!Array.isArray(record.value) || record.value.length === 0 || !record.value.every(scalar)) {
+        throw new Error('in 条件需要非空标量数组。');
+      }
+      return { op: 'in', path: record.path, value: record.value };
+    }
+    if (!scalar(record.value)) throw new Error(`${String(record.op)} 条件需要标量比较值。`);
+    return { op: record.op as 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte', path: record.path, value: record.value };
+  };
+  return visit(parsed);
+}
+
 export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agents, candidateMatches, offers, locked, busy, onCompile, onSave, onConfirm }: Props) {
   const missionViewport = mission.workflowViewport ?? defaultViewport;
   const resolvedEdges = useMemo(() => resolveEdges(mission.id, stages, storedEdges), [mission.id, stages, storedEdges]);
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>(stages.map((stage, index) => stageNode(stage, agents, index)));
-  const [edges, setEdges, onEdgesChange] = useEdgesState(resolvedEdges.map(flowEdge));
+  const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>(resolvedEdges.map(flowEdge));
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
-  const [instance, setInstance] = useState<ReactFlowInstance<FlowNode, Edge> | null>(null);
+  const [instance, setInstance] = useState<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
   const [viewport, setViewport] = useState<Viewport>(missionViewport);
   const [history, setHistory] = useState<Snapshot[]>([]);
   const [future, setFuture] = useState<Snapshot[]>([]);
   const [dirty, setDirty] = useState(false);
   const [message, setMessage] = useState<{ text: string; tone: 'error' | 'success' } | null>(null);
+  const [conditionDraft, setConditionDraft] = useState('');
+  const [conditionDraftError, setConditionDraftError] = useState('');
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
@@ -237,6 +340,17 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const activeAgents = useMemo(() => agents.filter((agent) => agent.status === 'active'), [agents]);
   const activeAgentIds = useMemo(() => new Set(activeAgents.map((agent) => agent.id)), [activeAgents]);
   const selected = nodes.find((node) => node.id === selectedId) ?? null;
+  const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId) ?? null;
+  const selectedEdgeTarget = selectedEdge ? nodes.find((node) => node.id === selectedEdge.target) ?? null : null;
+  const selectedCondition = selectedEdge?.data?.condition ?? null;
+  const selectedConditionJson = selectedCondition ? JSON.stringify(selectedCondition, null, 2) : '';
+  const editableCondition = selectedCondition && 'path' in selectedCondition && selectedCondition.op !== 'in'
+    ? selectedCondition
+    : null;
+  const conditionalEdgeAllowed = Boolean(
+    selectedEdgeTarget?.data.stage.nodeType === 'approval'
+    && !edges.some((edge) => edge.source === selectedEdgeTarget.id),
+  );
   const selectedInput = selected?.data.stage.input ?? {};
   const offerByStage = useMemo(() => new Map(offers.map((offer) => [offer.stageId, offer])), [offers]);
   const canReissueOffers = offers.some((offer) => offer.status === 'declined' || offer.status === 'expired');
@@ -252,6 +366,11 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const taskBudget = taskNodes.reduce((sum, node) => sum + node.data.stage.budget, 0);
 
   useEffect(() => {
+    setConditionDraft(selectedConditionJson);
+    setConditionDraftError('');
+  }, [selectedConditionJson, selectedEdgeId]);
+
+  useEffect(() => {
     const workflowKey = `${mission.id}:${mission.workflowVersion}`;
     const serverVersionChanged = syncedWorkflowRef.current !== workflowKey;
     // Offer/candidate refreshes can replace the detail object without changing
@@ -261,13 +380,11 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
     const nextNodes = stages.map((stage, index) => stageNode(stage, agents, index));
     const shouldLayout = hasWorkflowNodeOverlap(nextNodes)
       || (serverVersionChanged && layoutNextCompilationRef.current);
-    setNodes(shouldLayout
-      ? layoutWorkflowNodes(nextNodes, nextEdges)
-      : nextNodes);
+    setNodes(shouldLayout ? layoutWorkflowNodes(nextNodes, nextEdges) : nextNodes);
     setEdges(nextEdges);
     setViewport(missionViewport);
-    setDirty(false);
-    dirtyRef.current = false;
+    setDirty(shouldLayout);
+    dirtyRef.current = shouldLayout;
     setHistory([]);
     setFuture([]);
     syncedWorkflowRef.current = workflowKey;
@@ -334,6 +451,32 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
     markDirty();
   };
 
+  const changeEdge = (data: WorkflowEdgeData) => {
+    if (!selectedEdge || locked) return;
+    remember();
+    setEdges((items) => items.map((edge) => edge.id === selectedEdge.id
+      ? { ...edge, data, ...edgeVisual(data) }
+      : edge));
+    markDirty();
+  };
+
+  const changeMapping = (index: number, patch: Partial<WorkflowFieldMapping>) => {
+    const mappings = [...(selectedEdge?.data?.mappings ?? [])];
+    if (!mappings[index]) return;
+    mappings[index] = { ...mappings[index], ...patch };
+    changeEdge({ condition: selectedEdge?.data?.condition ?? null, mappings });
+  };
+
+  const applyConditionDraft = () => {
+    try {
+      const condition = parseConditionDraft(conditionDraft);
+      setConditionDraftError('');
+      changeEdge({ condition, mappings: [] });
+    } catch (error) {
+      setConditionDraftError(error instanceof Error ? error.message : '条件 JSON 无效。');
+    }
+  };
+
   const onConnect = (connection: Connection) => {
     if (locked || !connection.source || !connection.target || connection.source === connection.target) return;
     if (edges.some((edge) => edge.source === connection.source && edge.target === connection.target)) return;
@@ -342,7 +485,14 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
       return;
     }
     remember();
-    setEdges((items) => addEdge({ ...connection, id: `EDGE-${crypto.randomUUID()}`, type: 'smoothstep', animated: true, style: { stroke: '#00b8d9', strokeWidth: 1.5 } }, items));
+    setEdges((items) => addEdge<FlowEdge>({
+      ...connection,
+      id: `EDGE-${crypto.randomUUID()}`,
+      type: 'smoothstep',
+      animated: true,
+      data: { condition: null, mappings: [] },
+      ...edgeVisual(undefined),
+    }, items));
     markDirty();
   };
 
@@ -363,7 +513,8 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
       input: nodeType === 'task'
         ? { executionMode: 'implement', inputContract: '', outputContract: '' }
         : { approvalCriteria: '确认上游交付满足任务目标与验收标准。' },
-      output: null,
+          output: null,
+          attemptNo: 1,
     };
     fitAfterNodeAddRef.current = true;
     setNodes((items) => [...items, stageNode(stage, agents)]);
@@ -428,7 +579,14 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
 
   const serialize = () => ({
     stages: nodes.map((node) => ({ ...node.data.stage, positionX: node.position.x, positionY: node.position.y })),
-    edges: edges.map((edge): WorkflowEdge => ({ id: edge.id, missionId: mission.id, sourceStageId: edge.source, targetStageId: edge.target })),
+    edges: edges.map((edge): WorkflowEdge => ({
+      id: edge.id,
+      missionId: mission.id,
+      sourceStageId: edge.source,
+      targetStageId: edge.target,
+      condition: edge.data?.condition ?? null,
+      mappings: edge.data?.mappings ?? [],
+    })),
   });
 
   const save = async () => {
@@ -489,7 +647,15 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
     }
     remember();
     setEdges((items) => checked
-      ? addEdge({ id: `EDGE-${crypto.randomUUID()}`, source: sourceId, target: selected.id, type: 'smoothstep', animated: true, style: { stroke: '#00b8d9', strokeWidth: 1.5 } }, items)
+      ? addEdge<FlowEdge>({
+        id: `EDGE-${crypto.randomUUID()}`,
+        source: sourceId,
+        target: selected.id,
+        type: 'smoothstep',
+        animated: true,
+        data: { condition: null, mappings: [] },
+        ...edgeVisual(undefined),
+      }, items)
       : items.filter((edge) => edge.id !== existing?.id));
     markDirty();
   };
@@ -550,7 +716,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
             <div className="mt-5 flex items-center justify-between"><p className="eyebrow">流程节点</p><span className="font-mono text-[9px] text-muted">{nodes.length}/30</span></div>
             <nav className="mt-2 space-y-1" aria-label="工作流节点列表">{nodes.map((node) => <button type="button" className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition ${selectedId === node.id ? 'bg-cyan/10 text-ink' : 'text-muted hover:bg-white hover:text-ink'}`} onClick={() => { setSelectedId(node.id); setSelectedEdgeId(null); setInspectorOpen(true); }} key={node.id}><span className={`size-1.5 shrink-0 rounded-full ${node.data.stage.nodeType === 'approval' ? 'bg-warning' : node.data.stage.agentId ? 'bg-lime' : 'bg-cyan'}`} /><span className="min-w-0 flex-1 truncate text-[10px] font-semibold">{node.data.stage.name}</span><span className="font-mono text-[8px]">{node.data.stage.nodeType === 'approval' ? 'GATE' : 'TASK'}</span></button>)}</nav>
 
-            <div className="mt-4 rounded-xl border border-line bg-white p-3 text-[9px] leading-4 text-muted"><GitBranch size={13} className="mb-1.5 text-cyan" />最多 30 个节点 / 80 条边；禁止循环、条件分支和运行期改图。</div>
+            <div className="mt-4 rounded-xl border border-line bg-white p-3 text-[9px] leading-4 text-muted"><GitBranch size={13} className="mb-1.5 text-cyan" />最多 30 个节点 / 80 条边；条件仅用于终态 Gate，循环会在启动前静态展开。</div>
           </div>
         </aside> : null}
 
@@ -573,7 +739,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
             onConnect={onConnect}
             onInit={setInstance}
             onNodeClick={(_, node) => { setSelectedId(node.id); setSelectedEdgeId(null); setInspectorOpen(true); }}
-            onEdgeClick={(_, edge) => { setSelectedEdgeId(edge.id); setSelectedId(null); setInspectorOpen(false); }}
+            onEdgeClick={(_, edge) => { setSelectedEdgeId(edge.id); setSelectedId(null); setInspectorOpen(true); }}
             onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); setInspectorOpen(false); setMoreOpen(false); }}
             onNodeDragStart={remember}
             onNodesDelete={remember}
@@ -606,8 +772,8 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
           </ReactFlow>
         </div>
 
-        {inspectorOpen ? <aside className={`${selected ? 'fixed inset-x-2 bottom-2 z-50 flex max-h-[70dvh] rounded-2xl border shadow-2xl md:inset-y-2 md:left-auto md:right-2 md:w-[360px] md:max-h-none lg:static lg:w-auto lg:rounded-none lg:border-y-0 lg:border-r-0 lg:shadow-none' : 'hidden lg:flex'} min-h-0 flex-col overflow-hidden border-l border-line bg-white`}>
-          <div className="flex shrink-0 items-center justify-between border-b border-line px-4 py-3"><div className="min-w-0"><p className="eyebrow">节点配置</p><h3 className="mt-1 truncate text-sm font-semibold">{selected ? selected.data.stage.nodeType === 'task' ? 'Agent 任务' : '人工审批 Gate' : '属性检查器'}</h3></div><button type="button" className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[10px] font-semibold text-muted transition hover:bg-canvas hover:text-ink" onClick={() => { setInspectorOpen(false); setSelectedId(null); }}><X size={13} /><span className="lg:hidden">关闭</span><span className="hidden lg:inline">收起</span></button></div>
+        {inspectorOpen ? <aside className={`${selected || selectedEdge ? 'fixed inset-x-2 bottom-2 z-50 flex max-h-[70dvh] rounded-2xl border shadow-2xl md:inset-y-2 md:left-auto md:right-2 md:w-[360px] md:max-h-none lg:static lg:w-auto lg:rounded-none lg:border-y-0 lg:border-r-0 lg:shadow-none' : 'hidden lg:flex'} min-h-0 flex-col overflow-hidden border-l border-line bg-white`}>
+          <div className="flex shrink-0 items-center justify-between border-b border-line px-4 py-3"><div className="min-w-0"><p className="eyebrow">{selectedEdge ? '连线配置' : '节点配置'}</p><h3 className="mt-1 truncate text-sm font-semibold">{selected ? selected.data.stage.nodeType === 'task' ? 'Agent 任务' : '人工审批 Gate' : selectedEdge ? '转换规则' : '属性检查器'}</h3></div><button type="button" className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[10px] font-semibold text-muted transition hover:bg-canvas hover:text-ink" onClick={() => { setInspectorOpen(false); setSelectedId(null); setSelectedEdgeId(null); }}><X size={13} /><span className="lg:hidden">关闭</span><span className="hidden lg:inline">收起</span></button></div>
           {selected ? <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 [scrollbar-width:thin]">
             <div className="rounded-xl border border-line bg-canvas/45 p-3"><div className="flex items-center justify-between gap-2"><span className="font-mono text-[9px] text-muted">{selected.id}</span><span className={`rounded-md px-2 py-1 font-mono text-[8px] ${selected.data.stage.nodeType === 'task' ? 'bg-ink text-cyan' : 'bg-amber-100 text-amber-700'}`}>{selected.data.stage.nodeType === 'task' ? 'TASK' : 'GATE'}</span></div></div>
             <label><span className="field-label !mb-1.5 !text-xs">名称</span><input className="field" value={selected.data.stage.name} onChange={(event) => changeStage({ name: event.target.value })} disabled={locked} /></label>
@@ -621,7 +787,53 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
               <label><span className="field-label !mb-1.5 !text-xs">输出契约</span><textarea className="field min-h-20 resize-none font-mono text-xs" value={String(selectedInput.outputContract ?? '')} onChange={(event) => changeStage({ input: { ...selectedInput, outputContract: event.target.value } })} disabled={locked} placeholder="描述交接摘要与 artifact reference" /></label>
             </> : <><label><span className="field-label !mb-1.5 !text-xs">审批标准</span><textarea className="field min-h-28 resize-none" value={String(selectedInput.approvalCriteria ?? '')} onChange={(event) => changeStage({ input: { ...selectedInput, approvalCriteria: event.target.value } })} disabled={locked} /></label><div><p className="field-label !mb-1.5 !text-xs">直接上游节点</p><div className="max-h-48 space-y-2 overflow-y-auto rounded-xl border border-line p-3">{nodes.filter((node) => node.id !== selected.id).map((node) => { const checked = edges.some((edge) => edge.source === node.id && edge.target === selected.id); return <label className="flex items-start gap-2 text-xs" key={node.id}><input type="checkbox" className="mt-0.5" checked={checked} onChange={(event) => toggleGateUpstream(node.id, event.target.checked)} disabled={locked} /><span><strong className="block text-ink">{node.data.stage.name}</strong><span className="text-[10px] text-muted">{node.data.stage.nodeType === 'approval' ? 'Gate' : '任务节点'}</span></span></label>; })}</div><p className="mt-2 text-[10px] leading-4 text-muted">Gate 会等待这里勾选的所有直接上游完成。</p></div></>}
             {offerByStage.get(selected.id) ? <p className="rounded-xl bg-canvas p-3 text-xs text-muted">邀请状态：<strong className="text-ink">{offerByStage.get(selected.id)?.status}</strong></p> : null}
-          </div> : <div className="flex min-h-0 flex-1 flex-col items-center justify-center p-6 text-center"><GitBranch size={28} className="text-muted/40" /><p className="mt-3 text-sm font-semibold">选择一个节点</p><p className="mt-1 max-w-48 text-xs leading-5 text-muted">配置目标、预算、Agent 和输入输出契约。</p></div>}
+          </div> : selectedEdge ? <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 [scrollbar-width:thin]">
+            <div className="rounded-xl border border-line bg-canvas/45 p-3">
+              <span className="font-mono text-[9px] text-muted">{selectedEdge.id}</span>
+              <p className="mt-2 text-xs font-semibold">{nodes.find((node) => node.id === selectedEdge.source)?.data.stage.name ?? selectedEdge.source}</p>
+              <p className="mt-1 text-[10px] text-muted">→ {selectedEdgeTarget?.data.stage.name ?? selectedEdge.target}</p>
+            </div>
+            <label className="flex items-start gap-2 rounded-xl border border-line p-3 text-xs">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={Boolean(selectedCondition)}
+                disabled={locked || (!selectedCondition && !conditionalEdgeAllowed)}
+                onChange={(event) => changeEdge({
+                  condition: event.target.checked ? { op: 'exists', path: '/verified' } : null,
+                  mappings: event.target.checked ? [] : selectedEdge.data?.mappings ?? [],
+                })}
+              />
+              <span><strong className="block text-ink">条件 Gate</strong><span className="mt-1 block text-[10px] leading-4 text-muted">仅允许指向无下游的终态审批 Gate；条件为假时自动跳过。</span></span>
+            </label>
+            {selectedCondition ? <>
+              <label><span className="field-label !mb-1.5 !text-xs">完整条件 AST（JSON）</span><textarea className="field min-h-40 resize-y font-mono text-[10px] leading-4" value={conditionDraft} onChange={(event) => { setConditionDraft(event.target.value); setConditionDraftError(''); }} disabled={locked} spellCheck={false} /></label>
+              <p className="text-[10px] leading-4 text-muted">支持 exists、比较、in、and、or 和 not；复合条件可在这里完整查看和编辑。</p>
+              {conditionDraftError ? <p className="rounded-lg bg-danger/10 p-2 text-[10px] text-danger" role="alert">{conditionDraftError}</p> : null}
+              <button type="button" className="btn-secondary !min-h-8 !px-3 !py-1.5 !text-[10px]" onClick={applyConditionDraft} disabled={locked}>应用条件 JSON</button>
+              {editableCondition ? <>
+                <label><span className="field-label !mb-1.5 !text-xs">输出路径（JSON Pointer）</span><input className="field font-mono text-xs" value={editableCondition.path} onChange={(event) => changeEdge({ condition: { ...editableCondition, path: event.target.value }, mappings: [] })} disabled={locked} placeholder="/result/verified" /></label>
+                <label><span className="field-label !mb-1.5 !text-xs">运算符</span><select className="field" value={editableCondition.op} onChange={(event) => {
+                  const op = event.target.value as 'exists' | 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte';
+                  const condition: WorkflowCondition = op === 'exists'
+                    ? { op, path: editableCondition.path }
+                    : { op, path: editableCondition.path, value: 'value' in editableCondition ? editableCondition.value as string | number | boolean | null : true };
+                  changeEdge({ condition, mappings: [] });
+                }} disabled={locked}><option value="exists">存在</option><option value="eq">等于</option><option value="neq">不等于</option><option value="gt">大于</option><option value="gte">大于等于</option><option value="lt">小于</option><option value="lte">小于等于</option></select></label>
+                {editableCondition.op !== 'exists' ? <label><span className="field-label !mb-1.5 !text-xs">比较值</span><input className="field font-mono text-xs" value={String('value' in editableCondition ? editableCondition.value : '')} onChange={(event) => changeEdge({ condition: { ...editableCondition, value: parseConditionValue(event.target.value) } as WorkflowCondition, mappings: [] })} disabled={locked} placeholder='true、42 或文本' /></label> : null}
+              </> : null}
+            </> : null}
+
+            <div>
+              <div className="flex items-center justify-between"><p className="field-label !mb-0 !text-xs">字段映射</p><button type="button" className="text-[10px] font-semibold text-cyan disabled:opacity-40" disabled={locked || Boolean(selectedCondition) || selectedEdgeTarget?.data.stage.nodeType !== 'task' || (selectedEdge.data?.mappings.length ?? 0) >= 20} onClick={() => changeEdge({ condition: null, mappings: [...(selectedEdge.data?.mappings ?? []), { from: '/summary', to: '/summary', required: true }] })}>+ 添加</button></div>
+              <p className="mt-1 text-[10px] leading-4 text-muted">把直接上游的结构化输出写入目标任务的 mappedInput。</p>
+              <div className="mt-2 space-y-2">{(selectedEdge.data?.mappings ?? []).map((mapping, index) => <div className="rounded-xl border border-line p-3" key={`${selectedEdge.id}-mapping-${index}`}>
+                <label><span className="field-label !mb-1 !text-[10px]">来源</span><input className="field !py-2 font-mono text-[10px]" value={mapping.from} onChange={(event) => changeMapping(index, { from: event.target.value })} disabled={locked} /></label>
+                <label className="mt-2 block"><span className="field-label !mb-1 !text-[10px]">写入</span><input className="field !py-2 font-mono text-[10px]" value={mapping.to} onChange={(event) => changeMapping(index, { to: event.target.value })} disabled={locked} /></label>
+                <div className="mt-2 flex items-center justify-between"><label className="inline-flex items-center gap-2 text-[10px]"><input type="checkbox" checked={mapping.required !== false} onChange={(event) => changeMapping(index, { required: event.target.checked })} disabled={locked} />缺失即阻断</label><button type="button" className="text-[10px] font-semibold text-danger" onClick={() => changeEdge({ condition: null, mappings: (selectedEdge.data?.mappings ?? []).filter((_, candidateIndex) => candidateIndex !== index) })} disabled={locked}>删除</button></div>
+              </div>)}</div>
+            </div>
+          </div> : <div className="flex min-h-0 flex-1 flex-col items-center justify-center p-6 text-center"><GitBranch size={28} className="text-muted/40" /><p className="mt-3 text-sm font-semibold">选择节点或连线</p><p className="mt-1 max-w-48 text-xs leading-5 text-muted">配置节点属性、条件 Gate 或字段映射。</p></div>}
         </aside> : null}
       </div>
     </section>

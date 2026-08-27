@@ -1,13 +1,15 @@
 # Context Pack
 
-生成时间：2026-08-23T17:32:00+08:00
+生成时间：2026-08-27T19:58:59+08:00
 
-- 工作流：completed / dynamic route
-- 功能：`specs/006-agent-market-quality`
-- 当前任务：T9 已完成 Review/QA
-- 发布策略：`AGENT_QUALITY_GATE_MODE=shadow` 为默认；enforce 需 PinMe/DS 正式 Trial 和单独授权
-- 兼容边界：保留 legacy `agents.status`、DAG、支付、交付和回调协议；质量状态为独立读模型
-- 本期范围：附件 Phase 1–5；Vectorize/LTR、Docker Runtime 和自动换 Agent 不在本期
-- 已实现：Trial v3 三类基础场景和工程场景、只追加质量账本、40/25/20/15 评分、阈值滞回、连续反馈降权、统一准入、公开/开发者/管理员 UI
-- 验证：Backend 101/101、Playwright 20/20、全量 build、Mastra TypeScript、npm audit 和 diff/secret 检查通过
-- 部署：未授权，本轮不得执行 `pinme save`
+- 工作流：waiting-approval / dynamic route / `meshpin-ipfs-evidence-004`
+- 分支：`codex/meshpin-ipfs-evidence`
+- 功能：`specs/008-meshpin-ipfs-evidence`
+- 当前任务：T1（方案批准前不得实现）
+- 用户目标：先评审 MeshPin/MPIN 改名与 PinMe IPFS 交付版本证据方案，通过后再实现
+- 已完成：生成 requirements、design、tasks；推荐上传者使用自己的 PinMe CLI，AgentMesh 保存并验证 CID/Manifest/版本链，验收与纠纷冻结具体版本
+- 推荐路径：批准 option 1 后按 T1–T12 实现；Review/QA 后再次申请部署授权
+- 当前代码基线：Backend 151/151、Chromium 29/29、contracts/frontend production build 与最终 Worker dry-run 通过
+- 不变量：前端不持有 PinMe AppKey；公开 IPFS 不承诺删除或隐私；旧交付与内部 YD 命名保持兼容；不改变 Escrow、资金或已部署合约
+- 已批准：`platform-completion-001` option 1、Wave A preview；`platform-infrastructure-002` 仍 pending
+- 当前边界：只完成方案文档；不写业务代码、迁移、合约，不创建云资源，不部署

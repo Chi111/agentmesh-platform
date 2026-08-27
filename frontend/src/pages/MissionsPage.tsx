@@ -11,6 +11,7 @@ import { formatPaymentAmount, paymentToken } from '../utils/payments';
 const statusOptions: Array<{ value: 'all' | MissionStatus; label: string }> = [
   { value: 'all', label: '全部' },
   { value: 'running', label: '执行中' },
+  { value: 'paused', label: '已暂停' },
   { value: 'review', label: '待验收' },
   { value: 'completed', label: '已完成' },
   { value: 'cancelled', label: '已退款终止' },

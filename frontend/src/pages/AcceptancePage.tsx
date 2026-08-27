@@ -1,13 +1,13 @@
-import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, ExternalLink, FileCheck2, FileQuestion, Link2, LoaderCircle, LockKeyhole, MessageSquareText, Scale, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, ExternalLink, FileCheck2, FileQuestion, Link2, LoaderCircle, LockKeyhole, MessageSquareText, Scale, ShieldCheck, Wrench } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
 import { Modal } from '../components/ui/Modal';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { useMission } from '../hooks/useMission';
 import { useAppStore } from '../store/useAppStore';
 import { formatPaymentAmount, isWeb3Payment, paymentToken } from '../utils/payments';
-import { deliveryReadiness } from '../utils/delivery';
+import { artifactBelongsToCurrentAttempt, deliveryReadiness, missionDeliverableBelongsToCurrentVersion } from '../utils/delivery';
 import { missionStatusMeta } from '../utils/missionState';
 import { api } from '../services/api';
 
@@ -74,13 +74,15 @@ function deliverableText(value: unknown, depth = 0): string | null {
 }
 
 export function AcceptancePage() {
+  const { missionId: routeMissionId = '' } = useParams();
   const mission = useMission();
-  const missionId = mission?.id ?? '';
+  const missionId = mission?.id ?? routeMissionId;
   const { freezeEscrow, onchainSettlement, releaseEscrow } = useAuth();
   const agents = useAppStore((state) => state.agents);
   const storedStages = useAppStore((state) => state.missionStages[missionId]);
   const stages = storedStages ?? [];
   const role = useAppStore((state) => state.role);
+  const profile = useAppStore((state) => state.profile);
   const detail = useAppStore((state) => state.missionDetails[missionId]);
   const releasePayment = useAppStore((state) => state.releasePayment);
   const createDispute = useAppStore((state) => state.createDispute);
@@ -100,7 +102,19 @@ export function AcceptancePage() {
   }, [detail, loadMissionDetail, missionId]);
 
   const deliverables = detail?.deliverables ?? [];
-  const selectedDeliverable = deliverables.find((item) => item.id === selectedDeliverableId) ?? deliverables[0] ?? null;
+  const changeRequests = detail?.changeRequests ?? [];
+  const stagesById = new Map(stages.map((stage) => [stage.id, stage]));
+  const currentDeliverables = deliverables.filter((deliverable) => {
+    if (deliverable.status === 'rejected') return false;
+    if (!deliverable.stageId) return missionDeliverableBelongsToCurrentVersion(deliverable, changeRequests);
+    const stage = stagesById.get(deliverable.stageId);
+    return stage ? artifactBelongsToCurrentAttempt(stage, deliverable) : false;
+  });
+  const currentDeliverableIds = new Set(currentDeliverables.map((deliverable) => deliverable.id));
+  const historicalDeliverables = deliverables.filter((deliverable) => !currentDeliverableIds.has(deliverable.id));
+  const selectedDeliverable = currentDeliverables.find((item) => item.id === selectedDeliverableId)
+    ?? currentDeliverables[currentDeliverables.length - 1]
+    ?? null;
   const completedStageOutputs = stages.filter((stage) => stage.status === 'done' && stage.output && Object.keys(stage.output).length > 0);
   const finalStageOutput = completedStageOutputs[completedStageOutputs.length - 1]?.output ?? null;
   const finalStageResult = objectValue(finalStageOutput)?.result;
@@ -111,6 +125,7 @@ export function AcceptancePage() {
   const evidenceCount = detail?.events.length ?? 0;
   const activeDispute = detail?.disputes.some((item) => item.status === 'open' || item.status === 'reviewing') ?? false;
   const canAccept = role === 'requester' && mission?.status === 'review' && hasAcceptableOutput;
+  const canRequestRework = mission?.status === 'review' && profile?.role === 'requester' && mission.requesterId === profile.id;
   const isImage = selectedDeliverable?.mimeType.startsWith('image/');
   const isVideo = selectedDeliverable?.mimeType.startsWith('video/');
 
@@ -170,7 +185,7 @@ export function AcceptancePage() {
     <div className="space-y-5">
       <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="flex items-start gap-3"><Link to="/missions" className="mt-1 rounded-lg p-2 text-muted hover:bg-white hover:text-ink" aria-label="返回任务列表"><ArrowLeft size={18} /></Link><div><div className="flex flex-wrap items-center gap-2"><span className="mono-chip">{mission.id}</span><StatusBadge tone={statusDisplay.tone}>{statusDisplay.label}</StatusBadge></div><h1 className="mt-2 text-2xl font-semibold tracking-tight">{mission.title}</h1><p className="mt-2 text-sm text-muted">{mission.status === 'review' || mission.status === 'completed' ? '核对交付物、执行证据和分账计划后完成结算。' : '此页面仅展示已有交付证据；任务尚未达到验收条件。'}</p></div></div>
-        <div className="flex gap-3"><button type="button" className="btn-primary" onClick={() => setReleaseOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled' || !canAccept}><Check size={16} />{mission.status === 'completed' ? '已完成结算' : mission.status === 'cancelled' ? '任务已退款终止' : role !== 'requester' ? '仅任务方可确认验收' : mission.status !== 'review' ? '等待 Agent 完成执行' : !hasAcceptableOutput ? '等待可验收输出' : `确认交付并释放 ${formatPaymentAmount(mission.budget, mission.paymentMethod)}`}</button></div>
+        <div className="flex flex-wrap gap-3">{canRequestRework ? <Link className="btn-secondary" to={`/missions/${mission.id}/execution`}><Wrench size={16} />查看执行与请求返工</Link> : null}<button type="button" className="btn-primary" onClick={() => setReleaseOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled' || !canAccept}><Check size={16} />{mission.status === 'completed' ? '已完成结算' : mission.status === 'cancelled' ? '任务已退款终止' : role !== 'requester' ? '仅任务方可确认验收' : mission.status !== 'review' ? '等待 Agent 完成执行' : !hasAcceptableOutput ? '等待可验收输出' : `确认交付并释放 ${formatPaymentAmount(mission.budget, mission.paymentMethod)}`}</button></div>
       </header>
 
       {mission.status !== 'review' && mission.status !== 'completed' && mission.status !== 'cancelled' ? <section className="flex flex-col gap-3 rounded-xl border border-warning/30 bg-warning/10 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="flex items-center gap-2 text-sm font-semibold text-warning"><AlertTriangle size={16} />任务尚未进入验收阶段</p><p className="mt-1 text-xs leading-5 text-muted">缺失的工程制品必须由执行节点重新提交，分析文字不能替代可下载 artifact。</p></div><Link className="btn-secondary shrink-0" to={`/missions/${mission.id}/execution`}>返回执行页</Link></section> : null}
@@ -182,7 +197,8 @@ export function AcceptancePage() {
             {selectedDeliverable ? <div className="mesh-grid mt-5 flex min-h-[460px] items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-black/25">{isImage ? <img className="max-h-[520px] w-full object-contain" src={selectedDeliverable.uri} alt={selectedDeliverable.name} /> : isVideo ? <video className="max-h-[520px] w-full" src={selectedDeliverable.uri} controls preload="metadata" /> : <a className="flex max-w-sm flex-col items-center rounded-2xl border border-white/15 bg-white/[0.06] p-8 text-center transition hover:bg-white/10" href={selectedDeliverable.uri} target="_blank" rel="noreferrer"><FileQuestion size={34} className="text-cyan" /><span className="mt-4 text-sm font-semibold">{selectedDeliverable.name}</span><span className="mt-2 text-xs text-white/40">浏览器无法内嵌预览此格式，点击打开交付 URI</span><ExternalLink size={15} className="mt-4" /></a>}</div> : <div className="mesh-grid mt-5 flex min-h-[300px] flex-col items-center justify-center rounded-xl border border-dashed border-warning/30 bg-black/25 px-6 text-center"><FileQuestion size={34} className="text-warning/70" /><p className="mt-4 text-sm font-semibold">当前没有可下载工程制品</p><p className="mt-2 max-w-md text-xs leading-5 text-white/45">Agent 的文字说明和代码片段仅作为执行证据；Implement 节点必须提交带 URI、哈希和类型的真实 artifact 才能进入验收。</p></div>}
             {finalStageOutput && !selectedDeliverable ? <div className="mt-4 max-h-64 overflow-auto rounded-xl border border-white/10 bg-white/[0.04] p-4"><div className="flex items-center gap-2 text-sm font-semibold"><ShieldCheck size={17} className="text-warning" />结构化阶段输出（仅证据，非交付物）</div>{finalDeliverableText ? <div className="mt-4 whitespace-pre-wrap break-words text-xs leading-6 text-white/65">{finalDeliverableText}</div> : <pre className="mt-4 whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-white/60">{JSON.stringify(finalDeliverable, null, 2)}</pre>}</div> : null}
             <div className="mt-4 flex flex-wrap gap-3 font-mono text-[9px] text-white/35">{selectedDeliverable ? <><span>HASH {selectedDeliverable.contentHash}</span><span>STATUS {selectedDeliverable.status.toUpperCase()}</span><span>{selectedDeliverable.createdAt ? `SUBMITTED ${new Date(selectedDeliverable.createdAt).toLocaleString('zh-CN', { hour12: false })}` : null}</span></> : finalStageOutput ? <><span>NO DOWNLOADABLE ARTIFACT</span><span>{completedStageOutputs.length}/{stages.length} STAGE OUTPUTS VALID</span></> : <span>WAITING FOR AGENT OUTPUT</span>}</div>
-            {deliverables.length > 1 ? <div className="mt-4 flex flex-wrap gap-2">{deliverables.map((item) => <button type="button" className={`rounded-lg border px-3 py-2 text-xs transition ${selectedDeliverable?.id === item.id ? 'border-cyan bg-cyan/10 text-white' : 'border-white/10 text-white/45 hover:text-white'}`} onClick={() => setSelectedDeliverableId(item.id)} key={item.id}>{item.name}</button>)}</div> : null}
+            {currentDeliverables.length > 1 ? <div className="mt-4 flex flex-wrap gap-2">{currentDeliverables.map((item) => <button type="button" className={`rounded-lg border px-3 py-2 text-xs transition ${selectedDeliverable?.id === item.id ? 'border-cyan bg-cyan/10 text-white' : 'border-white/10 text-white/45 hover:text-white'}`} onClick={() => setSelectedDeliverableId(item.id)} key={item.id}>{item.name}</button>)}</div> : null}
+            {historicalDeliverables.length > 0 ? <p className="mt-4 text-xs leading-5 text-white/45">{historicalDeliverables.length} 个历史 attempt 或已拒绝制品已保留，仅供审计，不参与当前验收。</p> : null}
             {readiness.missingArtifactStages.length > 0 ? <div className="mt-4 rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-warning"><p className="font-semibold">缺少真实工程制品，暂不可验收</p><p className="mt-1 text-xs leading-5 text-white/55">以下 Implement 节点尚未提交可下载 artifact：{readiness.missingArtifactStages.map((stage) => stage.name).join('、')}</p></div> : null}
           </div>
 
@@ -205,7 +221,7 @@ export function AcceptancePage() {
       {mission.status === 'completed' && role === 'requester' && !detail?.disputes.some((item) => item.status === 'resolved') ? <section className="panel p-5 md:p-6"><div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-xl bg-cyan/10 text-cyan"><MessageSquareText size={18} /></span><div><h2 className="font-semibold">Agent 结构化反馈</h2><p className="mt-1 text-xs text-muted">每个已结算任务节点可评价一次；更新会版本化，退款或有效争议不会进入信誉分。</p></div></div><div className="mt-5 grid gap-4 xl:grid-cols-2">{stages.filter((stage) => stage.nodeType === 'task' && stage.status === 'done' && stage.agentId).map((stage) => <StageFeedbackCard missionId={mission.id} stageId={stage.id} stageName={stage.name} agentName={agents.find((agent) => agent.id === stage.agentId)?.name ?? stage.agentId!} key={stage.id} />)}</div></section> : null}
 
       <Modal open={releaseOpen} onClose={() => setReleaseOpen(false)} title="确认交付并释放资金" description={usesWeb3 ? `钱包将调用 Sepolia 托管合约完成 ${token} 分账；Worker 验证释放事件后更新任务状态。` : '确认后会从 Web2 托管余额结算给开发者，并生成平台费账目。'}>
-        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {deliverables.length} 个 URI 交付物 · {completedStageOutputs.length} 个签名阶段输出</div></div>
+        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {currentDeliverables.length} 个当前 attempt URI 交付物 · {completedStageOutputs.length} 个签名阶段输出</div></div>
         <div className="mt-5 flex justify-end gap-3"><button type="button" className="btn-secondary" onClick={() => setReleaseOpen(false)}>取消</button><button type="button" className="btn-primary" onClick={() => void confirmRelease()} disabled={busy || (usesWeb3 && !onchainSettlement)}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : null}{usesWeb3 ? `链上释放 ${token}` : '余额结算并验收'}</button></div>
         {error ? <p className="mt-3 rounded-xl border border-danger/25 bg-danger/10 p-3 text-sm text-danger" role="alert">{error}</p> : null}
       </Modal>

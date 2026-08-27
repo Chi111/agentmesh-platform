@@ -20,6 +20,8 @@ import type {
   Deliverable,
   Dispute,
   DisputeAction,
+  DisputeAppealResult,
+  DisputeExecutionQueueResult,
   DisputeFinalizeResult,
   DisputeGovernance,
   DisputeVote,
@@ -35,11 +37,19 @@ import type {
   Escrow,
   ExecutionEvent,
   GovernancePowerSnapshot,
+  GovernanceExecutionItem,
   IdempotencyClaim,
   IdempotentResult,
   LedgerCursor,
   LedgerEntry,
+  LedgerExportClaim,
+  LedgerExportJob,
+  LedgerExportMutationResult,
+  LedgerExportPrivateArtifact,
+  LedgerExportRequestResult,
   Mission,
+  MissionChangeRequest,
+  MissionPauseMode,
   Notification,
   PlatformStore,
   RewardActivity,
@@ -57,11 +67,33 @@ import type {
   WorkflowStage,
   WorkflowDraftSaveResult,
   WorkflowEdge,
+  WorkflowCheckpoint,
+  WorkflowTransitionCheckpoint,
+  WorkflowTemplate,
+  WorkflowTemplateDetail,
+  WorkflowTemplateSaveResult,
+  WorkflowTemplateVersion,
   WorkflowViewport,
 } from './contracts';
 import { AGENT_QUALITY_FORMULA_VERSION, calculateAgentQuality, feedbackWeightForPriorCount } from './agentQuality';
-import { arbitrationQuorum, arbitrationVotingEndsAt, evaluateArbitrationProposal } from './arbitration';
+import {
+  arbitrationAppealEndsAt,
+  arbitrationExecutionPayloadHash,
+  arbitrationExecutionReady,
+  arbitrationQuorum,
+  arbitrationVoteWeight,
+  arbitrationVotingEndsAt,
+  arbitrationWeightVersion,
+  evaluateArbitrationProposal,
+} from './arbitration';
 import { paymentConfig, TEST_TOPUP_AMOUNT } from './payments';
+import {
+  exportArtifactExpiresAt,
+  exportJobExpiresAt,
+  exportLeaseExpiresAt,
+  exportProgress,
+  MAX_DIRECT_LEDGER_EXPORT_ROWS,
+} from './exportJobs';
 import { allocateRewardEpoch, evaluateEcosystemProposal, REWARD_FORMULA_VERSION, rewardScoreMicros } from './ydFinance';
 import type { Address, Hex } from 'viem';
 
@@ -143,6 +175,11 @@ function mapArbitrationProposal(row: Row): ArbitrationProposal {
     proposerId: text(row.proposer_id),
     status: text(row.status) as ArbitrationProposal['status'],
     weightMode: text(row.weight_mode) as ArbitrationProposal['weightMode'],
+    weightVersion: (text(row.weight_version) || (text(row.weight_mode) === 'power' ? 'member_power.v1' : 'one_person_one_vote.v1')) as ArbitrationProposal['weightVersion'],
+    round: Math.min(1, Math.max(0, number(row.round))) as 0 | 1,
+    parentProposalId: text(row.parent_proposal_id) || null,
+    appealReason: text(row.appeal_reason) || null,
+    appealDeadlineAt: text(row.appeal_deadline_at) || null,
     votingStartsAt: text(row.voting_starts_at),
     votingEndsAt: text(row.voting_ends_at),
     quorumRequired: number(row.quorum_required),
@@ -156,6 +193,23 @@ function mapArbitrationProposal(row: Row): ArbitrationProposal {
     executedAt: text(row.executed_at) || null,
     executedBy: text(row.executed_by) || null,
     createdAt: text(row.created_at),
+  };
+}
+
+function mapGovernanceExecution(row: Row): GovernanceExecutionItem {
+  return {
+    id: text(row.id),
+    scope: text(row.scope) as GovernanceExecutionItem['scope'],
+    sourceId: text(row.source_id),
+    proposalId: text(row.proposal_id),
+    action: text(row.action_type) as GovernanceExecutionItem['action'],
+    payloadHash: text(row.payload_hash),
+    status: text(row.status) as GovernanceExecutionItem['status'],
+    requestedBy: text(row.requested_by),
+    requestedAt: text(row.requested_at),
+    txHash: text(row.tx_hash) || null,
+    executedBy: text(row.executed_by) || null,
+    executedAt: text(row.executed_at) || null,
   };
 }
 
@@ -438,6 +492,8 @@ function mapAgentReputationSnapshot(row: Row): AgentReputationSnapshot {
 }
 
 function mapMission(row: Row): Mission {
+  const storedStatus = text(row.cancelled_at) ? 'cancelled' : text(row.status);
+  const pausedAt = text(row.runtime_paused_at) || null;
   return {
     id: text(row.id),
     requesterId: text(row.requester_id),
@@ -452,17 +508,30 @@ function mapMission(row: Row): Mission {
     priority: text(row.priority) as Mission['priority'],
     expertise: text(row.expertise) as Mission['expertise'],
     yieldEnabled: boolean(row.yield_enabled),
-    status: (text(row.cancelled_at) ? 'cancelled' : text(row.status)) as Mission['status'],
+    status: (pausedAt && storedStatus === 'running' ? 'paused' : storedStatus) as Mission['status'],
     progress: number(row.progress),
     currentStage: text(row.current_stage),
     team: parseJson<string[]>(row.team_json, []),
     compiledSpec: parseJson<Record<string, unknown> | null>(row.compiled_spec_json, null),
     workflowVersion: Math.max(1, number(row.workflow_version) || 1),
     workflowViewport: parseJson<WorkflowViewport>(row.workflow_viewport_json, { x: 0, y: 0, zoom: 1 }),
+    pausedAt,
+    pausedBy: text(row.runtime_paused_by) || null,
+    pauseReason: text(row.runtime_pause_reason) || null,
+    pauseMode: (text(row.runtime_pause_mode) || null) as Mission['pauseMode'],
+    schedulerRevision: number(row.runtime_scheduler_revision),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   };
 }
+
+const missionRuntimeColumns = `
+  c.paused_at AS runtime_paused_at,
+  c.paused_by AS runtime_paused_by,
+  c.pause_reason AS runtime_pause_reason,
+  c.pause_mode AS runtime_pause_mode,
+  c.scheduler_revision AS runtime_scheduler_revision
+`;
 
 function mapStage(row: Row): WorkflowStage {
   return {
@@ -479,20 +548,92 @@ function mapStage(row: Row): WorkflowStage {
     budget: number(row.budget_usdc),
     status: text(row.status) as WorkflowStage['status'],
     agentId: text(row.agent_id) || null,
-    input: parseJson<Record<string, unknown>>(row.input_json, {}),
+    input: parseJson<Record<string, unknown>>(row.current_attempt_input_json ?? row.input_json, {}),
     output: parseJson<Record<string, unknown> | null>(row.output_json, null),
+    attemptNo: Math.max(1, number(row.current_attempt_no) || 1),
+    attemptCreatedAt: text(row.current_attempt_created_at) || text(row.created_at),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   };
 }
 
+function mapMissionChangeRequest(row: Row): MissionChangeRequest {
+  return {
+    id: text(row.id),
+    missionId: text(row.mission_id),
+    version: number(row.version),
+    targetStageIds: parseJson<string[]>(row.target_stage_ids_json, []),
+    resetStageIds: parseJson<string[]>(row.reset_stage_ids_json, []),
+    reason: text(row.reason),
+    acceptanceCriteria: text(row.acceptance_criteria),
+    requestedBy: text(row.requested_by),
+    priorStageState: parseJson<MissionChangeRequest['priorStageState']>(row.prior_stage_state_json, []),
+    status: 'applied',
+    createdAt: text(row.created_at),
+  };
+}
+
+function mapWorkflowCheckpoint(row: Row): WorkflowCheckpoint {
+  return {
+    id: text(row.id),
+    missionId: text(row.mission_id),
+    sequence: number(row.sequence),
+    kind: text(row.kind) as WorkflowCheckpoint['kind'],
+    workflowVersion: number(row.workflow_version),
+    schedulerRevision: number(row.scheduler_revision),
+    changeVersion: number(row.change_version),
+    schedulerState: text(row.scheduler_state) as WorkflowCheckpoint['schedulerState'],
+    payload: parseJson<Record<string, unknown>>(row.payload_json, {}),
+    createdBy: text(row.created_by) || null,
+    createdAt: text(row.created_at),
+  };
+}
+
 function mapEdge(row: Row): WorkflowEdge {
+  const condition = parseJson<WorkflowEdge['condition']>(row.condition_json, null);
+  const mappings = parseJson<NonNullable<WorkflowEdge['mappings']>>(row.mappings_json, []);
   return {
     id: text(row.id),
     missionId: text(row.mission_id),
     sourceStageId: text(row.source_stage_id),
     targetStageId: text(row.target_stage_id),
+    ...(condition ? { condition } : {}),
+    ...(mappings.length ? { mappings } : {}),
     createdAt: text(row.created_at),
+  };
+}
+
+function mapWorkflowTransition(row: Row): WorkflowTransitionCheckpoint {
+  return {
+    id: text(row.id),
+    missionId: text(row.mission_id),
+    edgeId: text(row.edge_id),
+    sourceStageId: text(row.source_stage_id),
+    targetStageId: text(row.target_stage_id),
+    sourceAttemptNo: number(row.source_attempt_no),
+    workflowVersion: number(row.workflow_version),
+    matched: boolean(row.matched),
+    mappedInput: parseJson<Record<string, unknown>>(row.mapped_input_json, {}),
+    missingRequired: parseJson<string[]>(row.missing_required_json, []),
+    errorCode: text(row.error_code) || null,
+    createdAt: text(row.created_at),
+  };
+}
+
+function mapWorkflowTemplate(row: Row): WorkflowTemplate {
+  return {
+    id: text(row.template_id ?? row.id), ownerId: text(row.owner_id), name: text(row.name),
+    description: text(row.description), currentVersion: number(row.current_version),
+    createdAt: text(row.template_created_at ?? row.created_at), updatedAt: text(row.updated_at),
+  };
+}
+
+function mapWorkflowTemplateVersion(row: Row): WorkflowTemplateVersion {
+  return {
+    templateId: text(row.template_id), version: number(row.version),
+    nodes: parseJson<WorkflowStage[]>(row.nodes_json, []), edges: parseJson<WorkflowEdge[]>(row.edges_json, []),
+    entryIds: parseJson<string[]>(row.entry_ids_json, []), exitIds: parseJson<string[]>(row.exit_ids_json, []),
+    contentHash: text(row.content_hash), createdAt: text(row.version_created_at ?? row.created_at),
   };
 }
 
@@ -545,6 +686,7 @@ function mapDeliverable(row: Row): Deliverable {
     id: text(row.id),
     missionId: text(row.mission_id),
     stageId: text(row.stage_id) || null,
+    attemptNo: row.attempt_no === null || row.attempt_no === undefined ? null : number(row.attempt_no),
     agentId: text(row.agent_id) || null,
     name: text(row.name),
     uri: text(row.uri),
@@ -669,6 +811,44 @@ function mapLedgerEntry(row: Row): LedgerEntry {
   };
 }
 
+function mapLedgerExportJob(row: Row): LedgerExportJob {
+  const artifactId = text(row.artifact_id);
+  return {
+    id: text(row.id),
+    token: text(row.token),
+    status: text(row.status) as LedgerExportJob['status'],
+    totalRows: number(row.total_rows),
+    processedRows: number(row.processed_rows),
+    progress: number(row.progress),
+    attempt: number(row.attempt),
+    errorCode: text(row.error_code) || null,
+    errorMessage: text(row.error_message) || null,
+    startedAt: text(row.started_at) || null,
+    completedAt: text(row.completed_at) || null,
+    cancelledAt: text(row.cancelled_at) || null,
+    expiresAt: artifactId ? text(row.artifact_expires_at) : text(row.expires_at),
+    createdAt: text(row.created_at),
+    updatedAt: text(row.updated_at),
+    artifact: artifactId ? {
+      id: artifactId,
+      sha256: text(row.artifact_sha256),
+      contentType: 'text/csv',
+      rowCount: number(row.artifact_row_count),
+      byteSize: number(row.artifact_byte_size),
+      createdAt: text(row.artifact_created_at),
+      expiresAt: text(row.artifact_expires_at),
+    } : null,
+  };
+}
+
+const ledgerExportSelect = `
+  SELECT j.*,
+    a.id AS artifact_id, a.sha256 AS artifact_sha256, a.row_count AS artifact_row_count,
+    a.byte_size AS artifact_byte_size, a.created_at AS artifact_created_at,
+    a.expires_at AS artifact_expires_at
+  FROM export_jobs j LEFT JOIN export_artifacts a ON a.job_id = j.id AND a.deleted_at IS NULL
+`;
+
 function stageInsert(db: D1Database, stage: WorkflowStage): D1Statement {
   return db.prepare(`
     INSERT INTO workflow_stages
@@ -700,6 +880,21 @@ function edgeInsert(db: D1Database, edge: WorkflowEdge): D1Statement {
     INSERT INTO workflow_edges (id, mission_id, source_stage_id, target_stage_id, created_at)
     VALUES (?, ?, ?, ?, ?)
   `).bind(edge.id, edge.missionId, edge.sourceStageId, edge.targetStageId, edge.createdAt);
+}
+
+function edgeRuleInsert(db: D1Database, edge: WorkflowEdge): D1Statement {
+  return db.prepare(`
+    INSERT INTO workflow_edge_rules
+      (edge_id, mission_id, condition_json, mappings_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(
+    edge.id,
+    edge.missionId,
+    edge.condition ? JSON.stringify(edge.condition) : null,
+    JSON.stringify(edge.mappings ?? []),
+    edge.createdAt,
+    edge.createdAt,
+  );
 }
 
 function guardedStageInsert(db: D1Database, stage: WorkflowStage, saveToken: string): D1Statement {
@@ -744,6 +939,27 @@ function guardedEdgeInsert(db: D1Database, edge: WorkflowEdge, saveToken: string
     edge.createdAt,
     edge.missionId,
     saveToken,
+  );
+}
+
+function guardedEdgeRuleInsert(db: D1Database, edge: WorkflowEdge, saveToken: string): D1Statement {
+  return db.prepare(`
+    INSERT INTO workflow_edge_rules
+      (edge_id, mission_id, condition_json, mappings_json, created_at, updated_at)
+    SELECT ?, ?, ?, ?, ?, ?
+    WHERE EXISTS (SELECT 1 FROM missions WHERE id = ? AND workflow_save_token = ?)
+      AND EXISTS (SELECT 1 FROM workflow_edges WHERE id = ? AND mission_id = ?)
+  `).bind(
+    edge.id,
+    edge.missionId,
+    edge.condition ? JSON.stringify(edge.condition) : null,
+    JSON.stringify(edge.mappings ?? []),
+    edge.createdAt,
+    edge.createdAt,
+    edge.missionId,
+    saveToken,
+    edge.id,
+    edge.missionId,
   );
 }
 
@@ -921,7 +1137,7 @@ export class D1PlatformStore implements PlatformStore {
 
   async updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs = 1800): Promise<Agent | null> {
     const updatedAt = new Date().toISOString();
-    await this.db.batch([
+    const results = await this.db.batch([
       this.db.prepare(`
         UPDATE agents SET trust_score = ?, status = ?, response_time_ms = ?, updated_at = ?
         WHERE id = ?
@@ -1105,12 +1321,13 @@ export class D1PlatformStore implements PlatformStore {
 
   async listMissions(user: UserContext): Promise<Mission[]> {
     if (user.role === 'admin') {
-      const { results } = await this.db.prepare('SELECT * FROM missions ORDER BY created_at DESC LIMIT 200').all<Row>();
+      const { results } = await this.db.prepare(`SELECT m.*, ${missionRuntimeColumns} FROM missions m LEFT JOIN mission_runtime_controls c ON c.mission_id = m.id ORDER BY m.created_at DESC LIMIT 200`).all<Row>();
       return results.map(mapMission);
     }
     if (user.role === 'developer') {
       const { results } = await this.db.prepare(`
-        SELECT DISTINCT m.* FROM missions m
+        SELECT DISTINCT m.*, ${missionRuntimeColumns} FROM missions m
+        LEFT JOIN mission_runtime_controls c ON c.mission_id = m.id
         JOIN workflow_stages s ON s.mission_id = m.id
         JOIN agents a ON a.id = s.agent_id
         WHERE a.owner_id = ?
@@ -1118,12 +1335,12 @@ export class D1PlatformStore implements PlatformStore {
       `).bind(user.id).all<Row>();
       return results.map(mapMission);
     }
-    const { results } = await this.db.prepare('SELECT * FROM missions WHERE requester_id = ? ORDER BY created_at DESC LIMIT 200').bind(user.id).all<Row>();
+    const { results } = await this.db.prepare(`SELECT m.*, ${missionRuntimeColumns} FROM missions m LEFT JOIN mission_runtime_controls c ON c.mission_id = m.id WHERE m.requester_id = ? ORDER BY m.created_at DESC LIMIT 200`).bind(user.id).all<Row>();
     return results.map(mapMission);
   }
 
   async getMission(id: string): Promise<Mission | null> {
-    const row = await this.db.prepare('SELECT * FROM missions WHERE id = ?').bind(id).first<Row>();
+    const row = await this.db.prepare(`SELECT m.*, ${missionRuntimeColumns} FROM missions m LEFT JOIN mission_runtime_controls c ON c.mission_id = m.id WHERE m.id = ?`).bind(id).first<Row>();
     return row ? mapMission(row) : null;
   }
 
@@ -1146,6 +1363,7 @@ export class D1PlatformStore implements PlatformStore {
       ),
       ...stages.map((stage) => stageInsert(this.db, stage)),
       ...edges.map((edge) => edgeInsert(this.db, edge)),
+      ...edges.map((edge) => edgeRuleInsert(this.db, edge)),
       this.db.prepare(`
         INSERT INTO escrows
           (id, mission_id, amount, token, network, payment_method, yield_enabled, platform_fee_rate, status, created_at, updated_at)
@@ -1154,6 +1372,9 @@ export class D1PlatformStore implements PlatformStore {
         `ESC-${mission.id}`, mission.id, mission.budget, payment.token, payment.network,
         mission.paymentMethod, mission.yieldEnabled ? 1 : 0, mission.createdAt, mission.updatedAt,
       ),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO mission_runtime_controls (mission_id, updated_at) VALUES (?, ?)
+      `).bind(mission.id, mission.createdAt),
     ];
     await this.db.batch(statements);
     return mission;
@@ -1213,6 +1434,7 @@ export class D1PlatformStore implements PlatformStore {
       `).bind(id, id, saveToken),
       ...stages.map((stage) => guardedStageInsert(this.db, stage, saveToken)),
       ...edges.map((edge) => guardedEdgeInsert(this.db, edge, saveToken)),
+      ...edges.map((edge) => guardedEdgeRuleInsert(this.db, edge, saveToken)),
     ]);
     if (Number(results[0]?.meta?.changes ?? 0) === 0) {
       const [currentMission, currentEscrow] = await Promise.all([this.getMission(id), this.getEscrow(id)]);
@@ -1284,6 +1506,21 @@ export class D1PlatformStore implements PlatformStore {
         WHERE mission_id = ? AND status = 'pending'
           AND EXISTS (SELECT 1 FROM missions WHERE id = escrows.mission_id AND status = 'running' AND updated_at = ?)
       `).bind(depositTxHash, payoutHash, requesterWalletAddress?.toLocaleLowerCase() ?? null, startedAt, id, startedAt),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO mission_runtime_controls (mission_id, updated_at)
+        SELECT id, ? FROM missions WHERE id = ? AND status = 'running'
+      `).bind(startedAt, id),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO workflow_stage_attempts
+          (id, mission_id, stage_id, attempt_no, status, input_json, output_json, is_current,
+           started_at, completed_at, created_at, updated_at)
+        SELECT 'ATTEMPT-' || s.id || '-1', s.mission_id, s.id, 1, s.status, s.input_json, s.output_json, 1,
+          CASE WHEN s.status IN ('running', 'done', 'failed') THEN ? ELSE NULL END,
+          CASE WHEN s.status IN ('done', 'failed') THEN ? ELSE NULL END,
+          ?, ?
+        FROM workflow_stages s JOIN missions m ON m.id = s.mission_id
+        WHERE s.mission_id = ? AND m.status = 'running'
+      `).bind(startedAt, startedAt, startedAt, startedAt, id),
     );
     const results = await this.db.batch(statements);
     const saved = await this.getMission(id);
@@ -1294,8 +1531,340 @@ export class D1PlatformStore implements PlatformStore {
     await this.db.prepare(`
       UPDATE missions SET status = 'review', progress = 100, current_stage = '等待验收', review_due_at = ?, updated_at = datetime('now')
       WHERE id = ? AND status = 'running' AND cancelled_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM mission_runtime_controls c WHERE c.mission_id = missions.id AND c.paused_at IS NOT NULL)
     `).bind(reviewDueAt, id).run();
     return this.getMission(id);
+  }
+
+  async pauseMission(id: string, actorId: string, mode: MissionPauseMode, reason: string, pausedAt: string) {
+    await this.db.prepare(`
+      INSERT OR IGNORE INTO mission_runtime_controls (mission_id, updated_at)
+      SELECT id, ? FROM missions WHERE id = ?
+    `).bind(pausedAt, id).run();
+    const token = crypto.randomUUID();
+    const eventId = `EVT-${crypto.randomUUID()}`;
+    const checkpointId = `CHECKPOINT-${crypto.randomUUID()}`;
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE mission_runtime_controls SET
+          paused_at = ?, paused_by = ?, pause_reason = ?, pause_mode = ?,
+          scheduler_revision = scheduler_revision + 1, scheduler_state = 'clean',
+          checkpoint_sequence = checkpoint_sequence + 1, mutation_token = ?, updated_at = ?
+        WHERE mission_id = ?
+          AND (paused_at IS NULL OR (? = 'emergency' AND pause_mode = 'requester'))
+          AND EXISTS (
+            SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+            WHERE m.id = mission_runtime_controls.mission_id AND m.status = 'running'
+              AND m.cancelled_at IS NULL AND e.status = 'held'
+          )
+      `).bind(pausedAt, actorId, reason, mode, token, pausedAt, id, mode),
+      this.db.prepare(`
+        INSERT INTO execution_events
+          (id, mission_id, stage_id, event_type, message, actor_type, actor_id, payload_json, created_at)
+        SELECT ?, ?, NULL, 'mission.paused', ?, ?, ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(
+        eventId, id, mode === 'emergency' ? '管理员已紧急暂停任务' : '任务方已暂停执行',
+        mode === 'emergency' ? 'platform' : 'requester', actorId, JSON.stringify({ mode, reason }), pausedAt, id, token,
+      ),
+      this.db.prepare(`
+        INSERT INTO workflow_checkpoints
+          (id, mission_id, sequence, kind, workflow_version, scheduler_revision, change_version,
+           scheduler_state, payload_json, created_by, created_at)
+        SELECT ?, c.mission_id, c.checkpoint_sequence, 'pause', m.workflow_version, c.scheduler_revision,
+          c.change_version, c.scheduler_state, ?, ?, ?
+        FROM mission_runtime_controls c JOIN missions m ON m.id = c.mission_id
+        WHERE c.mission_id = ? AND c.mutation_token = ?
+      `).bind(checkpointId, JSON.stringify({ mode, reason }), actorId, pausedAt, id, token),
+    ]);
+    const mission = await this.getMission(id);
+    if (Number(results[0]?.meta?.changes ?? 0) > 0 && mission) {
+      return { state: 'applied' as const, mission, schedulerRevision: mission.schedulerRevision };
+    }
+    return mission?.status === 'paused'
+      ? { state: 'unchanged' as const, mission }
+      : { state: 'invalid' as const, mission };
+  }
+
+  async resumeMission(
+    id: string,
+    actorId: string,
+    expectedMode: MissionPauseMode,
+    expectedSchedulerRevision: number,
+    resumedAt: string,
+  ) {
+    const before = await this.getMission(id);
+    const token = crypto.randomUUID();
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE mission_runtime_controls SET
+          paused_at = NULL, paused_by = NULL, pause_reason = NULL, pause_mode = NULL,
+          scheduler_revision = scheduler_revision + 1, scheduler_state = 'dirty',
+          checkpoint_sequence = checkpoint_sequence + 1, mutation_token = ?, updated_at = ?
+        WHERE mission_id = ? AND paused_at IS NOT NULL AND pause_mode = ? AND scheduler_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+            WHERE m.id = mission_runtime_controls.mission_id AND m.status = 'running'
+              AND m.cancelled_at IS NULL AND e.status = 'held'
+          )
+      `).bind(token, resumedAt, id, expectedMode, expectedSchedulerRevision),
+      this.db.prepare(`
+        INSERT INTO execution_events
+          (id, mission_id, stage_id, event_type, message, actor_type, actor_id, payload_json, created_at)
+        SELECT ?, ?, NULL, 'mission.resumed', '任务执行已恢复', ?, ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(
+        `EVT-${crypto.randomUUID()}`, id, expectedMode === 'emergency' ? 'platform' : 'requester', actorId,
+        JSON.stringify({ mode: expectedMode, pausedAt: before?.pausedAt, reason: before?.pauseReason }), resumedAt, id, token,
+      ),
+      this.db.prepare(`
+        INSERT INTO workflow_checkpoints
+          (id, mission_id, sequence, kind, workflow_version, scheduler_revision, change_version,
+           scheduler_state, payload_json, created_by, created_at)
+        SELECT ?, c.mission_id, c.checkpoint_sequence, 'resume', m.workflow_version, c.scheduler_revision,
+          c.change_version, c.scheduler_state, ?, ?, ?
+        FROM mission_runtime_controls c JOIN missions m ON m.id = c.mission_id
+        WHERE c.mission_id = ? AND c.mutation_token = ?
+      `).bind(
+        `CHECKPOINT-${crypto.randomUUID()}`,
+        JSON.stringify({ mode: expectedMode, pausedAt: before?.pausedAt, reason: before?.pauseReason }),
+        actorId, resumedAt, id, token,
+      ),
+    ]);
+    const mission = await this.getMission(id);
+    if (Number(results[0]?.meta?.changes ?? 0) > 0 && mission) {
+      return { state: 'applied' as const, mission, schedulerRevision: mission.schedulerRevision };
+    }
+    return mission?.status !== 'paused' && mission
+      ? { state: 'unchanged' as const, mission }
+      : { state: 'invalid' as const, mission };
+  }
+
+  async applyMissionChangeRequest(input: {
+    id: string; missionId: string; targetStageIds: string[]; resetStageIds: string[];
+    reason: string; acceptanceCriteria: string; requestedBy: string; createdAt: string;
+    expectedRunningStageIds?: string[];
+  }) {
+    const resetIds = [...new Set(input.resetStageIds)];
+    const targetIds = [...new Set(input.targetStageIds)];
+    const expectedRunningIds = [...new Set(input.expectedRunningStageIds ?? [])];
+    const expectedRunningSqlIds = expectedRunningIds.length ? expectedRunningIds : [''];
+    const stages = await this.listStages(input.missionId);
+    const resetStages = stages.filter((stage) => resetIds.includes(stage.id));
+    const priorStageState = resetStages.map((stage) => ({
+      stageId: stage.id, attemptNo: stage.attemptNo, status: stage.status,
+      progress: stage.progress, input: stage.input, output: stage.output,
+    }));
+    const nextInputByStageId = new Map(resetStages.map((stage) => [stage.id, {
+      ...stage.input,
+      rework: {
+        changeRequestId: input.id,
+        reason: input.reason,
+        acceptanceCriteria: input.acceptanceCriteria,
+        targetStageIds: input.targetStageIds,
+        isTarget: targetIds.includes(stage.id),
+        requestedAt: input.createdAt,
+      },
+    }]));
+    const missionBefore = await this.getMission(input.missionId);
+    if (!resetIds.length || !targetIds.length || priorStageState.length !== resetIds.length
+      || expectedRunningIds.some((stageId) => !resetIds.includes(stageId))
+      || expectedRunningIds.some((stageId) => {
+        const stage = resetStages.find((candidate) => candidate.id === stageId);
+        return stage?.status !== 'running' || stage.nodeType !== 'approval';
+      })) {
+      return { state: 'invalid' as const, mission: missionBefore };
+    }
+    if (priorStageState.some((stage) => stage.status === 'running' && !expectedRunningIds.includes(stage.stageId))) {
+      return missionBefore ? { state: 'blocked_running_stage' as const, mission: missionBefore } : { state: 'invalid' as const, mission: null };
+    }
+    const token = crypto.randomUUID();
+    const placeholders = resetIds.map(() => '?').join(',');
+    const targetPlaceholders = targetIds.map(() => '?').join(',');
+    const expectedRunningPlaceholders = expectedRunningSqlIds.map(() => '?').join(',');
+    const statements: D1Statement[] = [
+      this.db.prepare(`
+        UPDATE mission_runtime_controls SET
+          change_version = change_version + 1, scheduler_revision = scheduler_revision + 1,
+          scheduler_state = 'dirty', checkpoint_sequence = checkpoint_sequence + 1,
+          mutation_token = ?, updated_at = ?
+        WHERE mission_id = ?
+          AND EXISTS (
+            SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+            WHERE m.id = mission_runtime_controls.mission_id
+              AND (m.status = 'review' OR (m.status = 'running' AND mission_runtime_controls.paused_at IS NOT NULL))
+              AND m.cancelled_at IS NULL AND e.status = 'held'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_stages s
+            WHERE s.mission_id = mission_runtime_controls.mission_id
+              AND s.id IN (${placeholders}) AND s.status = 'running'
+              AND s.id NOT IN (${expectedRunningPlaceholders})
+          )
+          AND (
+            SELECT COUNT(*) FROM workflow_stages s
+            WHERE s.mission_id = mission_runtime_controls.mission_id
+              AND s.id IN (${expectedRunningPlaceholders})
+              AND s.status = 'running' AND s.node_type = 'approval'
+          ) = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_stages s
+            WHERE s.mission_id = mission_runtime_controls.mission_id
+              AND s.id IN (${expectedRunningPlaceholders})
+              AND (s.status <> 'running' OR s.node_type <> 'approval')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_stages s
+            WHERE s.mission_id = mission_runtime_controls.mission_id
+              AND s.id IN (${targetPlaceholders}) AND s.status NOT IN ('done', 'failed')
+          )
+      `).bind(
+        token, input.createdAt, input.missionId,
+        ...resetIds, ...expectedRunningSqlIds,
+        ...expectedRunningSqlIds, expectedRunningIds.length,
+        ...expectedRunningSqlIds, ...targetIds,
+      ),
+      this.db.prepare(`
+        INSERT INTO mission_change_requests
+          (id, mission_id, version, target_stage_ids_json, reset_stage_ids_json, reason,
+           acceptance_criteria, requested_by, prior_stage_state_json, created_at)
+        SELECT ?, c.mission_id, c.change_version, ?, ?, ?, ?, ?, ?, ?
+        FROM mission_runtime_controls c WHERE c.mission_id = ? AND c.mutation_token = ?
+      `).bind(
+        input.id, JSON.stringify(input.targetStageIds), JSON.stringify(resetIds), input.reason,
+        input.acceptanceCriteria, input.requestedBy, JSON.stringify(priorStageState), input.createdAt,
+        input.missionId, token,
+      ),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO workflow_stage_attempts
+          (id, mission_id, stage_id, attempt_no, status, input_json, output_json, is_current,
+           started_at, completed_at, created_at, updated_at)
+        SELECT ? || s.id, s.mission_id, s.id, 1, s.status, s.input_json, s.output_json, 1,
+          CASE WHEN s.status IN ('running', 'done', 'failed') THEN s.created_at ELSE NULL END,
+          CASE WHEN s.status IN ('done', 'failed') THEN s.updated_at ELSE NULL END,
+          s.created_at, s.updated_at
+        FROM workflow_stages s
+        WHERE s.mission_id = ? AND s.id IN (${placeholders})
+          AND NOT EXISTS (SELECT 1 FROM workflow_stage_attempts a WHERE a.stage_id = s.id)
+          AND EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(`ATTEMPT-legacy-${crypto.randomUUID()}-`, input.missionId, ...resetIds, input.missionId, token),
+      this.db.prepare(`
+        UPDATE workflow_stage_attempts SET is_current = 0, updated_at = ?
+        WHERE mission_id = ? AND stage_id IN (${placeholders}) AND is_current = 1
+          AND EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(input.createdAt, input.missionId, ...resetIds, input.missionId, token),
+      this.db.prepare(`
+        UPDATE workflow_dispatch_outbox SET status = 'done', updated_at = ?
+        WHERE mission_id = ? AND stage_id IN (${placeholders})
+          AND EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(input.createdAt, input.missionId, ...resetIds, input.missionId, token),
+    ];
+    for (const stageId of resetIds) {
+      const nextInput = JSON.stringify(nextInputByStageId.get(stageId) ?? {});
+      statements.push(this.db.prepare(`
+        INSERT INTO workflow_stage_attempts
+          (id, mission_id, stage_id, attempt_no, change_request_id, status, input_json,
+           output_json, is_current, created_at, updated_at)
+        SELECT ?, s.mission_id, s.id,
+          COALESCE((SELECT MAX(a.attempt_no) + 1 FROM workflow_stage_attempts a WHERE a.stage_id = s.id), 1),
+          ?, 'queued', ?, NULL, 1, ?, ?
+        FROM workflow_stages s
+        WHERE s.id = ? AND s.mission_id = ?
+          AND EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(`ATTEMPT-${crypto.randomUUID()}`, input.id, nextInput, input.createdAt, input.createdAt, stageId, input.missionId, input.missionId, token));
+    }
+    statements.push(
+      this.db.prepare(`
+        UPDATE workflow_stages SET status = 'queued', progress = 0, output_json = NULL, updated_at = ?
+        WHERE mission_id = ? AND id IN (${placeholders})
+          AND EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(input.createdAt, input.missionId, ...resetIds, input.missionId, token),
+      this.db.prepare(`
+        UPDATE missions SET status = 'running', review_due_at = NULL,
+          current_stage = '已创建返工版本，等待重新执行', updated_at = ?
+        WHERE id = ? AND status = 'review'
+          AND EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(input.createdAt, input.missionId, input.missionId, token),
+      this.db.prepare(`
+        INSERT INTO execution_events
+          (id, mission_id, stage_id, event_type, message, actor_type, actor_id, payload_json, created_at)
+        SELECT ?, ?, NULL, 'mission.change_requested', '任务方已创建版本化返工请求', 'requester', ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM mission_runtime_controls WHERE mission_id = ? AND mutation_token = ?)
+      `).bind(
+        `EVT-${crypto.randomUUID()}`, input.missionId, input.requestedBy,
+        JSON.stringify({ changeRequestId: input.id, targetStageIds: input.targetStageIds, resetStageIds: resetIds, reason: input.reason, acceptanceCriteria: input.acceptanceCriteria }),
+        input.createdAt, input.missionId, token,
+      ),
+      this.db.prepare(`
+        INSERT INTO workflow_checkpoints
+          (id, mission_id, sequence, kind, workflow_version, scheduler_revision, change_version,
+           scheduler_state, payload_json, created_by, created_at)
+        SELECT ?, c.mission_id, c.checkpoint_sequence, 'change_request', m.workflow_version,
+          c.scheduler_revision, c.change_version, c.scheduler_state, ?, ?, ?
+        FROM mission_runtime_controls c JOIN missions m ON m.id = c.mission_id
+        WHERE c.mission_id = ? AND c.mutation_token = ?
+      `).bind(
+        `CHECKPOINT-${crypto.randomUUID()}`,
+        JSON.stringify({ changeRequestId: input.id, targetStageIds: input.targetStageIds, resetStageIds: resetIds }),
+        input.requestedBy, input.createdAt, input.missionId, token,
+      ),
+    );
+    const results = await this.db.batch(statements);
+    const mission = await this.getMission(input.missionId);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0 || !mission) {
+      return priorStageState.some((stage) => stage.status === 'running' && !expectedRunningIds.includes(stage.stageId)) && mission
+        ? { state: 'blocked_running_stage' as const, mission }
+        : { state: 'invalid' as const, mission };
+    }
+    const changeRequest = (await this.listMissionChangeRequests(input.missionId)).find((item) => item.id === input.id)!;
+    return { state: 'applied' as const, mission, changeRequest, schedulerRevision: mission.schedulerRevision };
+  }
+
+  async listMissionChangeRequests(missionId: string): Promise<MissionChangeRequest[]> {
+    const { results } = await this.db.prepare(`
+      SELECT * FROM mission_change_requests WHERE mission_id = ? ORDER BY version DESC
+    `).bind(missionId).all<Row>();
+    return results.map(mapMissionChangeRequest);
+  }
+
+  async listWorkflowCheckpoints(missionId: string, limit = 50): Promise<WorkflowCheckpoint[]> {
+    const { results } = await this.db.prepare(`
+      SELECT * FROM workflow_checkpoints WHERE mission_id = ? ORDER BY sequence DESC LIMIT ?
+    `).bind(missionId, Math.max(1, Math.min(200, limit))).all<Row>();
+    return results.map(mapWorkflowCheckpoint);
+  }
+
+  async listDirtyMissionControls(limit = 50): Promise<Array<{ missionId: string; schedulerRevision: number }>> {
+    const { results } = await this.db.prepare(`
+      SELECT c.mission_id, c.scheduler_revision
+      FROM mission_runtime_controls c JOIN missions m ON m.id = c.mission_id
+      JOIN escrows e ON e.mission_id = c.mission_id
+      WHERE c.scheduler_state = 'dirty' AND c.paused_at IS NULL
+        AND m.status IN ('running', 'review') AND m.cancelled_at IS NULL AND e.status = 'held'
+      ORDER BY c.updated_at ASC LIMIT ?
+    `).bind(Math.max(1, Math.min(200, limit))).all<Row>();
+    return results.map((row) => ({ missionId: text(row.mission_id), schedulerRevision: number(row.scheduler_revision) }));
+  }
+
+  async markMissionCheckpointClean(missionId: string, schedulerRevision: number, actorId: string | null, reconciledAt: string): Promise<boolean> {
+    const token = crypto.randomUUID();
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE mission_runtime_controls SET scheduler_state = 'clean', checkpoint_sequence = checkpoint_sequence + 1,
+          mutation_token = ?, updated_at = ?
+        WHERE mission_id = ? AND scheduler_revision = ? AND scheduler_state = 'dirty' AND paused_at IS NULL
+      `).bind(token, reconciledAt, missionId, schedulerRevision),
+      this.db.prepare(`
+        INSERT INTO workflow_checkpoints
+          (id, mission_id, sequence, kind, workflow_version, scheduler_revision, change_version,
+           scheduler_state, payload_json, created_by, created_at)
+        SELECT ?, c.mission_id, c.checkpoint_sequence, 'reconciled', m.workflow_version,
+          c.scheduler_revision, c.change_version, c.scheduler_state, '{}', ?, ?
+        FROM mission_runtime_controls c JOIN missions m ON m.id = c.mission_id
+        WHERE c.mission_id = ? AND c.mutation_token = ?
+      `).bind(`CHECKPOINT-${crypto.randomUUID()}`, actorId, reconciledAt, missionId, token),
+    ]);
+    return Number(results[0]?.meta?.changes ?? 0) > 0;
   }
 
   async acceptMission(id: string, actorId: string, releaseTxHash: string | null) {
@@ -1422,15 +1991,175 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async listStages(missionId: string): Promise<WorkflowStage[]> {
-    const { results } = await this.db.prepare('SELECT * FROM workflow_stages WHERE mission_id = ? ORDER BY position ASC').bind(missionId).all<Row>();
+    const { results } = await this.db.prepare(`
+      SELECT s.*, a.attempt_no AS current_attempt_no, a.input_json AS current_attempt_input_json,
+        a.created_at AS current_attempt_created_at
+      FROM workflow_stages s
+      LEFT JOIN workflow_stage_attempts a ON a.stage_id = s.id AND a.is_current = 1
+      WHERE s.mission_id = ? ORDER BY s.position ASC
+    `).bind(missionId).all<Row>();
     return results.map(mapStage);
   }
 
   async listEdges(missionId: string): Promise<WorkflowEdge[]> {
-    const { results } = await this.db.prepare(
-      'SELECT * FROM workflow_edges WHERE mission_id = ? ORDER BY created_at ASC, id ASC',
-    ).bind(missionId).all<Row>();
+    const { results } = await this.db.prepare(`
+      SELECT e.*, r.condition_json, r.mappings_json
+      FROM workflow_edges e LEFT JOIN workflow_edge_rules r ON r.edge_id = e.id
+      WHERE e.mission_id = ? ORDER BY e.created_at ASC, e.id ASC
+    `).bind(missionId).all<Row>();
     return results.map(mapEdge);
+  }
+
+  async recordWorkflowTransition(checkpoint: WorkflowTransitionCheckpoint): Promise<{ applied: boolean; checkpoint: WorkflowTransitionCheckpoint }> {
+    const result = await this.db.prepare(`
+      INSERT OR IGNORE INTO workflow_transition_checkpoints
+        (id, mission_id, edge_id, source_stage_id, target_stage_id, source_attempt_no,
+         workflow_version, matched, mapped_input_json, missing_required_json, error_code, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM workflow_edges e JOIN workflow_stages s ON s.id = e.source_stage_id
+        JOIN missions m ON m.id = e.mission_id
+        LEFT JOIN workflow_stage_attempts a ON a.stage_id = s.id AND a.is_current = 1
+        WHERE e.id = ? AND e.mission_id = ? AND e.source_stage_id = ? AND e.target_stage_id = ?
+          AND s.status = 'done' AND COALESCE(a.attempt_no, 1) = ? AND m.workflow_version = ?
+      )
+    `).bind(
+      checkpoint.id, checkpoint.missionId, checkpoint.edgeId, checkpoint.sourceStageId, checkpoint.targetStageId,
+      checkpoint.sourceAttemptNo, checkpoint.workflowVersion, checkpoint.matched ? 1 : 0,
+      JSON.stringify(checkpoint.mappedInput), JSON.stringify(checkpoint.missingRequired), checkpoint.errorCode, checkpoint.createdAt,
+      checkpoint.edgeId, checkpoint.missionId, checkpoint.sourceStageId, checkpoint.targetStageId,
+      checkpoint.sourceAttemptNo, checkpoint.workflowVersion,
+    ).run();
+    const row = await this.db.prepare(`
+      SELECT * FROM workflow_transition_checkpoints
+      WHERE mission_id = ? AND edge_id = ? AND source_attempt_no = ?
+    `).bind(checkpoint.missionId, checkpoint.edgeId, checkpoint.sourceAttemptNo).first<Row>();
+    if (!row) throw new Error('WORKFLOW_TRANSITION_CONFLICT');
+    return { applied: Number(result.meta.changes) > 0, checkpoint: mapWorkflowTransition(row) };
+  }
+
+  async listWorkflowTransitions(missionId: string, limit?: number): Promise<WorkflowTransitionCheckpoint[]> {
+    const statement = limit === undefined
+      ? this.db.prepare(`
+          SELECT * FROM workflow_transition_checkpoints
+          WHERE mission_id = ? ORDER BY created_at DESC, edge_id DESC
+        `).bind(missionId)
+      : this.db.prepare(`
+          SELECT * FROM workflow_transition_checkpoints
+          WHERE mission_id = ? ORDER BY created_at DESC, edge_id DESC LIMIT ?
+        `).bind(missionId, Math.max(1, Math.min(5_000, limit)));
+    const { results } = await statement.all<Row>();
+    return results.map(mapWorkflowTransition).reverse();
+  }
+
+  async listCurrentWorkflowTransitions(missionId: string): Promise<WorkflowTransitionCheckpoint[]> {
+    const { results } = await this.db.prepare(`
+      SELECT c.* FROM workflow_transition_checkpoints c
+      LEFT JOIN workflow_stage_attempts a
+        ON a.mission_id = c.mission_id AND a.stage_id = c.source_stage_id AND a.is_current = 1
+      WHERE c.mission_id = ? AND COALESCE(a.attempt_no, 1) = c.source_attempt_no
+      ORDER BY c.created_at ASC, c.edge_id ASC
+    `).bind(missionId).all<Row>();
+    return results.map(mapWorkflowTransition);
+  }
+
+  private async workflowTemplateDetail(ownerId: string, templateId: string, version?: number): Promise<WorkflowTemplateDetail | null> {
+    const row = await this.db.prepare(`
+      SELECT t.id AS template_id, t.owner_id, t.name, t.description, t.current_version,
+        t.created_at AS template_created_at, t.updated_at,
+        v.version, v.nodes_json, v.edges_json, v.entry_ids_json, v.exit_ids_json,
+        v.content_hash, v.created_at AS version_created_at
+      FROM workflow_templates t JOIN workflow_template_versions v ON v.template_id = t.id
+      WHERE t.id = ? AND t.owner_id = ? AND v.version = COALESCE(?, t.current_version)
+    `).bind(templateId, ownerId, version ?? null).first<Row>();
+    return row ? { template: mapWorkflowTemplate(row), version: mapWorkflowTemplateVersion(row) } : null;
+  }
+
+  async saveWorkflowTemplateVersion(input: {
+    id: string; ownerId: string; name: string; description: string; nodes: WorkflowStage[]; edges: WorkflowEdge[];
+    entryIds: string[]; exitIds: string[]; contentHash: string; createdAt: string;
+  }): Promise<WorkflowTemplateSaveResult> {
+    const existingTemplate = await this.db.prepare(`
+      SELECT * FROM workflow_templates WHERE owner_id = ? AND name = ?
+    `).bind(input.ownerId, input.name).first<Row>();
+    if (!existingTemplate) {
+      const results = await this.db.batch([
+        this.db.prepare(`
+          INSERT OR IGNORE INTO workflow_templates
+            (id, owner_id, name, description, current_version, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 1, ?, ?)
+        `).bind(input.id, input.ownerId, input.name, input.description, input.createdAt, input.createdAt),
+        this.db.prepare(`
+          INSERT INTO workflow_template_versions
+            (template_id, version, nodes_json, edges_json, entry_ids_json, exit_ids_json, content_hash, created_at)
+          SELECT ?, 1, ?, ?, ?, ?, ?, ?
+          WHERE EXISTS (SELECT 1 FROM workflow_templates WHERE id = ? AND owner_id = ? AND current_version = 1)
+        `).bind(
+          input.id, JSON.stringify(input.nodes), JSON.stringify(input.edges), JSON.stringify(input.entryIds),
+          JSON.stringify(input.exitIds), input.contentHash, input.createdAt, input.id, input.ownerId,
+        ),
+      ]);
+      if (Number(results[0]?.meta?.changes ?? 0) === 0) {
+        const raced = await this.db.prepare('SELECT id FROM workflow_templates WHERE owner_id = ? AND name = ?')
+          .bind(input.ownerId, input.name).first<Row>();
+        return { state: 'conflict', detail: raced ? await this.workflowTemplateDetail(input.ownerId, text(raced.id)) : null };
+      }
+      return { state: 'saved', detail: (await this.workflowTemplateDetail(input.ownerId, input.id))! };
+    }
+
+    const templateId = text(existingTemplate.id);
+    const expectedVersion = number(existingTemplate.current_version);
+    const current = await this.workflowTemplateDetail(input.ownerId, templateId, expectedVersion);
+    if (current?.version.contentHash === input.contentHash && current.template.description === input.description) {
+      return { state: 'unchanged', detail: current };
+    }
+    const nextVersion = expectedVersion + 1;
+    try {
+      const results = await this.db.batch([
+        this.db.prepare(`
+          UPDATE workflow_templates SET current_version = ?, description = ?, updated_at = ?
+          WHERE id = ? AND owner_id = ? AND current_version = ?
+        `).bind(nextVersion, input.description, input.createdAt, templateId, input.ownerId, expectedVersion),
+        this.db.prepare(`
+          INSERT INTO workflow_template_versions
+            (template_id, version, nodes_json, edges_json, entry_ids_json, exit_ids_json, content_hash, created_at)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM workflow_templates WHERE id = ? AND owner_id = ? AND current_version = ?
+          )
+        `).bind(
+          templateId, nextVersion, JSON.stringify(input.nodes), JSON.stringify(input.edges), JSON.stringify(input.entryIds),
+          JSON.stringify(input.exitIds), input.contentHash, input.createdAt, templateId, input.ownerId, nextVersion,
+        ),
+      ]);
+      if (Number(results[0]?.meta?.changes ?? 0) === 0) {
+        return { state: 'conflict', detail: await this.workflowTemplateDetail(input.ownerId, templateId) };
+      }
+      return { state: 'saved', detail: (await this.workflowTemplateDetail(input.ownerId, templateId, nextVersion))! };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/unique|constraint/i.test(message)) {
+        return { state: 'conflict', detail: await this.workflowTemplateDetail(input.ownerId, templateId) };
+      }
+      throw error;
+    }
+  }
+
+  async listWorkflowTemplates(ownerId: string): Promise<WorkflowTemplateDetail[]> {
+    const { results } = await this.db.prepare(`
+      SELECT t.id AS template_id, t.owner_id, t.name, t.description, t.current_version,
+        t.created_at AS template_created_at, t.updated_at,
+        v.version, v.nodes_json, v.edges_json, v.entry_ids_json, v.exit_ids_json,
+        v.content_hash, v.created_at AS version_created_at
+      FROM workflow_templates t JOIN workflow_template_versions v
+        ON v.template_id = t.id AND v.version = t.current_version
+      WHERE t.owner_id = ? ORDER BY t.updated_at DESC, t.id ASC
+    `).bind(ownerId).all<Row>();
+    return results.map((row) => ({ template: mapWorkflowTemplate(row), version: mapWorkflowTemplateVersion(row) }));
+  }
+
+  async getWorkflowTemplate(ownerId: string, templateId: string, version?: number): Promise<WorkflowTemplateDetail | null> {
+    return this.workflowTemplateDetail(ownerId, templateId, version);
   }
 
   async listStageOffers(missionId: string, now = new Date().toISOString()): Promise<StageOffer[]> {
@@ -1481,7 +2210,8 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async claimStageForDispatch(missionId: string, stageId: string): Promise<WorkflowStage | null> {
-    const row = await this.db.prepare(`
+    const claimedAt = new Date().toISOString();
+    const results = await this.db.batch([this.db.prepare(`
       UPDATE workflow_stages SET status = 'running', progress = MAX(progress, 1), updated_at = datetime('now')
       WHERE id = ? AND mission_id = ? AND status IN ('queued', 'failed') AND node_type = 'task' AND agent_id IS NOT NULL
         AND EXISTS (
@@ -1490,15 +2220,46 @@ export class D1PlatformStore implements PlatformStore {
             AND m.cancelled_at IS NULL AND e.status = 'held'
         )
         AND NOT EXISTS (
+          SELECT 1 FROM mission_runtime_controls c
+          WHERE c.mission_id = workflow_stages.mission_id AND c.paused_at IS NOT NULL
+        )
+        AND NOT EXISTS (
           SELECT 1 FROM workflow_edges edge
           JOIN workflow_stages source ON source.id = edge.source_stage_id
           WHERE edge.mission_id = workflow_stages.mission_id
             AND edge.target_stage_id = workflow_stages.id
             AND source.status <> 'done'
         )
-      RETURNING *
-    `).bind(stageId, missionId).first<Row>();
-    return row ? mapStage(row) : null;
+        AND NOT EXISTS (
+          SELECT 1 FROM workflow_transition_checkpoints checkpoint
+          JOIN workflow_stages source ON source.id = checkpoint.source_stage_id
+          LEFT JOIN workflow_stage_attempts attempt ON attempt.stage_id = source.id AND attempt.is_current = 1
+          WHERE checkpoint.mission_id = workflow_stages.mission_id
+            AND checkpoint.target_stage_id = workflow_stages.id
+            AND checkpoint.error_code IS NOT NULL
+            AND checkpoint.source_attempt_no = COALESCE(attempt.attempt_no, 1)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM workflow_edges edge
+          JOIN workflow_edge_rules rule ON rule.edge_id = edge.id
+          JOIN workflow_stages source ON source.id = edge.source_stage_id
+          LEFT JOIN workflow_stage_attempts attempt ON attempt.stage_id = source.id AND attempt.is_current = 1
+          LEFT JOIN workflow_transition_checkpoints checkpoint
+            ON checkpoint.mission_id = edge.mission_id
+           AND checkpoint.edge_id = edge.id
+           AND checkpoint.source_attempt_no = COALESCE(attempt.attempt_no, 1)
+          WHERE edge.mission_id = workflow_stages.mission_id
+            AND edge.target_stage_id = workflow_stages.id
+            AND (rule.condition_json IS NOT NULL OR rule.mappings_json <> '[]')
+            AND checkpoint.id IS NULL
+        )
+    `).bind(stageId, missionId), this.db.prepare(`
+      UPDATE workflow_stage_attempts SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+      WHERE stage_id = ? AND mission_id = ? AND is_current = 1
+        AND EXISTS (SELECT 1 FROM workflow_stages WHERE id = ? AND mission_id = ? AND status = 'running')
+    `).bind(claimedAt, claimedAt, stageId, missionId, stageId, missionId)]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
+    return (await this.listStages(missionId)).find((stage) => stage.id === stageId) ?? null;
   }
 
   async resetStageDispatch(missionId: string, stageId: string): Promise<void> {
@@ -1514,7 +2275,8 @@ export class D1PlatformStore implements PlatformStore {
       WHERE id = ? AND mission_id = ? AND status = 'running'
       RETURNING *
     `).bind(progress, stageId, missionId).first<Row>();
-    return row ? mapStage(row) : null;
+    if (!row) return null;
+    return (await this.listStages(missionId)).find((stage) => stage.id === stageId) ?? null;
   }
 
   async resetWorkflowNodes(missionId: string, stageIds: string[], gateId?: string): Promise<void> {
@@ -1540,14 +2302,37 @@ export class D1PlatformStore implements PlatformStore {
     await this.db.batch(stageIds.map((stageId) => this.db.prepare(`
       INSERT INTO workflow_dispatch_outbox
         (id, mission_id, stage_id, run_id, expires_at, status, attempts, next_attempt_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+      SELECT ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+        WHERE m.id = ? AND m.status = 'running' AND m.cancelled_at IS NULL AND e.status = 'held'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM mission_runtime_controls c WHERE c.mission_id = ? AND c.paused_at IS NOT NULL
+      )
       ON CONFLICT(mission_id, stage_id) DO UPDATE SET
-        status = CASE WHEN workflow_dispatch_outbox.status = 'done' THEN 'pending' ELSE workflow_dispatch_outbox.status END,
-        run_id = CASE WHEN workflow_dispatch_outbox.status = 'done' THEN excluded.run_id ELSE workflow_dispatch_outbox.run_id END,
-        expires_at = CASE WHEN workflow_dispatch_outbox.status = 'done' THEN excluded.expires_at ELSE workflow_dispatch_outbox.expires_at END,
+        status = CASE
+          WHEN workflow_dispatch_outbox.status = 'done'
+            OR (workflow_dispatch_outbox.status = 'pending'
+              AND julianday(workflow_dispatch_outbox.expires_at) <= julianday(excluded.next_attempt_at))
+          THEN 'pending' ELSE workflow_dispatch_outbox.status END,
+        run_id = CASE
+          WHEN workflow_dispatch_outbox.status = 'done'
+            OR (workflow_dispatch_outbox.status = 'pending'
+              AND julianday(workflow_dispatch_outbox.expires_at) <= julianday(excluded.next_attempt_at))
+          THEN excluded.run_id ELSE workflow_dispatch_outbox.run_id END,
+        expires_at = CASE
+          WHEN workflow_dispatch_outbox.status = 'done'
+            OR (workflow_dispatch_outbox.status = 'pending'
+              AND julianday(workflow_dispatch_outbox.expires_at) <= julianday(excluded.next_attempt_at))
+          THEN excluded.expires_at ELSE workflow_dispatch_outbox.expires_at END,
+        attempts = CASE
+          WHEN workflow_dispatch_outbox.status = 'done'
+            OR (workflow_dispatch_outbox.status = 'pending'
+              AND julianday(workflow_dispatch_outbox.expires_at) <= julianday(excluded.next_attempt_at))
+          THEN 0 ELSE workflow_dispatch_outbox.attempts END,
         next_attempt_at = excluded.next_attempt_at,
         updated_at = excluded.updated_at
-    `).bind(`OUTBOX-${crypto.randomUUID()}`, missionId, stageId, crypto.randomUUID(), expiresAt, now, now, now)));
+    `).bind(`OUTBOX-${crypto.randomUUID()}`, missionId, stageId, crypto.randomUUID(), expiresAt, now, now, now, missionId, missionId)));
     const { results } = await this.db.prepare(`
       SELECT * FROM workflow_dispatch_outbox
       WHERE mission_id = ? AND stage_id IN (${stageIds.map(() => '?').join(',')})
@@ -1556,14 +2341,87 @@ export class D1PlatformStore implements PlatformStore {
     return results.map(mapDispatchOutbox);
   }
 
+  async recoverExpiredStageDispatches(missionId: string, now: string): Promise<string[]> {
+    const { results: candidates } = await this.db.prepare(`
+      SELECT s.id AS stage_id, a.run_id
+      FROM workflow_stages s
+      JOIN workflow_stage_attempts a
+        ON a.mission_id = s.mission_id AND a.stage_id = s.id AND a.is_current = 1
+      JOIN agent_dispatches d ON d.run_id = a.run_id
+      JOIN missions m ON m.id = s.mission_id
+      JOIN escrows e ON e.mission_id = s.mission_id
+      WHERE s.mission_id = ? AND s.status = 'running' AND a.status = 'running'
+        AND d.completed_at IS NULL AND julianday(d.expires_at) <= julianday(?)
+        AND m.status = 'running' AND m.cancelled_at IS NULL AND e.status = 'held'
+        AND NOT EXISTS (
+          SELECT 1 FROM mission_runtime_controls c
+          WHERE c.mission_id = s.mission_id AND c.paused_at IS NOT NULL
+        )
+      ORDER BY s.position ASC
+    `).bind(missionId, now).all<Row>();
+    const recovered: string[] = [];
+    for (const candidate of candidates) {
+      const stageId = text(candidate.stage_id);
+      const runId = text(candidate.run_id);
+      const results = await this.db.batch([
+        this.db.prepare(`
+          UPDATE workflow_stages SET status = 'queued', progress = 0, output_json = NULL, updated_at = ?
+          WHERE id = ? AND mission_id = ? AND status = 'running'
+            AND EXISTS (
+              SELECT 1 FROM workflow_stage_attempts a JOIN agent_dispatches d ON d.run_id = a.run_id
+              WHERE a.mission_id = workflow_stages.mission_id AND a.stage_id = workflow_stages.id
+                AND a.is_current = 1 AND a.status = 'running' AND a.run_id = ?
+                AND d.completed_at IS NULL AND julianday(d.expires_at) <= julianday(?)
+            )
+        `).bind(now, stageId, missionId, runId, now),
+        this.db.prepare(`
+          UPDATE workflow_stage_attempts
+          SET status = 'queued', run_id = NULL, output_json = NULL, started_at = NULL,
+            completed_at = NULL, updated_at = ?
+          WHERE mission_id = ? AND stage_id = ? AND is_current = 1 AND status = 'running' AND run_id = ?
+            AND EXISTS (
+              SELECT 1 FROM workflow_stages s
+              WHERE s.mission_id = workflow_stage_attempts.mission_id
+                AND s.id = workflow_stage_attempts.stage_id AND s.status = 'queued'
+            )
+        `).bind(now, missionId, stageId, runId),
+        this.db.prepare(`
+          UPDATE agent_dispatches SET completed_at = ?
+          WHERE run_id = ? AND mission_id = ? AND stage_id = ? AND completed_at IS NULL
+            AND EXISTS (
+              SELECT 1 FROM workflow_stage_attempts a
+              WHERE a.mission_id = ? AND a.stage_id = ? AND a.is_current = 1
+                AND a.status = 'queued' AND a.run_id IS NULL
+            )
+        `).bind(now, runId, missionId, stageId, missionId, stageId),
+        this.db.prepare(`
+          UPDATE workflow_dispatch_outbox SET status = 'done', updated_at = ?
+          WHERE mission_id = ? AND stage_id = ? AND run_id = ?
+        `).bind(now, missionId, stageId, runId),
+      ]);
+      if (Number(results[0]?.meta?.changes ?? 0) > 0 && Number(results[1]?.meta?.changes ?? 0) > 0) {
+        recovered.push(stageId);
+      }
+    }
+    return recovered;
+  }
+
   async listPendingDispatches(limit: number, now: string): Promise<DispatchOutboxItem[]> {
     await this.db.prepare(`
       UPDATE workflow_dispatch_outbox SET status = 'pending', next_attempt_at = ?, updated_at = ?
       WHERE status = 'processing' AND julianday(updated_at) <= julianday(?, '-2 minutes')
+        AND NOT EXISTS (
+          SELECT 1 FROM mission_runtime_controls c
+          WHERE c.mission_id = workflow_dispatch_outbox.mission_id AND c.paused_at IS NOT NULL
+        )
     `).bind(now, now, now).run();
     const { results } = await this.db.prepare(`
       SELECT * FROM workflow_dispatch_outbox
       WHERE status = 'pending' AND julianday(next_attempt_at) <= julianday(?)
+        AND NOT EXISTS (
+          SELECT 1 FROM mission_runtime_controls c
+          WHERE c.mission_id = workflow_dispatch_outbox.mission_id AND c.paused_at IS NOT NULL
+        )
       ORDER BY next_attempt_at ASC, created_at ASC LIMIT ?
     `).bind(now, limit).all<Row>();
     return results.map(mapDispatchOutbox);
@@ -1573,6 +2431,15 @@ export class D1PlatformStore implements PlatformStore {
     const result = await this.db.prepare(`
       UPDATE workflow_dispatch_outbox SET status = 'processing', attempts = attempts + 1, updated_at = ?
       WHERE id = ? AND status = 'pending' AND julianday(next_attempt_at) <= julianday(?)
+        AND EXISTS (
+          SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+          WHERE m.id = workflow_dispatch_outbox.mission_id AND m.status = 'running'
+            AND m.cancelled_at IS NULL AND e.status = 'held'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM mission_runtime_controls c
+          WHERE c.mission_id = workflow_dispatch_outbox.mission_id AND c.paused_at IS NOT NULL
+        )
     `).bind(now, id, now).run();
     return Number(result.meta.changes ?? 0) > 0;
   }
@@ -1590,14 +2457,73 @@ export class D1PlatformStore implements PlatformStore {
     status: WorkflowStage['status'],
     output?: Record<string, unknown> | null,
   ): Promise<WorkflowStage | null> {
-    await this.db.prepare(`
+    const updatedAt = new Date().toISOString();
+    await this.db.batch([this.db.prepare(`
       UPDATE workflow_stages
       SET status = ?, progress = CASE WHEN ? = 'done' THEN 100 WHEN ? = 'queued' THEN 0 ELSE progress END,
-        output_json = CASE WHEN ? = 1 THEN ? ELSE output_json END, updated_at = datetime('now')
+        output_json = CASE WHEN ? = 1 THEN ? ELSE output_json END, updated_at = ?
       WHERE id = ? AND mission_id = ?
-    `).bind(status, status, status, output === undefined ? 0 : 1, output === undefined ? null : JSON.stringify(output), stageId, missionId).run();
-    const row = await this.db.prepare('SELECT * FROM workflow_stages WHERE id = ? AND mission_id = ?').bind(stageId, missionId).first<Row>();
-    return row ? mapStage(row) : null;
+    `).bind(status, status, status, output === undefined ? 0 : 1, output === undefined ? null : JSON.stringify(output), updatedAt, stageId, missionId), this.db.prepare(`
+      UPDATE workflow_stage_attempts SET status = ?,
+        output_json = CASE WHEN ? = 1 THEN ? ELSE output_json END,
+        started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
+        completed_at = CASE WHEN ? IN ('done', 'failed') THEN ? ELSE completed_at END,
+        updated_at = ?
+      WHERE stage_id = ? AND mission_id = ? AND is_current = 1
+    `).bind(
+      status, output === undefined ? 0 : 1, output === undefined ? null : JSON.stringify(output),
+      status, updatedAt, status, updatedAt, updatedAt, stageId, missionId,
+    )]);
+    return (await this.listStages(missionId)).find((stage) => stage.id === stageId) ?? null;
+  }
+
+  async transitionStage(
+    missionId: string,
+    stageId: string,
+    expectedStatus: WorkflowStage['status'],
+    status: WorkflowStage['status'],
+    output?: Record<string, unknown> | null,
+  ): Promise<WorkflowStage | null> {
+    const transitionedAt = new Date().toISOString();
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE workflow_stages
+        SET status = ?, progress = CASE WHEN ? = 'done' THEN 100 WHEN ? = 'queued' THEN 0 ELSE progress END,
+          output_json = CASE WHEN ? = 1 THEN ? ELSE output_json END, updated_at = ?
+        WHERE id = ? AND mission_id = ? AND status = ?
+          AND EXISTS (
+            SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+            WHERE m.id = workflow_stages.mission_id AND m.status = 'running'
+              AND m.cancelled_at IS NULL AND e.status = 'held'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM mission_runtime_controls c
+            WHERE c.mission_id = workflow_stages.mission_id AND c.paused_at IS NOT NULL
+          )
+      `).bind(
+        status, status, status, output === undefined ? 0 : 1,
+        output === undefined ? null : JSON.stringify(output), transitionedAt,
+        stageId, missionId, expectedStatus,
+      ),
+      this.db.prepare(`
+        UPDATE workflow_stage_attempts SET status = ?,
+          output_json = CASE WHEN ? = 1 THEN ? ELSE output_json END,
+          started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
+          completed_at = CASE WHEN ? IN ('done', 'failed') THEN ? ELSE completed_at END,
+          updated_at = ?
+        WHERE stage_id = ? AND mission_id = ? AND is_current = 1
+          AND EXISTS (
+            SELECT 1 FROM workflow_stages
+            WHERE id = ? AND mission_id = ? AND status = ? AND updated_at = ?
+          )
+      `).bind(
+        status, output === undefined ? 0 : 1, output === undefined ? null : JSON.stringify(output),
+        status, transitionedAt, status, transitionedAt, transitionedAt,
+        stageId, missionId, stageId, missionId, status, transitionedAt,
+      ),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
+    return (await this.listStages(missionId)).find((stage) => stage.id === stageId) ?? null;
   }
 
   async transitionRunningStage(
@@ -1620,7 +2546,18 @@ export class D1PlatformStore implements PlatformStore {
             WHERE m.id = workflow_stages.mission_id AND m.status = 'running'
               AND m.cancelled_at IS NULL AND e.status = 'held'
           )
-      `).bind(status, status, output === undefined ? 0 : 1, output === undefined ? null : JSON.stringify(output), transitionedAt, stageId, missionId)];
+      `).bind(status, status, output === undefined ? 0 : 1, output === undefined ? null : JSON.stringify(output), transitionedAt, stageId, missionId),
+      this.db.prepare(`
+        UPDATE workflow_stage_attempts SET status = ?,
+          output_json = CASE WHEN ? = 1 THEN ? ELSE output_json END,
+          completed_at = CASE WHEN ? IN ('done', 'failed') THEN ? ELSE completed_at END,
+          updated_at = ?
+        WHERE stage_id = ? AND mission_id = ? AND is_current = 1
+          AND EXISTS (SELECT 1 FROM workflow_stages WHERE id = ? AND mission_id = ? AND status = ? AND updated_at = ?)
+      `).bind(
+        status, output === undefined ? 0 : 1, output === undefined ? null : JSON.stringify(output),
+        status, transitionedAt, transitionedAt, stageId, missionId, stageId, missionId, status, transitionedAt,
+      )];
     if (agentId && (status === 'done' || status === 'failed')) {
       statements.push(
         this.db.prepare(`
@@ -1633,9 +2570,7 @@ export class D1PlatformStore implements PlatformStore {
     }
     const results = await this.db.batch(statements);
     if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
-    const row = await this.db.prepare('SELECT * FROM workflow_stages WHERE id = ? AND mission_id = ?')
-      .bind(stageId, missionId).first<Row>();
-    return row ? mapStage(row) : null;
+    return (await this.listStages(missionId)).find((stage) => stage.id === stageId) ?? null;
   }
 
   async addEvent(event: ExecutionEvent, progress?: number, currentStage?: string, stageGuard?: WorkflowStage['status']): Promise<ExecutionEvent> {
@@ -1679,15 +2614,30 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async addDeliverable(deliverable: Deliverable): Promise<Deliverable> {
-    await this.db.prepare(`
-      INSERT INTO deliverables (id, mission_id, stage_id, agent_id, name, uri, content_hash, mime_type, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    let attemptNo = deliverable.stageId ? deliverable.attemptNo ?? null : null;
+    if (deliverable.stageId && attemptNo === null) {
+      const row = await this.db.prepare(`
+        SELECT attempt_no FROM workflow_stage_attempts
+        WHERE mission_id = ? AND stage_id = ? AND is_current = 1
+      `).bind(deliverable.missionId, deliverable.stageId).first<Row>();
+      attemptNo = row ? number(row.attempt_no) : null;
+    }
+    const result = await this.db.prepare(`
+      INSERT INTO deliverables
+        (id, mission_id, stage_id, attempt_no, agent_id, name, uri, content_hash, mime_type, status, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ? IS NULL OR EXISTS (
+        SELECT 1 FROM workflow_stage_attempts
+        WHERE mission_id = ? AND stage_id = ? AND attempt_no = ? AND is_current = 1
+      )
     `).bind(
-      deliverable.id, deliverable.missionId, deliverable.stageId, deliverable.agentId,
+      deliverable.id, deliverable.missionId, deliverable.stageId, attemptNo, deliverable.agentId,
       deliverable.name, deliverable.uri, deliverable.contentHash, deliverable.mimeType,
       deliverable.status, deliverable.createdAt,
+      deliverable.stageId, deliverable.missionId, deliverable.stageId, attemptNo,
     ).run();
-    return deliverable;
+    if (Number(result.meta.changes ?? 0) === 0) throw new Error('STALE_STAGE_ATTEMPT');
+    return { ...deliverable, attemptNo };
   }
 
   async listDeliverables(missionId: string): Promise<Deliverable[]> {
@@ -1743,8 +2693,8 @@ export class D1PlatformStore implements PlatformStore {
       LEFT JOIN agents a ON a.id = s.agent_id
       WHERE m.requester_id = ? OR a.owner_id = ?
         OR EXISTS (
-          SELECT 1 FROM dispute_proposals dp
-          JOIN dispute_electorate de ON de.proposal_id = dp.id
+          SELECT 1 FROM dispute_proposal_rounds dp
+          JOIN dispute_round_electorate de ON de.proposal_id = dp.id
           WHERE dp.dispute_id = d.id AND de.user_id = ?
         )
       ORDER BY d.created_at DESC LIMIT 200
@@ -1769,13 +2719,18 @@ export class D1PlatformStore implements PlatformStore {
     return dispute;
   }
 
-  async startDisputeReview(id: string, actorId: string, startedAt = new Date().toISOString()): Promise<Dispute | null> {
+  async startDisputeReview(
+    id: string,
+    actorId: string,
+    startedAt = new Date().toISOString(),
+    weightMode: ArbitrationProposal['weightMode'] = 'one_person_one_vote',
+  ): Promise<Dispute | null> {
     const existingRow = await this.db.prepare('SELECT * FROM disputes WHERE id = ?').bind(id).first<Row>();
     if (!existingRow) return null;
     const existing = mapDispute(existingRow);
     if (!['open', 'reviewing'].includes(existing.status)) return existing;
 
-    const proposalRow = await this.db.prepare('SELECT * FROM dispute_proposals WHERE dispute_id = ?').bind(id).first<Row>();
+    const proposalRow = await this.db.prepare('SELECT * FROM dispute_proposal_rounds WHERE dispute_id = ? ORDER BY round DESC LIMIT 1').bind(id).first<Row>();
     if (proposalRow) {
       if (existing.status === 'open') {
         await this.db.prepare("UPDATE disputes SET status = 'reviewing' WHERE id = ? AND status = 'open'").bind(id).run();
@@ -1803,30 +2758,39 @@ export class D1PlatformStore implements PlatformStore {
     if (electorateRows.length === 0) throw new Error('ARBITRATION_NO_ELIGIBLE_MEMBERS');
 
     const proposalId = `PROP-${crypto.randomUUID()}`;
-    const eligibleWeight = electorateRows.length;
+    const electorate = electorateRows.map((row) => ({
+      userId: text(row.user_id),
+      power: Math.max(1, number(row.power)),
+      voteWeight: arbitrationVoteWeight(weightMode, number(row.power)),
+    }));
+    const eligibleWeight = electorate.reduce((sum, member) => sum + member.voteWeight, 0);
     const votingEndsAt = arbitrationVotingEndsAt(startedAt);
     const actionId = `${id}:review_started`;
     const statements = [
       this.db.prepare(`
-        INSERT INTO dispute_proposals
-          (id, dispute_id, proposer_id, status, weight_mode, voting_starts_at, voting_ends_at,
+        INSERT INTO dispute_proposal_rounds
+          (id, dispute_id, round, parent_proposal_id, proposer_id, appeal_reason, appeal_deadline_at,
+           status, weight_mode, weight_version, voting_starts_at, voting_ends_at,
            quorum_required, eligible_weight, support_votes, oppose_votes, abstain_votes, created_at)
-        VALUES (?, ?, ?, 'active', 'one_person_one_vote', ?, ?, ?, ?, 0, 0, 0, ?)
-      `).bind(proposalId, id, actorId, startedAt, votingEndsAt, arbitrationQuorum(eligibleWeight), eligibleWeight, startedAt),
-      ...electorateRows.map((row) => this.db.prepare(`
-        INSERT INTO dispute_electorate (proposal_id, user_id, power_snapshot, vote_weight, created_at)
-        VALUES (?, ?, ?, 1, ?)
-      `).bind(proposalId, text(row.user_id), Math.max(1, number(row.power)), startedAt)),
+        VALUES (?, ?, 0, NULL, ?, NULL, NULL, 'active', ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+      `).bind(
+        proposalId, id, actorId, weightMode, arbitrationWeightVersion(weightMode), startedAt, votingEndsAt,
+        arbitrationQuorum(eligibleWeight), eligibleWeight, startedAt,
+      ),
+      ...electorate.map((member) => this.db.prepare(`
+        INSERT INTO dispute_round_electorate (proposal_id, user_id, power_snapshot, vote_weight, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(proposalId, member.userId, member.power, member.voteWeight, startedAt)),
       this.db.prepare("UPDATE disputes SET status = 'reviewing' WHERE id = ? AND status IN ('open', 'reviewing')").bind(id),
       this.db.prepare(`
         INSERT OR IGNORE INTO dispute_actions (id, dispute_id, actor_id, action, note, created_at)
         VALUES (?, ?, ?, 'review_started', ?, ?)
-      `).bind(actionId, id, actorId, `DAO proposal ${proposalId} created with ${eligibleWeight} eligible voters`, startedAt),
+      `).bind(actionId, id, actorId, `DAO proposal ${proposalId} created in ${weightMode} mode with ${eligibleWeight} eligible weight`, startedAt),
     ];
     try {
       await this.db.batch(statements);
     } catch (error) {
-      const concurrent = await this.db.prepare('SELECT id FROM dispute_proposals WHERE dispute_id = ?').bind(id).first<Row>();
+      const concurrent = await this.db.prepare('SELECT id FROM dispute_proposal_rounds WHERE dispute_id = ? AND round = 0').bind(id).first<Row>();
       if (!concurrent) throw error;
     }
     const row = await this.db.prepare('SELECT * FROM disputes WHERE id = ?').bind(id).first<Row>();
@@ -1834,33 +2798,67 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async getDisputeGovernance(id: string, userId: string, now = new Date().toISOString()): Promise<DisputeGovernance | null> {
-    const dispute = await this.db.prepare('SELECT id FROM disputes WHERE id = ?').bind(id).first<Row>();
+    const dispute = await this.db.prepare(`
+      SELECT d.*, m.requester_id,
+        CASE WHEN d.opened_by = ? OR m.requester_id = ? OR EXISTS (
+          SELECT 1 FROM workflow_stages s JOIN agents a ON a.id = s.agent_id
+          WHERE s.mission_id = d.mission_id AND a.owner_id = ?
+        ) THEN 1 ELSE 0 END AS is_party
+      FROM disputes d JOIN missions m ON m.id = d.mission_id WHERE d.id = ?
+    `).bind(userId, userId, userId, id).first<Row>();
     if (!dispute) return null;
-    const proposalRow = await this.db.prepare('SELECT * FROM dispute_proposals WHERE dispute_id = ?').bind(id).first<Row>();
-    if (!proposalRow) {
-      return { proposal: null, electorate: [], votes: [], currentUser: { eligible: false, canVote: false, hasVoted: false, choice: null } };
+    const { results: proposalRows } = await this.db.prepare(
+      'SELECT * FROM dispute_proposal_rounds WHERE dispute_id = ? ORDER BY round ASC',
+    ).bind(id).all<Row>();
+    if (proposalRows.length === 0) {
+      return {
+        proposal: null, electorate: [], votes: [], rounds: [], execution: null, executionReady: false,
+        appeal: { used: false, deadlineAt: null, canAppeal: false, reason: null, appellantId: null, createdAt: null },
+        currentUser: { eligible: false, canVote: false, hasVoted: false, choice: null },
+      };
     }
-    const proposal = mapArbitrationProposal(proposalRow);
-    const [{ results: electorateRows }, { results: voteRows }] = await Promise.all([
-      this.db.prepare(`
-        SELECT e.*, p.display_name
-        FROM dispute_electorate e JOIN profiles p ON p.id = e.user_id
-        WHERE e.proposal_id = ? ORDER BY p.display_name ASC, e.user_id ASC
-      `).bind(proposal.id).all<Row>(),
-      this.db.prepare(`
-        SELECT v.*, p.display_name
-        FROM dispute_votes v JOIN profiles p ON p.id = v.voter_id
-        WHERE v.proposal_id = ? ORDER BY v.created_at ASC, v.id ASC
-      `).bind(proposal.id).all<Row>(),
-    ]);
-    const electorate = electorateRows.map(mapArbitrationElector);
-    const votes = voteRows.map(mapDisputeVote);
+    const rounds = await Promise.all(proposalRows.map(async (proposalRow) => {
+      const proposal = mapArbitrationProposal(proposalRow);
+      const [{ results: electorateRows }, { results: voteRows }] = await Promise.all([
+        this.db.prepare(`
+          SELECT e.*, p.display_name
+          FROM dispute_round_electorate e JOIN profiles p ON p.id = e.user_id
+          WHERE e.proposal_id = ? ORDER BY p.display_name ASC, e.user_id ASC
+        `).bind(proposal.id).all<Row>(),
+        this.db.prepare(`
+          SELECT v.*, p.display_name
+          FROM dispute_round_votes v JOIN profiles p ON p.id = v.voter_id
+          WHERE v.proposal_id = ? ORDER BY v.created_at ASC, v.id ASC
+        `).bind(proposal.id).all<Row>(),
+      ]);
+      return { proposal, electorate: electorateRows.map(mapArbitrationElector), votes: voteRows.map(mapDisputeVote) };
+    }));
+    const currentRound = rounds.at(-1)!;
+    const { proposal, electorate, votes } = currentRound;
     const eligible = electorate.some((item) => item.userId === userId);
     const currentVote = votes.find((item) => item.voterId === userId);
+    const initial = rounds[0]?.proposal ?? null;
+    const appealProposal = rounds.find((round) => round.proposal.round === 1)?.proposal ?? null;
+    const executionRow = await this.db.prepare(
+      "SELECT * FROM governance_execution_queue WHERE scope = 'task_dispute' AND source_id = ?",
+    ).bind(id).first<Row>();
     return {
       proposal,
       electorate,
       votes,
+      rounds,
+      appeal: {
+        used: Boolean(appealProposal),
+        deadlineAt: initial?.appealDeadlineAt ?? null,
+        canAppeal: !appealProposal && initial?.status !== 'active' && initial?.status !== 'executed'
+          && !executionRow && Boolean(initial?.appealDeadlineAt)
+          && Date.parse(now) < Date.parse(initial!.appealDeadlineAt!) && boolean(dispute.is_party),
+        reason: appealProposal?.appealReason ?? null,
+        appellantId: appealProposal?.proposerId ?? null,
+        createdAt: appealProposal?.createdAt ?? null,
+      },
+      execution: executionRow ? mapGovernanceExecution(executionRow) : null,
+      executionReady: arbitrationExecutionReady(proposal, Boolean(appealProposal), now),
       currentUser: {
         eligible,
         canVote: eligible && !currentVote && proposal.status === 'active'
@@ -1887,17 +2885,17 @@ export class D1PlatformStore implements PlatformStore {
     const abstain = choice === 'abstain' ? elector.voteWeight : 0;
     const results = await this.db.batch([
         this.db.prepare(`
-          INSERT INTO dispute_votes (id, proposal_id, voter_id, choice, reason, vote_weight, created_at)
+          INSERT INTO dispute_round_votes (id, proposal_id, voter_id, choice, reason, vote_weight, created_at)
           SELECT ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (
-            SELECT 1 FROM dispute_proposals
+            SELECT 1 FROM dispute_proposal_rounds
             WHERE id = ? AND status = 'active'
               AND julianday(voting_starts_at) <= julianday(?)
               AND julianday(voting_ends_at) > julianday(?)
           ) AND EXISTS (
-            SELECT 1 FROM dispute_electorate WHERE proposal_id = ? AND user_id = ?
+            SELECT 1 FROM dispute_round_electorate WHERE proposal_id = ? AND user_id = ?
           ) AND NOT EXISTS (
-            SELECT 1 FROM dispute_votes WHERE proposal_id = ? AND voter_id = ?
+            SELECT 1 FROM dispute_round_votes WHERE proposal_id = ? AND voter_id = ?
           )
         `).bind(
           voteId, governance.proposal.id, voterId, choice, reason, elector.voteWeight, votedAt,
@@ -1906,10 +2904,10 @@ export class D1PlatformStore implements PlatformStore {
           governance.proposal.id, voterId,
         ),
         this.db.prepare(`
-          UPDATE dispute_proposals
+          UPDATE dispute_proposal_rounds
           SET support_votes = support_votes + ?, oppose_votes = oppose_votes + ?, abstain_votes = abstain_votes + ?
           WHERE id = ? AND status = 'active'
-            AND EXISTS (SELECT 1 FROM dispute_votes WHERE id = ?)
+            AND EXISTS (SELECT 1 FROM dispute_round_votes WHERE id = ?)
         `).bind(support, oppose, abstain, governance.proposal.id, voteId),
       ]);
     if (Number(results[0]?.meta?.changes ?? 0) === 0) {
@@ -1930,11 +2928,181 @@ export class D1PlatformStore implements PlatformStore {
     const evaluation = evaluateArbitrationProposal(governance.proposal, finalizedAt);
     if (!evaluation.finalizable) return { state: 'not_ready', governance };
     await this.db.prepare(`
-      UPDATE dispute_proposals SET status = ?, outcome = ?, finalized_at = ?, finalized_by = ?
+      UPDATE dispute_proposal_rounds SET status = ?, outcome = ?, finalized_at = ?, finalized_by = ?,
+        appeal_deadline_at = CASE WHEN round = 0 THEN ? ELSE NULL END
       WHERE id = ? AND status = 'active'
-    `).bind(evaluation.status, evaluation.outcome, finalizedAt, actorId, governance.proposal.id).run();
+    `).bind(
+      evaluation.status, evaluation.outcome, finalizedAt, actorId,
+      arbitrationAppealEndsAt(finalizedAt), governance.proposal.id,
+    ).run();
     const updated = await this.getDisputeGovernance(id, actorId, finalizedAt);
     return updated ? { state: 'finalized', governance: updated } : { state: 'missing' };
+  }
+
+  async createDisputeAppeal(id: string, appellantId: string, reason: string, createdAt: string): Promise<DisputeAppealResult> {
+    const party = await this.db.prepare(`
+      SELECT d.id FROM disputes d JOIN missions m ON m.id = d.mission_id
+      WHERE d.id = ? AND d.status = 'reviewing' AND (
+        d.opened_by = ? OR m.requester_id = ? OR EXISTS (
+          SELECT 1 FROM workflow_stages s JOIN agents a ON a.id = s.agent_id
+          WHERE s.mission_id = d.mission_id AND a.owner_id = ?
+        )
+      )
+    `).bind(id, appellantId, appellantId, appellantId).first<Row>();
+    if (!party) {
+      const dispute = await this.db.prepare('SELECT id FROM disputes WHERE id = ?').bind(id).first<Row>();
+      return dispute ? { state: 'not_allowed' } : { state: 'missing' };
+    }
+    const initialRow = await this.db.prepare(
+      'SELECT * FROM dispute_proposal_rounds WHERE dispute_id = ? AND round = 0',
+    ).bind(id).first<Row>();
+    if (!initialRow) return { state: 'not_finalized' };
+    const initial = mapArbitrationProposal(initialRow);
+    if (initial.status === 'active' || initial.status === 'executed' || !initial.appealDeadlineAt) {
+      return { state: 'not_finalized' };
+    }
+    if (Date.parse(createdAt) >= Date.parse(initial.appealDeadlineAt)) return { state: 'expired' };
+    const existingAppeal = await this.db.prepare(
+      'SELECT id FROM dispute_proposal_rounds WHERE dispute_id = ? AND round = 1',
+    ).bind(id).first<Row>();
+    if (existingAppeal) return { state: 'already_appealed' };
+    const existingExecution = await this.db.prepare(
+      "SELECT id FROM governance_execution_queue WHERE scope = 'task_dispute' AND source_id = ?",
+    ).bind(id).first<Row>();
+    if (existingExecution) return { state: 'execution_queued' };
+
+    const [{ results: originalRows }, { results: currentRows }] = await Promise.all([
+      this.db.prepare(`
+        SELECT e.user_id, COALESCE(am.power, e.power_snapshot) AS current_power, e.power_snapshot, p.display_name
+        FROM dispute_round_electorate e JOIN profiles p ON p.id = e.user_id
+        LEFT JOIN arbitration_members am ON am.user_id = e.user_id
+        WHERE e.proposal_id = ? ORDER BY e.user_id ASC
+      `).bind(initial.id).all<Row>(),
+      this.db.prepare(`
+        SELECT am.user_id, am.power, p.display_name
+        FROM arbitration_members am
+        JOIN profiles p ON p.id = am.user_id
+        JOIN disputes d ON d.id = ?
+        JOIN missions m ON m.id = d.mission_id
+        WHERE am.status = 'active' AND am.user_id <> d.opened_by AND am.user_id <> m.requester_id
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_stages s JOIN agents a ON a.id = s.agent_id
+            WHERE s.mission_id = m.id AND a.owner_id = am.user_id
+          )
+        ORDER BY am.user_id ASC
+      `).bind(id).all<Row>(),
+    ]);
+    const originalIds = new Set(originalRows.map((row) => text(row.user_id)));
+    if (!currentRows.some((row) => !originalIds.has(text(row.user_id)))) return { state: 'no_expanded_electorate' };
+    const electorate = new Map<string, { power: number; displayName: string }>();
+    for (const row of originalRows) electorate.set(text(row.user_id), {
+      power: Math.max(1, number(row.current_power) || number(row.power_snapshot)), displayName: text(row.display_name),
+    });
+    for (const row of currentRows) electorate.set(text(row.user_id), {
+      power: Math.max(1, number(row.power)), displayName: text(row.display_name),
+    });
+    const members = [...electorate.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([userId, member]) => ({
+      userId, ...member, voteWeight: arbitrationVoteWeight(initial.weightMode, member.power),
+    }));
+    const eligibleWeight = members.reduce((sum, member) => sum + member.voteWeight, 0);
+    const proposalId = `PROP-${crypto.randomUUID()}`;
+    const votingEndsAt = arbitrationVotingEndsAt(createdAt);
+    const results = await this.db.batch([
+      this.db.prepare(`
+        INSERT OR IGNORE INTO dispute_proposal_rounds
+          (id, dispute_id, round, parent_proposal_id, proposer_id, appeal_reason, appeal_deadline_at,
+           status, weight_mode, weight_version, voting_starts_at, voting_ends_at, quorum_required,
+           eligible_weight, support_votes, oppose_votes, abstain_votes, created_at)
+        SELECT ?, ?, 1, ?, ?, ?, NULL, 'active', ?, ?, ?, ?, ?, ?, 0, 0, 0, ?
+        WHERE EXISTS (
+          SELECT 1 FROM dispute_proposal_rounds
+          WHERE id = ? AND dispute_id = ? AND round = 0
+            AND status IN ('succeeded', 'defeated', 'inconclusive', 'quorum_failed')
+            AND julianday(appeal_deadline_at) > julianday(?)
+        ) AND NOT EXISTS (
+          SELECT 1 FROM dispute_proposal_rounds WHERE dispute_id = ? AND round = 1
+        ) AND NOT EXISTS (
+          SELECT 1 FROM governance_execution_queue WHERE scope = 'task_dispute' AND source_id = ?
+        )
+      `).bind(
+        proposalId, id, initial.id, appellantId, reason, initial.weightMode, initial.weightVersion,
+        createdAt, votingEndsAt, arbitrationQuorum(eligibleWeight), eligibleWeight, createdAt,
+        initial.id, id, createdAt, id, id,
+      ),
+      ...members.map((member) => this.db.prepare(`
+        INSERT INTO dispute_round_electorate (proposal_id, user_id, power_snapshot, vote_weight, created_at)
+        SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM dispute_proposal_rounds WHERE id = ?)
+      `).bind(proposalId, member.userId, member.power, member.voteWeight, createdAt, proposalId)),
+      this.db.prepare(`
+        INSERT INTO dispute_governance_events (id, dispute_id, actor_id, action, note, created_at)
+        SELECT ?, ?, ?, 'appeal_created', ?, ?
+        WHERE EXISTS (SELECT 1 FROM dispute_proposal_rounds WHERE id = ?)
+      `).bind(`${id}:appeal`, id, appellantId, reason, createdAt, proposalId),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) {
+      const concurrent = await this.db.prepare(
+        'SELECT id FROM dispute_proposal_rounds WHERE dispute_id = ? AND round = 1',
+      ).bind(id).first<Row>();
+      if (concurrent) return { state: 'already_appealed' };
+      const queued = await this.db.prepare(
+        "SELECT id FROM governance_execution_queue WHERE scope = 'task_dispute' AND source_id = ?",
+      ).bind(id).first<Row>();
+      return queued ? { state: 'execution_queued' } : { state: 'expired' };
+    }
+    return { state: 'created', governance: (await this.getDisputeGovernance(id, appellantId, createdAt))! };
+  }
+
+  async queueDisputeExecution(
+    id: string,
+    actorId: string,
+    queuedAt: string,
+    web3: boolean,
+  ): Promise<DisputeExecutionQueueResult> {
+    const governance = await this.getDisputeGovernance(id, actorId, queuedAt);
+    if (!governance?.proposal) return { state: 'missing' };
+    if (governance.execution?.status === 'executed') return { state: 'already_executed' };
+    if (governance.execution) return { state: 'replayed', governance };
+    const escrow = await this.db.prepare(`
+      SELECT e.status FROM escrows e JOIN disputes d ON d.mission_id = e.mission_id WHERE d.id = ?
+    `).bind(id).first<Row>();
+    if (text(escrow?.status) !== 'frozen') return { state: 'escrow_not_frozen' };
+    if (!governance.executionReady || governance.proposal.outcome === null) return { state: 'not_ready' };
+    const action = governance.proposal.outcome === 'refund_requester' ? 'refund_requester' : 'reject_dispute';
+    const itemId = `GEXEC-${crypto.randomUUID()}`;
+    const payloadHash = await arbitrationExecutionPayloadHash(id, governance.proposal.id, action);
+    const results = await this.db.batch([
+      this.db.prepare(`
+        INSERT INTO governance_execution_queue
+          (id, scope, source_id, proposal_id, action_type, payload_hash, status, requested_by, requested_at)
+        SELECT ?, 'task_dispute', ?, p.id, ?, ?, ?, ?, ?
+        FROM dispute_proposal_rounds p
+        JOIN disputes d ON d.id = p.dispute_id
+        JOIN escrows e ON e.mission_id = d.mission_id
+        WHERE p.id = ? AND p.dispute_id = ? AND d.status = 'reviewing' AND e.status = 'frozen'
+          AND ((p.status = 'succeeded' AND p.outcome = 'refund_requester')
+            OR (p.status = 'defeated' AND p.outcome = 'reject_dispute'))
+          AND p.outcome = ?
+          AND NOT EXISTS (SELECT 1 FROM dispute_proposal_rounds newer WHERE newer.dispute_id = p.dispute_id AND newer.round > p.round)
+          AND (p.round = 1 OR julianday(p.appeal_deadline_at) <= julianday(?))
+          AND NOT EXISTS (SELECT 1 FROM governance_execution_queue WHERE scope = 'task_dispute' AND source_id = ?)
+      `).bind(
+        itemId, id, action, payloadHash, web3 ? 'awaiting_transaction' : 'queued', actorId, queuedAt,
+        governance.proposal.id, id, governance.proposal.outcome, queuedAt, id,
+      ),
+      this.db.prepare(`
+        INSERT INTO dispute_governance_events (id, dispute_id, actor_id, action, note, created_at)
+        SELECT ?, ?, ?, 'execution_queued', ?, ?
+        WHERE EXISTS (SELECT 1 FROM governance_execution_queue WHERE id = ?)
+      `).bind(`${id}:execution_queued`, id, actorId, payloadHash, queuedAt, itemId),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) {
+      const existing = await this.db.prepare(
+        "SELECT status FROM governance_execution_queue WHERE scope = 'task_dispute' AND source_id = ?",
+      ).bind(id).first<Row>();
+      if (existing) return { state: 'replayed', governance: (await this.getDisputeGovernance(id, actorId, queuedAt))! };
+      return { state: 'not_ready' };
+    }
+    return { state: 'queued', governance: (await this.getDisputeGovernance(id, actorId, queuedAt))! };
   }
 
   async resolveDispute(id: string, resolution: string, status: 'resolved' | 'rejected', actorId: string, resolutionTxHash: string | null) {
@@ -1951,10 +3119,16 @@ export class D1PlatformStore implements PlatformStore {
         UPDATE disputes SET status = ?, resolution = ?, resolution_tx_hash = ?, resolved_at = ?
         WHERE id = ? AND status = 'reviewing'
           AND EXISTS (
-            SELECT 1 FROM dispute_proposals
-            WHERE dispute_id = ? AND status = ? AND outcome = ?
+            SELECT 1 FROM dispute_proposal_rounds p
+            JOIN governance_execution_queue q
+              ON q.scope = 'task_dispute' AND q.source_id = p.dispute_id AND q.proposal_id = p.id
+            WHERE p.dispute_id = ? AND p.status = ? AND p.outcome = ?
+              AND q.action_type = ? AND q.status IN ('queued', 'awaiting_transaction')
           )
-      `).bind(status, resolution, resolutionTxHash, resolvedAt, id, id, expectedProposalStatus, expectedOutcome),
+      `).bind(
+        status, resolution, resolutionTxHash, resolvedAt, id, id, expectedProposalStatus, expectedOutcome,
+        status === 'resolved' ? 'refund_requester' : 'reject_dispute',
+      ),
       this.db.prepare(`
         UPDATE escrows SET status = ?, resolution_tx_hash = ?, updated_at = ?
         WHERE mission_id = ? AND status = 'frozen'
@@ -1969,13 +3143,28 @@ export class D1PlatformStore implements PlatformStore {
         WHERE id = ? AND status = ? AND resolution = ? AND resolution_tx_hash IS ? AND resolved_at = ?
       `).bind(`${id}:${status}`, actorId, status, resolution, resolvedAt, id, status, resolution, resolutionTxHash, resolvedAt),
       this.db.prepare(`
-        UPDATE dispute_proposals SET status = 'executed', executed_at = ?, executed_by = ?
-        WHERE dispute_id = ? AND status = ? AND outcome = ?
+        UPDATE dispute_proposal_rounds SET status = 'executed', executed_at = ?, executed_by = ?
+        WHERE id = (SELECT proposal_id FROM governance_execution_queue WHERE scope = 'task_dispute' AND source_id = ?)
+          AND status = ? AND outcome = ?
           AND EXISTS (
             SELECT 1 FROM disputes
             WHERE id = ? AND status = ? AND resolution = ? AND resolution_tx_hash IS ? AND resolved_at = ?
         )
       `).bind(resolvedAt, actorId, id, expectedProposalStatus, expectedOutcome, id, status, resolution, resolutionTxHash, resolvedAt),
+      this.db.prepare(`
+        UPDATE governance_execution_queue
+        SET status = 'executed', tx_hash = ?, executed_by = ?, executed_at = ?
+        WHERE scope = 'task_dispute' AND source_id = ? AND status IN ('queued', 'awaiting_transaction')
+          AND EXISTS (
+            SELECT 1 FROM disputes
+            WHERE id = ? AND status = ? AND resolution = ? AND resolution_tx_hash IS ? AND resolved_at = ?
+          )
+      `).bind(resolutionTxHash, actorId, resolvedAt, id, id, status, resolution, resolutionTxHash, resolvedAt),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO dispute_governance_events (id, dispute_id, actor_id, action, note, created_at)
+        SELECT ?, ?, ?, 'execution_executed', payload_hash, ? FROM governance_execution_queue
+        WHERE scope = 'task_dispute' AND source_id = ? AND status = 'executed' AND executed_at = ?
+      `).bind(`${id}:execution_executed`, id, actorId, resolvedAt, id, resolvedAt),
       this.db.prepare(`
         INSERT OR IGNORE INTO reward_activities
           (id, source_key, user_id, mission_id, dispute_id, role, formula_version, asset, settled_amount, quality_bps,
@@ -1985,8 +3174,8 @@ export class D1PlatformStore implements PlatformStore {
           v.voter_id, d.mission_id, d.id, 'arbitrator', ?, 'YD_CONTRIBUTION', 1, 10000, 0, ?, 1,
           json_object('source', 'executed_arbitration', 'choice', v.choice), ?, ?
         FROM disputes d
-        JOIN dispute_proposals p ON p.dispute_id = d.id AND p.status = 'executed'
-        JOIN dispute_votes v ON v.proposal_id = p.id
+        JOIN dispute_proposal_rounds p ON p.dispute_id = d.id AND p.status = 'executed'
+        JOIN dispute_round_votes v ON v.proposal_id = p.id
         WHERE d.id = ? AND d.status = ? AND d.resolved_at = ?
       `).bind(REWARD_FORMULA_VERSION, rewardScoreMicros(1, 'arbitrator'), resolvedAt, resolvedAt, id, status, resolvedAt),
     ];
@@ -2027,22 +3216,55 @@ export class D1PlatformStore implements PlatformStore {
 
   async listDisputeActions(disputeId: string): Promise<DisputeAction[]> {
     const { results } = await this.db.prepare(
-      'SELECT * FROM dispute_actions WHERE dispute_id = ? ORDER BY created_at ASC, id ASC',
-    ).bind(disputeId).all<Row>();
+      `SELECT * FROM dispute_actions WHERE dispute_id = ?
+       UNION ALL
+       SELECT * FROM dispute_governance_events WHERE dispute_id = ?
+       ORDER BY created_at ASC, id ASC`,
+    ).bind(disputeId, disputeId).all<Row>();
     return results.map(mapDisputeAction);
   }
 
   async createAgentDispatch(dispatch: AgentDispatch): Promise<void> {
-    await this.db.prepare(`
-      INSERT OR IGNORE INTO agent_dispatches (run_id, mission_id, stage_id, agent_id, expires_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(dispatch.runId, dispatch.missionId, dispatch.stageId, dispatch.agentId, dispatch.expiresAt).run();
+    const results = await this.db.batch([
+      this.db.prepare(`
+        INSERT OR IGNORE INTO workflow_stage_attempts
+          (id, mission_id, stage_id, attempt_no, status, input_json, output_json, is_current,
+           started_at, completed_at, created_at, updated_at)
+        SELECT 'ATTEMPT-' || s.id || '-1', s.mission_id, s.id, 1, s.status, s.input_json, s.output_json, 1,
+          CASE WHEN s.status IN ('running', 'done', 'failed') THEN datetime('now') ELSE NULL END,
+          CASE WHEN s.status IN ('done', 'failed') THEN datetime('now') ELSE NULL END,
+          s.created_at, s.updated_at
+        FROM workflow_stages s WHERE s.id = ? AND s.mission_id = ?
+          AND NOT EXISTS (SELECT 1 FROM workflow_stage_attempts a WHERE a.stage_id = s.id AND a.is_current = 1)
+      `).bind(dispatch.stageId, dispatch.missionId),
+      this.db.prepare(`
+        UPDATE workflow_stage_attempts SET run_id = ?, status = 'running',
+          started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now')
+        WHERE mission_id = ? AND stage_id = ? AND is_current = 1
+          AND (run_id IS NULL OR run_id = ?)
+      `).bind(dispatch.runId, dispatch.missionId, dispatch.stageId, dispatch.runId),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO agent_dispatches (run_id, mission_id, stage_id, agent_id, expires_at)
+        SELECT ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM workflow_stage_attempts
+          WHERE mission_id = ? AND stage_id = ? AND is_current = 1 AND run_id = ?
+        )
+      `).bind(
+        dispatch.runId, dispatch.missionId, dispatch.stageId, dispatch.agentId, dispatch.expiresAt,
+        dispatch.missionId, dispatch.stageId, dispatch.runId,
+      ),
+    ]);
+    if (Number(results[1]?.meta?.changes ?? 0) === 0) throw new Error('STALE_STAGE_ATTEMPT');
   }
 
   async applyAgentCallback(update: AgentCallbackUpdate) {
     const dispatch = await this.db.prepare(`
-      SELECT expires_at, completed_at FROM agent_dispatches
-      WHERE run_id = ? AND mission_id = ? AND stage_id = ? AND agent_id = ? AND expires_at = ?
+      SELECT d.expires_at, d.completed_at, a.attempt_no
+      FROM agent_dispatches d
+      JOIN workflow_stage_attempts a
+        ON a.mission_id = d.mission_id AND a.stage_id = d.stage_id AND a.run_id = d.run_id
+      WHERE d.run_id = ? AND d.mission_id = ? AND d.stage_id = ? AND d.agent_id = ? AND d.expires_at = ?
     `).bind(update.runId, update.missionId, update.stageId, update.agentId, update.expiresAt).first<Row>();
     if (!dispatch) return { state: 'missing' as const };
 
@@ -2058,36 +3280,48 @@ export class D1PlatformStore implements PlatformStore {
       SELECT 1
       FROM agent_dispatches d
       JOIN workflow_stages s ON s.id = d.stage_id AND s.mission_id = d.mission_id
+      JOIN workflow_stage_attempts a ON a.stage_id = d.stage_id AND a.mission_id = d.mission_id
       JOIN missions m ON m.id = d.mission_id
       JOIN escrows e ON e.mission_id = d.mission_id
       WHERE d.run_id = ? AND d.mission_id = ? AND d.stage_id = ? AND d.agent_id = ? AND d.expires_at = ?
         AND d.completed_at IS NULL AND julianday(d.expires_at) > julianday(?)
+        AND a.is_current = 1 AND a.run_id = d.run_id
         AND s.status = 'running' AND m.status = 'running' AND m.cancelled_at IS NULL AND e.status = 'held'
+        AND (? IN ('done', 'failed') OR NOT EXISTS (
+          SELECT 1 FROM mission_runtime_controls c WHERE c.mission_id = d.mission_id AND c.paused_at IS NOT NULL
+        ))
     `;
-    const artifactStatements = (update.artifacts ?? []).map((artifact) => this.db.prepare(`
+    const dispatchAttemptNo = number(dispatch.attempt_no);
+    const artifactStatements = (update.artifacts ?? []).map((artifact) => {
+      const artifactAttemptNo = artifact.attemptNo ?? dispatchAttemptNo;
+      return this.db.prepare(`
       INSERT INTO deliverables
-        (id, mission_id, stage_id, agent_id, name, uri, content_hash, mime_type, status, created_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        (id, mission_id, stage_id, attempt_no, agent_id, name, uri, content_hash, mime_type, status, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE EXISTS (
         SELECT 1 FROM agent_callback_events
         WHERE run_id = ? AND callback_id = ? AND processing_token = ? AND applied_at IS NULL
       ) AND EXISTS (
-        SELECT 1 FROM workflow_stages WHERE id = ? AND mission_id = ? AND agent_id = ? AND status = 'done'
+        SELECT 1 FROM workflow_stages s
+        JOIN workflow_stage_attempts a ON a.stage_id = s.id AND a.mission_id = s.mission_id
+        WHERE s.id = ? AND s.mission_id = ? AND s.agent_id = ? AND s.status = 'done'
+          AND a.is_current = 1 AND a.attempt_no = ? AND a.run_id = ?
       )
     `).bind(
-      artifact.id, artifact.missionId, artifact.stageId, artifact.agentId, artifact.name,
+      artifact.id, artifact.missionId, artifact.stageId, artifactAttemptNo, artifact.agentId, artifact.name,
       artifact.uri, artifact.contentHash, artifact.mimeType, artifact.status, artifact.createdAt,
       update.runId, update.callbackId, processingToken,
-      update.stageId, update.missionId, update.agentId,
-    ));
-    const appliedIndex = 9 + artifactStatements.length;
+      update.stageId, update.missionId, update.agentId, artifactAttemptNo, update.runId,
+      );
+    });
+    const appliedIndex = 10 + artifactStatements.length;
     const results = await this.db.batch([
       this.db.prepare(`
         INSERT OR IGNORE INTO agent_callback_events (run_id, callback_id, created_at)
         SELECT ?, ?, ? WHERE EXISTS (${validDispatch})
       `).bind(
         update.runId, update.callbackId, update.now,
-        update.runId, update.missionId, update.stageId, update.agentId, update.expiresAt, update.now,
+        update.runId, update.missionId, update.stageId, update.agentId, update.expiresAt, update.now, update.status,
       ),
       this.db.prepare(`
         UPDATE agent_callback_events SET processing_token = ?
@@ -2095,7 +3329,7 @@ export class D1PlatformStore implements PlatformStore {
           AND EXISTS (${validDispatch})
       `).bind(
         processingToken, update.runId, update.callbackId,
-        update.runId, update.missionId, update.stageId, update.agentId, update.expiresAt, update.now,
+        update.runId, update.missionId, update.stageId, update.agentId, update.expiresAt, update.now, update.status,
       ),
       this.db.prepare(`
         UPDATE workflow_stages
@@ -2111,6 +3345,21 @@ export class D1PlatformStore implements PlatformStore {
         update.status, update.status, update.progress ?? null, update.progress ?? null,
         update.output === undefined ? 0 : 1, outputJson, update.now,
         update.stageId, update.missionId, update.runId, update.callbackId, processingToken,
+      ),
+      this.db.prepare(`
+        UPDATE workflow_stage_attempts SET status = ?,
+          output_json = CASE WHEN ? = 1 THEN ? ELSE output_json END,
+          completed_at = CASE WHEN ? IN ('done', 'failed') THEN ? ELSE completed_at END,
+          updated_at = ?
+        WHERE mission_id = ? AND stage_id = ? AND is_current = 1 AND run_id = ?
+          AND EXISTS (
+            SELECT 1 FROM agent_callback_events
+            WHERE run_id = ? AND callback_id = ? AND processing_token = ? AND applied_at IS NULL
+          )
+      `).bind(
+        update.status, update.output === undefined ? 0 : 1, outputJson,
+        update.status, update.now, update.now, update.missionId, update.stageId, update.runId,
+        update.runId, update.callbackId, processingToken,
       ),
       this.db.prepare(`
         INSERT INTO execution_events
@@ -2189,26 +3438,63 @@ export class D1PlatformStore implements PlatformStore {
         .bind(update.runId, update.callbackId).first<Row>();
       return text(callback?.applied_at) ? { state: 'duplicate' as const } : { state: 'invalid' as const };
     }
-    const artifactInsertFailed = artifactStatements.some((_, index) => Number(results[9 + index]?.meta?.changes ?? 0) === 0);
+    const artifactInsertFailed = artifactStatements.some((_, index) => Number(results[10 + index]?.meta?.changes ?? 0) === 0);
     if (Number(results[2]?.meta?.changes ?? 0) === 0
       || Number(results[3]?.meta?.changes ?? 0) === 0
-      || artifactInsertFailed
+      || Number(results[4]?.meta?.changes ?? 0) === 0 || artifactInsertFailed
       || Number(results[appliedIndex]?.meta?.changes ?? 0) === 0) {
       throw new Error('AGENT_CALLBACK_ATOMICITY_FAILED');
     }
-    const row = await this.db.prepare('SELECT * FROM workflow_stages WHERE id = ? AND mission_id = ?')
-      .bind(update.stageId, update.missionId).first<Row>();
-    return row ? { state: 'applied' as const, stage: mapStage(row) } : { state: 'invalid' as const };
+    const stage = (await this.listStages(update.missionId)).find((candidate) => candidate.id === update.stageId);
+    return stage ? { state: 'applied' as const, stage } : { state: 'invalid' as const };
   }
 
-  async claimAgentCallback(runId: string, callbackId: string, now: string): Promise<'accepted' | 'duplicate' | 'expired' | 'missing'> {
-    const dispatch = await this.db.prepare('SELECT expires_at, completed_at FROM agent_dispatches WHERE run_id = ?').bind(runId).first<Row>();
+  async claimAgentCallback(input: {
+    runId: string; callbackId: string; missionId: string; stageId: string; agentId: string;
+    expiresAt: string; now: string; status: WorkflowStage['status'];
+  }): Promise<'accepted' | 'duplicate' | 'expired' | 'missing' | 'invalid'> {
+    const dispatch = await this.db.prepare(`
+      SELECT expires_at, completed_at FROM agent_dispatches
+      WHERE run_id = ? AND mission_id = ? AND stage_id = ? AND agent_id = ? AND expires_at = ?
+    `).bind(input.runId, input.missionId, input.stageId, input.agentId, input.expiresAt).first<Row>();
     if (!dispatch) return 'missing';
-    if (text(dispatch.completed_at) || Date.parse(text(dispatch.expires_at)) <= Date.parse(now)) return 'expired';
+    const existing = await this.db.prepare(`
+      SELECT applied_at FROM agent_callback_events WHERE run_id = ? AND callback_id = ?
+    `).bind(input.runId, input.callbackId).first<Row>();
+    if (text(existing?.applied_at)) return 'duplicate';
+    if (text(dispatch.completed_at) || Date.parse(text(dispatch.expires_at)) <= Date.parse(input.now)) return 'expired';
+    const validDispatch = `
+      SELECT 1
+      FROM agent_dispatches d
+      JOIN workflow_stages s ON s.id = d.stage_id AND s.mission_id = d.mission_id
+      JOIN workflow_stage_attempts a ON a.stage_id = d.stage_id AND a.mission_id = d.mission_id
+      JOIN missions m ON m.id = d.mission_id
+      JOIN escrows e ON e.mission_id = d.mission_id
+      WHERE d.run_id = ? AND d.mission_id = ? AND d.stage_id = ? AND d.agent_id = ? AND d.expires_at = ?
+        AND d.completed_at IS NULL AND julianday(d.expires_at) > julianday(?)
+        AND a.is_current = 1 AND a.run_id = d.run_id
+        AND s.status = 'running' AND m.status = 'running' AND m.cancelled_at IS NULL AND e.status = 'held'
+        AND (? IN ('done', 'failed') OR NOT EXISTS (
+          SELECT 1 FROM mission_runtime_controls c WHERE c.mission_id = d.mission_id AND c.paused_at IS NOT NULL
+        ))
+    `;
     const result = await this.db.prepare(`
-      INSERT OR IGNORE INTO agent_callback_events (run_id, callback_id, created_at) VALUES (?, ?, ?)
-    `).bind(runId, callbackId, now).run();
-    return result.meta.changes > 0 ? 'accepted' : 'duplicate';
+      INSERT OR IGNORE INTO agent_callback_events (run_id, callback_id, created_at)
+      SELECT ?, ?, ? WHERE EXISTS (${validDispatch})
+    `).bind(
+      input.runId, input.callbackId, input.now,
+      input.runId, input.missionId, input.stageId, input.agentId, input.expiresAt, input.now, input.status,
+    ).run();
+    if (result.meta.changes > 0) return 'accepted';
+    const reserved = await this.db.prepare(`
+      SELECT applied_at FROM agent_callback_events WHERE run_id = ? AND callback_id = ?
+    `).bind(input.runId, input.callbackId).first<Row>();
+    if (text(reserved?.applied_at)) return 'duplicate';
+    if (!reserved) return 'invalid';
+    const current = await this.db.prepare(validDispatch).bind(
+      input.runId, input.missionId, input.stageId, input.agentId, input.expiresAt, input.now, input.status,
+    ).first<Row>();
+    return current ? 'accepted' : 'invalid';
   }
 
   async completeAgentDispatch(runId: string, now: string): Promise<void> {
@@ -2290,22 +3576,23 @@ export class D1PlatformStore implements PlatformStore {
     return results.map(mapArbitrationMember);
   }
 
-  async setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string): Promise<ArbitrationMember | null> {
+  async setArbitrationMember(userId: string, active: boolean, actorId: string, updatedAt: string, power?: number): Promise<ArbitrationMember | null> {
     const profile = await this.db.prepare('SELECT id FROM profiles WHERE id = ?').bind(userId).first<Row>();
     if (!profile) return null;
-    const existing = await this.db.prepare('SELECT status FROM arbitration_members WHERE user_id = ?').bind(userId).first<Row>();
+    const existing = await this.db.prepare('SELECT status, power FROM arbitration_members WHERE user_id = ?').bind(userId).first<Row>();
     const status: ArbitrationMember['status'] = active ? 'active' : 'inactive';
     const action = !existing ? 'appointed' : active ? 'activated' : 'deactivated';
+    const nextPower = power === undefined ? Math.max(1, number(existing?.power) || 1) : Math.max(1, Math.floor(power));
     await this.db.batch([
       this.db.prepare(`
         INSERT INTO arbitration_members (user_id, status, power, appointed_by, appointed_at, updated_at)
-        VALUES (?, ?, 1, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
-      `).bind(userId, status, actorId, updatedAt, updatedAt),
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET status = excluded.status, power = excluded.power, updated_at = excluded.updated_at
+      `).bind(userId, status, nextPower, actorId, updatedAt, updatedAt),
       this.db.prepare(`
         INSERT INTO arbitration_member_actions (id, user_id, actor_id, action, power, created_at)
-        VALUES (?, ?, ?, ?, 1, ?)
-      `).bind(`ARB-${crypto.randomUUID()}`, userId, actorId, action, updatedAt),
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(`ARB-${crypto.randomUUID()}`, userId, actorId, action, nextPower, updatedAt),
     ]);
     const row = await this.db.prepare(`
       SELECT am.*, p.display_name, p.email, p.role
@@ -2444,6 +3731,288 @@ export class D1PlatformStore implements PlatformStore {
         nextCursor: hasMore && lastEntry ? { createdAt: lastEntry.createdAt, id: lastEntry.id } : null,
       },
     };
+  }
+
+  private async expireDeveloperLedgerExports(now: string): Promise<void> {
+    const condition = `
+      (j.status IN ('queued', 'processing') AND julianday(j.expires_at) <= julianday(?))
+      OR (j.status = 'completed' AND EXISTS (
+        SELECT 1 FROM export_artifacts a WHERE a.job_id = j.id AND a.deleted_at IS NULL
+          AND julianday(a.expires_at) <= julianday(?)
+      ))
+    `;
+    await this.db.batch([
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT j.id || ':expired:' || j.attempt, j.id, 'system', NULL, 'expired', '{"reason":"retention"}', ?
+        FROM export_jobs j WHERE ${condition}
+      `).bind(now, now, now),
+      this.db.prepare(`
+        UPDATE export_jobs AS j SET status = 'expired', lease_owner = NULL, lease_expires_at = NULL,
+          updated_at = ?
+        WHERE ${condition}
+      `).bind(now, now, now),
+      this.db.prepare(`
+        UPDATE export_artifacts SET deleted_at = ?
+        WHERE deleted_at IS NULL AND julianday(expires_at) <= julianday(?)
+      `).bind(now, now),
+    ]);
+  }
+
+  async requestDeveloperLedgerExport(ownerId: string, token: string, requestedAt: string): Promise<LedgerExportRequestResult> {
+    await this.expireDeveloperLedgerExports(requestedAt);
+    const countRow = await this.db.prepare(`
+      SELECT
+        COUNT(*) AS count,
+        (SELECT le2.created_at FROM ledger_entries le2 JOIN agents a2 ON a2.id = le2.agent_id
+          WHERE a2.owner_id = ? AND le2.token = ? ORDER BY le2.created_at DESC, le2.id DESC LIMIT 1) AS snapshot_created_at,
+        (SELECT le3.id FROM ledger_entries le3 JOIN agents a3 ON a3.id = le3.agent_id
+          WHERE a3.owner_id = ? AND le3.token = ? ORDER BY le3.created_at DESC, le3.id DESC LIMIT 1) AS snapshot_id
+      FROM ledger_entries le JOIN agents a ON a.id = le.agent_id
+      WHERE a.owner_id = ? AND le.token = ?
+    `).bind(ownerId, token, ownerId, token, ownerId, token).first<Row>();
+    const rowCount = number(countRow?.count);
+    if (rowCount <= MAX_DIRECT_LEDGER_EXPORT_ROWS) return { mode: 'direct', rowCount };
+    const existing = await this.db.prepare(`${ledgerExportSelect}
+      WHERE j.owner_id = ? AND j.token = ? AND j.status IN ('queued', 'processing', 'completed')
+      ORDER BY j.created_at DESC LIMIT 1
+    `).bind(ownerId, token).first<Row>();
+    if (existing) return { mode: 'async', job: mapLedgerExportJob(existing) };
+    const id = `EXPORT-${crypto.randomUUID()}`;
+    const expiresAt = exportJobExpiresAt(requestedAt);
+    const results = await this.db.batch([
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_jobs
+          (id, owner_id, export_type, token, status, total_rows, snapshot_created_at, snapshot_id,
+           processed_rows, progress, attempt,
+           expires_at, created_at, updated_at)
+        VALUES (?, ?, 'developer_ledger', ?, 'queued', ?, ?, ?, 0, 0, 1, ?, ?, ?)
+      `).bind(
+        id, ownerId, token, rowCount, text(countRow?.snapshot_created_at), text(countRow?.snapshot_id),
+        expiresAt, requestedAt, requestedAt,
+      ),
+      this.db.prepare(`
+        INSERT INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT ?, ?, 'user', ?, 'created', ?, ? WHERE EXISTS (SELECT 1 FROM export_jobs WHERE id = ?)
+      `).bind(`${id}:created`, id, ownerId, JSON.stringify({ token, totalRows: rowCount, attempt: 1 }), requestedAt, id),
+    ]);
+    const selected = Number(results[0]?.meta?.changes ?? 0) > 0
+      ? await this.db.prepare(`${ledgerExportSelect} WHERE j.id = ?`).bind(id).first<Row>()
+      : await this.db.prepare(`${ledgerExportSelect}
+          WHERE j.owner_id = ? AND j.token = ? AND j.status IN ('queued', 'processing', 'completed')
+          ORDER BY j.created_at DESC LIMIT 1
+        `).bind(ownerId, token).first<Row>();
+    if (!selected) throw new Error('EXPORT_JOB_CREATE_FAILED');
+    return { mode: 'async', job: mapLedgerExportJob(selected) };
+  }
+
+  async listDeveloperLedgerExports(ownerId: string, now: string): Promise<LedgerExportJob[]> {
+    await this.expireDeveloperLedgerExports(now);
+    const { results } = await this.db.prepare(`${ledgerExportSelect}
+      WHERE j.owner_id = ? ORDER BY j.created_at DESC, j.id DESC LIMIT 50
+    `).bind(ownerId).all<Row>();
+    return results.map(mapLedgerExportJob);
+  }
+
+  async getDeveloperLedgerExport(ownerId: string, id: string, now: string): Promise<LedgerExportJob | null> {
+    await this.expireDeveloperLedgerExports(now);
+    const row = await this.db.prepare(`${ledgerExportSelect} WHERE j.id = ? AND j.owner_id = ?`)
+      .bind(id, ownerId).first<Row>();
+    return row ? mapLedgerExportJob(row) : null;
+  }
+
+  async cancelDeveloperLedgerExport(ownerId: string, id: string, cancelledAt: string): Promise<LedgerExportMutationResult> {
+    await this.expireDeveloperLedgerExports(cancelledAt);
+    const existing = await this.getDeveloperLedgerExport(ownerId, id, cancelledAt);
+    if (!existing) return { state: 'missing' };
+    if (existing.status === 'cancelled') return { state: 'unchanged', job: existing };
+    if (!['queued', 'processing'].includes(existing.status)) return { state: 'invalid_state' };
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE export_jobs SET status = 'cancelled', cancelled_at = ?, lease_owner = NULL,
+          lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND owner_id = ? AND status IN ('queued', 'processing')
+      `).bind(cancelledAt, cancelledAt, id, ownerId),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT ?, id, 'user', ?, 'cancelled', ?, ? FROM export_jobs
+        WHERE id = ? AND owner_id = ? AND status = 'cancelled' AND cancelled_at = ?
+      `).bind(`${id}:cancelled:${existing.attempt}`, ownerId, JSON.stringify({ attempt: existing.attempt }), cancelledAt, id, ownerId, cancelledAt),
+    ]);
+    const job = await this.getDeveloperLedgerExport(ownerId, id, cancelledAt);
+    return Number(results[0]?.meta?.changes ?? 0) > 0 && job ? { state: 'applied', job } : { state: 'invalid_state' };
+  }
+
+  async retryDeveloperLedgerExport(ownerId: string, id: string, retriedAt: string): Promise<LedgerExportMutationResult> {
+    await this.expireDeveloperLedgerExports(retriedAt);
+    const existing = await this.getDeveloperLedgerExport(ownerId, id, retriedAt);
+    if (!existing) return { state: 'missing' };
+    if (existing.status !== 'failed' || Date.parse(retriedAt) >= Date.parse(existing.expiresAt)) return { state: 'invalid_state' };
+    const activeSibling = await this.db.prepare(`
+      SELECT id FROM export_jobs
+      WHERE owner_id = ? AND token = ? AND id <> ? AND status IN ('queued', 'processing', 'completed')
+      LIMIT 1
+    `).bind(ownerId, existing.token, id).first<Row>();
+    if (activeSibling) return { state: 'invalid_state' };
+    const nextAttempt = existing.attempt + 1;
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE export_jobs SET status = 'queued', processed_rows = 0, progress = 0, attempt = ?,
+          lease_owner = NULL, lease_expires_at = NULL, error_code = NULL, error_message = NULL,
+          started_at = NULL, completed_at = NULL, cancelled_at = NULL, updated_at = ?
+        WHERE id = ? AND owner_id = ? AND status = 'failed' AND attempt = ?
+          AND julianday(expires_at) > julianday(?)
+          AND NOT EXISTS (
+            SELECT 1 FROM export_jobs sibling
+            WHERE sibling.owner_id = export_jobs.owner_id AND sibling.token = export_jobs.token
+              AND sibling.id <> export_jobs.id AND sibling.status IN ('queued', 'processing', 'completed')
+          )
+      `).bind(nextAttempt, retriedAt, id, ownerId, existing.attempt, retriedAt),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT ?, id, 'user', ?, 'retried', ?, ? FROM export_jobs
+        WHERE id = ? AND owner_id = ? AND status = 'queued' AND attempt = ?
+      `).bind(`${id}:retried:${nextAttempt}`, ownerId, JSON.stringify({ attempt: nextAttempt }), retriedAt, id, ownerId, nextAttempt),
+    ]);
+    const job = await this.getDeveloperLedgerExport(ownerId, id, retriedAt);
+    return Number(results[0]?.meta?.changes ?? 0) > 0 && job ? { state: 'applied', job } : { state: 'invalid_state' };
+  }
+
+  async claimDeveloperLedgerExport(workerId: string, claimedAt: string): Promise<LedgerExportClaim | null> {
+    await this.expireDeveloperLedgerExports(claimedAt);
+    await this.db.batch([
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT id || ':lease_expired:' || attempt, id, 'system', NULL, 'retried',
+          json_object('attempt', attempt + 1, 'reason', 'lease_expired'), ?
+        FROM export_jobs WHERE status = 'processing' AND julianday(lease_expires_at) <= julianday(?)
+      `).bind(claimedAt, claimedAt),
+      this.db.prepare(`
+        UPDATE export_jobs SET status = 'queued', processed_rows = 0, progress = 0, attempt = attempt + 1,
+          lease_owner = NULL, lease_expires_at = NULL, error_code = 'LEASE_EXPIRED',
+          error_message = 'Previous export worker lease expired', updated_at = ?
+        WHERE status = 'processing' AND julianday(lease_expires_at) <= julianday(?)
+      `).bind(claimedAt, claimedAt),
+    ]);
+    const candidate = await this.db.prepare(`
+      SELECT id FROM export_jobs WHERE status = 'queued' AND julianday(expires_at) > julianday(?)
+      ORDER BY created_at ASC, id ASC LIMIT 1
+    `).bind(claimedAt).first<Row>();
+    if (!candidate) return null;
+    const id = text(candidate.id);
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE export_jobs SET status = 'processing', lease_owner = ?, lease_expires_at = ?,
+          started_at = COALESCE(started_at, ?), error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND status = 'queued'
+      `).bind(workerId, exportLeaseExpiresAt(claimedAt), claimedAt, claimedAt, id),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT id || ':claimed:' || attempt, id, 'service', ?, 'claimed', json_object('attempt', attempt, 'workerId', ?), ?
+        FROM export_jobs WHERE id = ? AND status = 'processing' AND lease_owner = ?
+      `).bind(workerId, workerId, claimedAt, id, workerId),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
+    const row = await this.db.prepare(`${ledgerExportSelect} WHERE j.id = ?`).bind(id).first<Row>();
+    return row ? {
+      job: mapLedgerExportJob(row), ownerId: text(row.owner_id), exportType: 'developer_ledger',
+      snapshot: { createdAt: text(row.snapshot_created_at), id: text(row.snapshot_id) },
+    } : null;
+  }
+
+  async updateDeveloperLedgerExportProgress(id: string, workerId: string, attempt: number, processedRows: number, updatedAt: string): Promise<LedgerExportJob | null> {
+    await this.expireDeveloperLedgerExports(updatedAt);
+    const row = await this.db.prepare('SELECT total_rows, attempt FROM export_jobs WHERE id = ?').bind(id).first<Row>();
+    if (!row || processedRows < 0 || processedRows > number(row.total_rows)) return null;
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE export_jobs SET processed_rows = ?, progress = ?, lease_expires_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'processing' AND lease_owner = ? AND attempt = ? AND processed_rows <= ?
+          AND julianday(lease_expires_at) > julianday(?) AND julianday(expires_at) > julianday(?)
+      `).bind(processedRows, exportProgress(processedRows, number(row.total_rows)), exportLeaseExpiresAt(updatedAt), updatedAt,
+        id, workerId, attempt, processedRows, updatedAt, updatedAt),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT ? || ':progress:' || attempt || ':' || ?, id, 'service', ?, 'progressed',
+          json_object('attempt', attempt, 'processedRows', ?, 'totalRows', total_rows), ?
+        FROM export_jobs WHERE id = ? AND status = 'processing' AND lease_owner = ? AND attempt = ? AND processed_rows = ?
+          AND julianday(lease_expires_at) > julianday(?) AND julianday(expires_at) > julianday(?)
+      `).bind(id, processedRows, workerId, processedRows, updatedAt, id, workerId, attempt, processedRows, updatedAt, updatedAt),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
+    const selected = await this.db.prepare(`${ledgerExportSelect}
+      WHERE j.id = ? AND j.status = 'processing' AND j.lease_owner = ? AND j.attempt = ?
+        AND julianday(j.lease_expires_at) > julianday(?) AND julianday(j.expires_at) > julianday(?)
+    `).bind(id, workerId, attempt, updatedAt, updatedAt).first<Row>();
+    return selected ? mapLedgerExportJob(selected) : null;
+  }
+
+  async completeDeveloperLedgerExport(input: {
+    id: string; workerId: string; attempt: number; objectKey: string; sha256: string; rowCount: number; byteSize: number; completedAt: string;
+  }): Promise<LedgerExportJob | null> {
+    if (!input.objectKey.startsWith(`private/exports/${input.id}/`)) return null;
+    await this.expireDeveloperLedgerExports(input.completedAt);
+    const artifactId = `EXPORT-ARTIFACT-${crypto.randomUUID()}`;
+    const expiresAt = exportArtifactExpiresAt(input.completedAt);
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE export_jobs SET status = 'completed', processed_rows = total_rows, progress = 100,
+          completed_at = ?, expires_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'processing' AND lease_owner = ? AND attempt = ? AND total_rows = ?
+          AND julianday(lease_expires_at) > julianday(?) AND julianday(expires_at) > julianday(?)
+      `).bind(input.completedAt, expiresAt, input.completedAt, input.id, input.workerId, input.attempt, input.rowCount,
+        input.completedAt, input.completedAt),
+      this.db.prepare(`
+        INSERT INTO export_artifacts
+          (id, job_id, object_key, sha256, content_type, row_count, byte_size, created_at, expires_at)
+        SELECT ?, id, ?, ?, 'text/csv', total_rows, ?, ?, ? FROM export_jobs
+        WHERE id = ? AND status = 'completed' AND completed_at = ?
+          AND NOT EXISTS (SELECT 1 FROM export_artifacts WHERE job_id = ?)
+      `).bind(artifactId, input.objectKey, input.sha256, input.byteSize, input.completedAt, expiresAt, input.id, input.completedAt, input.id),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT id || ':completed:' || attempt, id, 'service', ?, 'completed',
+          json_object('attempt', attempt, 'rowCount', total_rows, 'byteSize', ?), ?
+        FROM export_jobs WHERE id = ? AND status = 'completed' AND completed_at = ?
+      `).bind(input.workerId, input.byteSize, input.completedAt, input.id, input.completedAt),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
+    const row = await this.db.prepare(`${ledgerExportSelect} WHERE j.id = ?`).bind(input.id).first<Row>();
+    return row ? mapLedgerExportJob(row) : null;
+  }
+
+  async failDeveloperLedgerExport(id: string, workerId: string, attempt: number, errorCode: string, errorMessage: string, failedAt: string): Promise<LedgerExportJob | null> {
+    await this.expireDeveloperLedgerExports(failedAt);
+    const results = await this.db.batch([
+      this.db.prepare(`
+        UPDATE export_jobs SET status = 'failed', error_code = ?, error_message = ?,
+          lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'processing' AND lease_owner = ? AND attempt = ?
+          AND julianday(lease_expires_at) > julianday(?) AND julianday(expires_at) > julianday(?)
+      `).bind(errorCode, errorMessage, failedAt, id, workerId, attempt, failedAt, failedAt),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO export_job_events (id, job_id, actor_type, actor_id, action, detail_json, created_at)
+        SELECT id || ':failed:' || attempt, id, 'service', ?, 'failed',
+          json_object('attempt', attempt, 'errorCode', error_code), ?
+        FROM export_jobs WHERE id = ? AND status = 'failed' AND error_code = ? AND attempt = ?
+      `).bind(workerId, failedAt, id, errorCode, attempt),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
+    const row = await this.db.prepare(`${ledgerExportSelect} WHERE j.id = ?`).bind(id).first<Row>();
+    return row ? mapLedgerExportJob(row) : null;
+  }
+
+  async getDeveloperLedgerExportArtifact(ownerId: string, id: string, now: string): Promise<LedgerExportPrivateArtifact | null> {
+    await this.expireDeveloperLedgerExports(now);
+    const row = await this.db.prepare(`
+      SELECT a.* FROM export_artifacts a JOIN export_jobs j ON j.id = a.job_id
+      WHERE j.id = ? AND j.owner_id = ? AND j.status = 'completed' AND a.deleted_at IS NULL
+        AND julianday(a.expires_at) > julianday(?)
+    `).bind(id, ownerId, now).first<Row>();
+    return row ? {
+      id: text(row.id), objectKey: text(row.object_key), sha256: text(row.sha256), contentType: 'text/csv',
+      rowCount: number(row.row_count), byteSize: number(row.byte_size), createdAt: text(row.created_at), expiresAt: text(row.expires_at),
+    } : null;
   }
 
   async recordRewardActivity(activity: RewardActivity): Promise<boolean> {

@@ -35,11 +35,11 @@ function sumUnits(values: string[]) {
 export function DashboardPage() {
   const missions = useAppStore((state) => state.missions);
   const agents = useAppStore((state) => state.agents);
-  const activeMission = missions.find((mission) => mission.status === 'running') ?? missions[0] ?? null;
+  const activeMission = missions.find((mission) => mission.status === 'running' || mission.status === 'paused') ?? missions[0] ?? null;
   const storedStages = useAppStore((state) => activeMission ? state.missionStages[activeMission.id] : undefined);
   const detail = useAppStore((state) => activeMission ? state.missionDetails[activeMission.id] : undefined);
   const loadMissionDetail = useAppStore((state) => state.loadMissionDetail);
-  const running = missions.filter((mission) => mission.status === 'running').length;
+  const running = missions.filter((mission) => mission.status === 'running' || mission.status === 'paused').length;
   const review = missions.filter((mission) => mission.status === 'review').length;
   const budgetTokens = [...new Set(missions.map((mission) => paymentToken(mission.paymentMethod)))];
   const averageSuccess = agents.length ? agents.reduce((total, agent) => total + agent.successRate, 0) / agents.length : 0;

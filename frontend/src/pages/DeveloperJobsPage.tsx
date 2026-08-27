@@ -48,7 +48,7 @@ export function DeveloperJobsPage() {
     id: mission.id,
     agent: mission.team.map((agentId) => agents.find((agent) => agent.id === agentId)?.name ?? agentId).join(' / ') || '待分配',
     title: mission.title,
-    status: mission.status === 'completed' ? '已结算' : mission.status === 'cancelled' ? '已退款终止' : mission.status === 'review' ? '待验收' : mission.status === 'running' ? '执行中' : '匹配中',
+    status: mission.status === 'completed' ? '已结算' : mission.status === 'cancelled' ? '已退款终止' : mission.status === 'review' ? '待验收' : mission.status === 'paused' ? '已暂停' : mission.status === 'running' ? '执行中' : '匹配中',
     reward: mission.budget,
     paymentMethod: mission.paymentMethod,
     progress: mission.progress,

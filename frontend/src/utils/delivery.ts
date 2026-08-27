@@ -1,4 +1,4 @@
-import type { Deliverable, WorkflowStage } from '../types/domain';
+import type { Deliverable, MissionChangeRequest, WorkflowStage } from '../types/domain';
 
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -24,6 +24,27 @@ function meaningfulOutput(stage: WorkflowStage): boolean {
     || (Array.isArray(result.findings) && result.findings.some(hasText));
 }
 
+export function artifactBelongsToCurrentAttempt(stage: WorkflowStage, deliverable: Deliverable): boolean {
+  if (deliverable.stageId !== stage.id) return false;
+  const attemptNo = stage.attemptNo || 1;
+  if (deliverable.attemptNo !== undefined && deliverable.attemptNo !== null) {
+    return deliverable.attemptNo === attemptNo;
+  }
+  return attemptNo === 1;
+}
+
+export function missionDeliverableBelongsToCurrentVersion(
+  deliverable: Deliverable,
+  changeRequests: MissionChangeRequest[],
+): boolean {
+  if (deliverable.stageId) return false;
+  if (changeRequests.length === 0) return true;
+  if (!deliverable.createdAt) return false;
+  const deliveredAt = Date.parse(deliverable.createdAt);
+  const latestChangeAt = Math.max(...changeRequests.map((request) => Date.parse(request.createdAt)));
+  return Number.isFinite(deliveredAt) && Number.isFinite(latestChangeAt) && deliveredAt >= latestChangeAt;
+}
+
 export function deliveryReadiness(stages: WorkflowStage[], deliverables: Deliverable[]) {
   const taskStages = stages.filter((stage) => stage.nodeType === 'task').sort((left, right) => (
     (left.position ?? 0) - (right.position ?? 0)
@@ -32,12 +53,9 @@ export function deliveryReadiness(stages: WorkflowStage[], deliverables: Deliver
     stage.input?.executionMode === 'implement'
     || (stage.input?.executionMode === undefined && taskStages.length >= 3 && index > 0 && index < taskStages.length - 1)
   ));
-  const deliveredStageIds = new Set(
-    deliverables
-      .filter((deliverable) => deliverable.status !== 'rejected' && deliverable.stageId)
-      .map((deliverable) => deliverable.stageId),
-  );
-  const missingArtifactStages = implementStages.filter((stage) => !deliveredStageIds.has(stage.id));
+  const missingArtifactStages = implementStages.filter((stage) => !deliverables.some((deliverable) => (
+    deliverable.status !== 'rejected' && artifactBelongsToCurrentAttempt(stage, deliverable)
+  )));
   const invalidOutputStages = stages.filter((stage) => !meaningfulOutput(stage));
   return {
     ready: stages.length > 0 && invalidOutputStages.length === 0 && missingArtifactStages.length === 0,

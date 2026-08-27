@@ -1,5 +1,11 @@
 import type { Agent, Mission, WorkflowEdge, WorkflowStage, WorkflowViewport } from './contracts';
 import { paymentBudgetPrecision } from './payments';
+import {
+  validateWorkflowCondition,
+  validateWorkflowMappings,
+  workflowMappingTargetsOverlap,
+  WorkflowDslError,
+} from './workflowDsl';
 
 export const MAX_WORKFLOW_NODES = 30;
 export const MAX_WORKFLOW_EDGES = 80;
@@ -195,6 +201,8 @@ export function validateWorkflowGraph(input: {
   }
   const edgeKeys = new Set<string>();
   const edgeIds = new Set<string>();
+  const mappingTargetsByNode = new Map<string, string[]>();
+  const stageById = new Map(stages.map((stage) => [stage.id, stage]));
   for (const edge of edges) {
     if (!edge.id || edge.missionId !== mission.id) throw new WorkflowValidationError('INVALID_EDGE', 'Every edge must belong to this mission');
     if (edgeIds.has(edge.id)) throw new WorkflowValidationError('DUPLICATE_EDGE', 'Workflow edge IDs must be unique');
@@ -203,6 +211,32 @@ export function validateWorkflowGraph(input: {
     const key = `${edge.sourceStageId}\n${edge.targetStageId}`;
     if (edgeKeys.has(key)) throw new WorkflowValidationError('DUPLICATE_EDGE', 'Workflow cannot contain duplicate edges');
     edgeKeys.add(key);
+    try {
+      if (edge.condition) validateWorkflowCondition(edge.condition);
+      const mappings = validateWorkflowMappings(edge.mappings ?? []);
+      if (edge.condition) {
+        const target = stageById.get(edge.targetStageId);
+        if (target?.nodeType !== 'approval' || outgoingStageIds(target.id, edges).length !== 0) {
+          throw new WorkflowValidationError('UNSAFE_CONDITIONAL_BRANCH', 'Conditional edges may only target terminal approval Gates');
+        }
+        if (mappings.length > 0) throw new WorkflowValidationError('INVALID_EDGE_RULE', 'Conditional Gate edges cannot also map task input');
+      }
+      if (mappings.length > 0 && stageById.get(edge.targetStageId)?.nodeType !== 'task') {
+        throw new WorkflowValidationError('INVALID_FIELD_MAPPING', 'Field mappings may only target Agent task nodes');
+      }
+      const targets = mappingTargetsByNode.get(edge.targetStageId) ?? [];
+      for (const mapping of mappings) {
+        if (targets.some((target) => workflowMappingTargetsOverlap(target, mapping.to))) {
+          throw new WorkflowValidationError('DUPLICATE_MAPPING_TARGET', 'Incoming edges cannot write overlapping mappedInput pointers');
+        }
+        targets.push(mapping.to);
+      }
+      mappingTargetsByNode.set(edge.targetStageId, targets);
+    } catch (error) {
+      if (error instanceof WorkflowValidationError) throw error;
+      if (error instanceof WorkflowDslError) throw new WorkflowValidationError(error.code, error.message);
+      throw error;
+    }
   }
   const ordered = topologicalOrder(stages, edges);
   assertWeaklyConnected(stages, edges);
