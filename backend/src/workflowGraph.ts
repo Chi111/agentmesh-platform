@@ -119,6 +119,22 @@ export function layoutWorkflowStages(stages: WorkflowStage[], edges: WorkflowEdg
   });
 }
 
+export function workflowStagesOverlap(left: WorkflowStage, right: WorkflowStage): boolean {
+  return left.positionX < right.positionX + WORKFLOW_LAYOUT_NODE_WIDTH
+    && left.positionX + WORKFLOW_LAYOUT_NODE_WIDTH > right.positionX
+    && left.positionY < right.positionY + WORKFLOW_LAYOUT_NODE_HEIGHT
+    && left.positionY + WORKFLOW_LAYOUT_NODE_HEIGHT > right.positionY;
+}
+
+export function hasWorkflowStageOverlap(stages: WorkflowStage[]): boolean {
+  for (let leftIndex = 0; leftIndex < stages.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < stages.length; rightIndex += 1) {
+      if (workflowStagesOverlap(stages[leftIndex], stages[rightIndex])) return true;
+    }
+  }
+  return false;
+}
+
 function assertWeaklyConnected(stages: WorkflowStage[], edges: WorkflowEdge[]): void {
   if (stages.length <= 1) return;
   const adjacency = new Map(stages.map((stage) => [stage.id, [] as string[]]));
@@ -173,6 +189,9 @@ export function validateWorkflowGraph(input: {
         throw new WorkflowValidationError('INVALID_EXECUTION_MODE', 'Task execution mode must be analyze, implement, or review');
       }
     }
+  }
+  if (hasWorkflowStageOverlap(stages)) {
+    throw new WorkflowValidationError('WORKFLOW_NODE_OVERLAP', 'Workflow nodes cannot overlap');
   }
   const edgeKeys = new Set<string>();
   const edgeIds = new Set<string>();

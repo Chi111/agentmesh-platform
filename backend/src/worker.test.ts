@@ -967,6 +967,22 @@ describe('AgentMesh Worker', () => {
     ]);
     expect(disconnected.body.error.code).toBe('WORKFLOW_DISCONNECTED');
 
+    const missingPosition = await draft([
+      { ...stages[0], positionX: undefined },
+      stages[1],
+      stages[2],
+    ] as unknown as WorkflowStage[], [
+      { id: 'EDGE-position-1', sourceStageId: stages[0].id, targetStageId: stages[1].id },
+      { id: 'EDGE-position-2', sourceStageId: stages[1].id, targetStageId: stages[2].id },
+    ]);
+    expect(missingPosition.body.error.code).toBe('INVALID_NODE_POSITION');
+
+    const overlapping = await draft(stages.map((stage) => ({ ...stage, positionX: 80, positionY: 80 })), [
+      { id: 'EDGE-overlap-1', sourceStageId: stages[0].id, targetStageId: stages[1].id },
+      { id: 'EDGE-overlap-2', sourceStageId: stages[1].id, targetStageId: stages[2].id },
+    ]);
+    expect(overlapping.body.error.code).toBe('WORKFLOW_NODE_OVERLAP');
+
     const badBudget = await draft([
       { ...stages[0], budget: stages[0].budget + 1 },
       stages[1],

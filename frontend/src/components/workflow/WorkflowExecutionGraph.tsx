@@ -9,6 +9,7 @@ import {
   WorkflowNodeCard,
   type WorkflowNodeData,
 } from './WorkflowNodeCard';
+import { hasWorkflowNodeOverlap, layoutWorkflowNodes } from './workflowLayout';
 
 interface Props {
   stages: WorkflowStage[];
@@ -47,7 +48,7 @@ export function WorkflowExecutionGraph({ stages, edges, agents, events, delivera
   const [feedback, setFeedback] = useState('');
   const [reworkIds, setReworkIds] = useState<string[]>([]);
   const blocked = useMemo(() => blockedIds(stages, edges), [edges, stages]);
-  const nodes = useMemo<Array<Node<WorkflowNodeData>>>(() => stages.map((stage) => ({
+  const rawNodes = useMemo<Array<Node<WorkflowNodeData>>>(() => stages.map((stage) => ({
     id: stage.id,
     type: 'workflowNode',
     position: { x: stage.positionX, y: stage.positionY },
@@ -68,6 +69,10 @@ export function WorkflowExecutionGraph({ stages, edges, agents, events, delivera
     animated: stages.find((stage) => stage.id === edge.targetStageId)?.status === 'running',
     style: { stroke: stages.find((stage) => stage.id === edge.sourceStageId)?.status === 'done' ? '#84cc16' : '#667078', strokeWidth: 1.5 },
   })), [edges, stages]);
+  const nodes = useMemo(
+    () => hasWorkflowNodeOverlap(rawNodes) ? layoutWorkflowNodes(rawNodes, flowEdges) : rawNodes,
+    [flowEdges, rawNodes],
+  );
   const selected = stages.find((stage) => stage.id === selectedId) ?? null;
   const upstream = selected ? edges.filter((edge) => edge.targetStageId === selected.id)
     .map((edge) => stages.find((stage) => stage.id === edge.sourceStageId))

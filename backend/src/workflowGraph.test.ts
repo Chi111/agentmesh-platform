@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Mission, WorkflowEdge, WorkflowStage } from './contracts';
-import { workflowAggregate } from './workflowGraph';
+import { hasWorkflowStageOverlap, layoutWorkflowStages, validateWorkflowGraph, workflowAggregate } from './workflowGraph';
 
 const missionId = 'MISSION-weighted-progress';
 const now = '2026-08-22T00:00:00.000Z';
@@ -89,5 +89,27 @@ describe('workflowAggregate', () => {
 
     expect(workflowAggregate([taskNode, gate], edges)).toMatchObject({ progress: 99, currentStage: '1 个待审批' });
     expect(workflowAggregate([taskNode, { ...gate, status: 'done' }], edges)).toMatchObject({ progress: 100, currentStage: '工作流已完成，等待验收' });
+  });
+});
+
+describe('workflow layout validation', () => {
+  it('rejects overlapping persisted coordinates and accepts the same graph after layout', () => {
+    const stages = [
+      stage({ id: 'STAGE-overlap-a', position: 1, budget: 100, status: 'queued', positionX: 80, positionY: 80 }),
+      stage({ id: 'STAGE-overlap-b', position: 2, budget: 200, status: 'queued', positionX: 80, positionY: 80 }),
+    ];
+    const edges: WorkflowEdge[] = [{
+      id: 'EDGE-overlap',
+      missionId,
+      sourceStageId: stages[0].id,
+      targetStageId: stages[1].id,
+      createdAt: now,
+    }];
+
+    expect(() => validateWorkflowGraph({ mission, stages, edges })).toThrow('Workflow nodes cannot overlap');
+
+    const laidOut = layoutWorkflowStages(stages, edges);
+    expect(hasWorkflowStageOverlap(laidOut)).toBe(false);
+    expect(validateWorkflowGraph({ mission, stages: laidOut, edges })).toHaveLength(2);
   });
 });

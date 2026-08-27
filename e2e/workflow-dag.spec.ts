@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
 
 const now = '2026-08-22T12:00:00.000Z';
 const requester = { id: 'USER-e2e-requester', email: 'requester@example.test', displayName: 'E2E Requester', role: 'requester' };
@@ -54,6 +54,23 @@ test.beforeEach(async ({ page }) => {
 
 function envelope(data: unknown) {
   return { data, meta: { requestId: 'REQ-e2e' } };
+}
+
+async function expectNoNodeOverlap(nodes: Locator) {
+  await expect.poll(async () => {
+    const boxes = await nodes.evaluateAll((items) => items.map((item) => {
+      const box = item.getBoundingClientRect();
+      return { left: box.left, right: box.right, top: box.top, bottom: box.bottom };
+    }));
+    for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
+        const left = boxes[leftIndex];
+        const right = boxes[rightIndex];
+        if (!(left.right <= right.left || right.right <= left.left || left.bottom <= right.top || right.bottom <= left.top)) return false;
+      }
+    }
+    return true;
+  }).toBe(true);
 }
 
 async function mockWorkspace(page: Page, missionDetail: Record<string, unknown>, onRequest?: (route: Route) => boolean | Promise<boolean>) {
@@ -164,6 +181,19 @@ test('desktop editor creates nodes by drag and connects handles', async ({ page 
   await expect(page.locator('.react-flow__node')).toHaveCount(4);
 });
 
+test('desktop quick add places every new node in a free slot', async ({ page }) => {
+  const detail = { mission: baseMission, stages: draftStages, edges: draftEdges, offers: [], events: [], deliverables: [], escrow: { status: 'pending', amount: 300, token: 'CREDIT', network: 'web2' }, disputes: [] };
+  await mockWorkspace(page, detail);
+  await page.goto(`/#/missions/${baseMission.id}/workflow`);
+
+  const quickAdd = page.locator('.workflow-library-sidebar').getByRole('button', { name: 'Agent 任务' });
+  await quickAdd.click();
+  await quickAdd.click();
+  const nodes = page.locator('.react-flow__node');
+  await expect(nodes).toHaveCount(5);
+  await expectNoNodeOverlap(nodes);
+});
+
 test('funded workflow locks graph mutation including keyboard deletion', async ({ page }) => {
   const lockedMission = { ...baseMission, status: 'running', currentStage: '2 个节点执行中' };
   const detail = {
@@ -194,6 +224,11 @@ test('mobile editor keeps a full canvas and opens node configuration as a bottom
   await expect(page.getByRole('button', { name: '任务' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Gate' })).toBeVisible();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollHeight <= window.innerHeight)).toBe(true);
+  await page.getByRole('button', { name: '任务', exact: true }).click();
+  await page.getByRole('button', { name: '任务', exact: true }).click();
+  await expect(page.locator('.react-flow__node')).toHaveCount(5);
+  await expectNoNodeOverlap(page.locator('.react-flow__node'));
+  await page.getByRole('button', { name: '关闭' }).click();
   await page.locator('.react-flow__node[data-id="STAGE-analysis"]').click();
   const drawer = page.locator('aside').filter({ has: page.getByText('节点配置') });
   await expect(drawer).toBeVisible();
@@ -246,17 +281,7 @@ test('AI compile replaces the draft graph without assigning an Agent', async ({ 
   await page.getByRole('button', { name: 'AI 智能编排' }).click();
   await expect.poll(() => compiled).toBe(true);
   await expect(page.getByText('AI 需求分析', { exact: true }).first()).toBeVisible();
-  const boxes = await page.locator('.react-flow__node').evaluateAll((nodes) => nodes.map((node) => {
-    const box = node.getBoundingClientRect();
-    return { left: box.left, right: box.right, top: box.top, bottom: box.bottom };
-  }));
-  for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
-      const left = boxes[leftIndex];
-      const right = boxes[rightIndex];
-      expect(left.right <= right.left || right.right <= left.left || left.bottom <= right.top || right.bottom <= left.top).toBe(true);
-    }
-  }
+  await expectNoNodeOverlap(page.locator('.react-flow__node'));
   await page.getByText('AI 需求分析', { exact: true }).first().click();
   await expect(page.getByLabel('Agent（不自动选择）')).toHaveValue('');
 });
@@ -267,7 +292,7 @@ test('execution graph exposes Agent, events, artifacts and Gate controls per nod
   const executionStages = [
     { ...draftStages[0], status: 'done', progress: 100, agentId: 'AGENT-pinme', output: { summary: '架构分析已完成', risks: ['依赖升级风险'] } },
     { ...draftStages[1], status: 'running', progress: 40, agentId: 'AGENT-ds' },
-    { ...draftStages[1], id: 'STAGE-failed', name: '失败节点', status: 'failed', progress: 0, agentId: 'AGENT-ds', positionX: 460, positionY: 340 },
+    { ...draftStages[1], id: 'STAGE-failed', name: '失败节点', status: 'failed', progress: 0, agentId: 'AGENT-ds' },
     { ...draftStages[2], status: 'running', progress: 0 },
   ];
   const executionEdges = [{ id: 'EDGE-analysis-gate', missionId: baseMission.id, sourceStageId: 'STAGE-analysis', targetStageId: 'STAGE-gate' }];
@@ -295,6 +320,7 @@ test('execution graph exposes Agent, events, artifacts and Gate controls per nod
   await page.goto(`/#/missions/${baseMission.id}/execution`);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollHeight <= window.innerHeight)).toBe(true);
   const executionFlow = page.locator('.workflow-execution-flow');
+  await expectNoNodeOverlap(executionFlow.locator('.react-flow__node'));
   await expect(executionFlow).toHaveClass(/dark/);
   await expect(executionFlow.locator('.react-flow__attribution')).toHaveCSS('background-color', 'rgba(13, 17, 23, 0.82)');
   await expect(executionFlow.locator('.react-flow__controls-button').first()).toHaveCSS('background-color', 'rgb(22, 33, 41)');

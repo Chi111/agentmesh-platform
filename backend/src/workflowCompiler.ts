@@ -394,10 +394,11 @@ export function adaptiveFallbackCompilation(
     edges,
   }), mission);
   if (!parsed) throw new Error('Adaptive workflow fallback could not be normalized');
-  parsed.stages = layoutWorkflowStages(
-    validateWorkflowGraph({ mission, stages: parsed.stages, edges: parsed.edges }),
-    parsed.edges,
-  );
+  parsed.stages = validateWorkflowGraph({
+    mission,
+    stages: layoutWorkflowStages(parsed.stages, parsed.edges),
+    edges: parsed.edges,
+  });
   parsed.spec = {
     ...parsed.spec,
     source: 'adaptive-fallback',
@@ -585,7 +586,11 @@ function validateCandidate(
   const compilation = parseLlmCompilation(json, mission);
   if (!compilation) return { errors: ['The planner JSON is missing valid nodes or exceeds platform limits.'] };
   try {
-    compilation.stages = validateWorkflowGraph({ mission, stages: compilation.stages, edges: compilation.edges });
+    compilation.stages = validateWorkflowGraph({
+      mission,
+      stages: layoutWorkflowStages(compilation.stages, compilation.edges),
+      edges: compilation.edges,
+    });
   } catch (error) {
     return { errors: [error instanceof Error ? error.message.slice(0, 500) : 'Workflow graph validation failed.'] };
   }

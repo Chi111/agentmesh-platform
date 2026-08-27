@@ -1,5 +1,4 @@
 import '@xyflow/react/dist/style.css';
-import dagre from '@dagrejs/dagre';
 import {
   Background,
   Controls,
@@ -46,6 +45,7 @@ import {
   WorkflowNodeCard,
   type WorkflowNodeData,
 } from './WorkflowNodeCard';
+import { findFreeWorkflowNodePosition, hasWorkflowNodeOverlap, layoutWorkflowNodes } from './workflowLayout';
 
 type FlowNode = Node<WorkflowNodeData>;
 type Snapshot = { nodes: FlowNode[]; edges: Edge[] };
@@ -124,6 +124,7 @@ function graphError(nodes: FlowNode[], edges: Edge[], mission: Mission, requireA
   if (!nodes.length) return '工作流至少需要一个节点。';
   if (nodes.length > 30) return '首版最多支持 30 个节点。';
   if (edges.length > 80) return '首版最多支持 80 条边。';
+  if (hasWorkflowNodeOverlap(nodes)) return '节点不能互相重叠，请移动节点或使用自动布局。';
   for (const node of nodes) {
     const stage = node.data.stage;
     if (stage.name.trim().length < 2 || stage.purpose.trim().length < 2) return '每个节点都需要完整的名称和目标说明。';
@@ -192,24 +193,6 @@ function graphError(nodes: FlowNode[], edges: Edge[], mission: Mission, requireA
   return null;
 }
 
-function autoLayout(nodes: FlowNode[], edges: Edge[]): FlowNode[] {
-  const graph = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
-  graph.setGraph({ rankdir: 'LR', ranksep: 90, nodesep: 55, marginx: 40, marginy: 40 });
-  nodes.forEach((node) => graph.setNode(node.id, { width: WORKFLOW_NODE_WIDTH, height: WORKFLOW_NODE_HEIGHT }));
-  edges.forEach((edge) => graph.setEdge(edge.source, edge.target));
-  dagre.layout(graph);
-  return nodes.map((node) => {
-    const position = graph.node(node.id);
-    return {
-      ...node,
-      position: {
-        x: position.x - WORKFLOW_NODE_WIDTH / 2,
-        y: position.y - WORKFLOW_NODE_HEIGHT / 2,
-      },
-    };
-  });
-}
-
 function wouldCreateCycle(source: string, target: string, edges: Edge[]): boolean {
   const outgoing = new Map<string, string[]>();
   edges.forEach((edge) => outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge.target]));
@@ -276,8 +259,10 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
     if (dirtyRef.current && !serverVersionChanged) return;
     const nextEdges = resolvedEdges.map(flowEdge);
     const nextNodes = stages.map((stage, index) => stageNode(stage, agents, index));
-    setNodes(serverVersionChanged && layoutNextCompilationRef.current
-      ? autoLayout(nextNodes, nextEdges)
+    const shouldLayout = hasWorkflowNodeOverlap(nextNodes)
+      || (serverVersionChanged && layoutNextCompilationRef.current);
+    setNodes(shouldLayout
+      ? layoutWorkflowNodes(nextNodes, nextEdges)
       : nextNodes);
     setEdges(nextEdges);
     setViewport(missionViewport);
@@ -368,9 +353,10 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
       return;
     }
     remember();
+    const freePosition = findFreeWorkflowNodePosition(nodes, position);
     const id = `STAGE-${crypto.randomUUID()}`;
     const stage: WorkflowStage = {
-      id, missionId: mission.id, position: nodes.length + 1, nodeType, positionX: position.x, positionY: position.y,
+      id, missionId: mission.id, position: nodes.length + 1, nodeType, positionX: freePosition.x, positionY: freePosition.y,
       progress: 0, name: nodeType === 'task' ? '新任务节点' : '人工审批 Gate',
       purpose: nodeType === 'task' ? '描述这个节点需要独立完成的目标。' : '检查所有直接上游结果是否达到审批标准。',
       category: nodeType === 'task' ? mission.category : '人工审批', budget: 0, status: 'queued', agentId: null,
@@ -435,7 +421,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const layout = () => {
     if (locked) return;
     remember();
-    setNodes((items) => autoLayout(items, edges));
+    setNodes((items) => layoutWorkflowNodes(items, edges));
     markDirty();
     window.setTimeout(() => instance?.fitView({ padding: 0.18, duration: 350 }), 0);
   };
@@ -549,7 +535,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
               type="button"
               draggable={!locked}
               onDragStart={(event) => { event.dataTransfer.setData('application/agentmesh-node', item.type); event.dataTransfer.effectAllowed = 'move'; }}
-              onClick={() => addNode(item.type, { x: 80 + nodes.length * 30, y: 100 + nodes.length * 25 })}
+              onClick={() => addNode(item.type)}
               className="mb-2 flex w-full items-center gap-3 rounded-xl border border-line bg-white p-3 text-left transition hover:border-cyan hover:shadow-sm"
               key={item.type}
               disabled={locked}

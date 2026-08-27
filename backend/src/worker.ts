@@ -514,8 +514,12 @@ function workflowDraftFromBody(
     const existing = existingById.get(id);
     const budget = nodeType === 'approval' ? 0 : Number(node.budget);
     if (!Number.isFinite(budget) || budget < 0 || budget > mission.budget) throw new ApiError(400, 'VALIDATION_ERROR', `Node ${id} has an invalid budget`);
-    const positionX = Number(node.positionX);
-    const positionY = Number(node.positionY);
+    if (typeof node.positionX !== 'number' || !Number.isFinite(node.positionX)
+      || typeof node.positionY !== 'number' || !Number.isFinite(node.positionY)) {
+      throw new ApiError(400, 'INVALID_NODE_POSITION', `Node ${id} requires finite numeric coordinates`);
+    }
+    const positionX = node.positionX;
+    const positionY = node.positionY;
     const agentId = nodeType === 'task' && typeof node.agentId === 'string' && node.agentId.trim() ? node.agentId.trim() : null;
     const rawInput = recordValue(node, 'input');
     let normalizedInput: Record<string, unknown>;
@@ -546,8 +550,8 @@ function workflowDraftFromBody(
       missionId: mission.id,
       position: index + 1,
       nodeType,
-      positionX: Number.isFinite(positionX) ? Math.max(-100_000, Math.min(100_000, positionX)) : 0,
-      positionY: Number.isFinite(positionY) ? Math.max(-100_000, Math.min(100_000, positionY)) : 0,
+      positionX: Math.max(-100_000, Math.min(100_000, positionX)),
+      positionY: Math.max(-100_000, Math.min(100_000, positionY)),
       progress: 0,
       name: requiredString(node, 'name', 2, 120),
       purpose: requiredString(node, 'purpose', 2, 600),
