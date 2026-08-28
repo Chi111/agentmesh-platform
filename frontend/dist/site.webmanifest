@@ -1,0 +1,17 @@
+{
+  "name": "pinme-mesh",
+  "short_name": "pinme-mesh",
+  "description": "pinme-mesh — AI Agent 任务拆解、智能组队、执行监控与可信结算平台",
+  "start_url": "/#/dashboard",
+  "display": "standalone",
+  "background_color": "#F4F5F1",
+  "theme_color": "#0D1117",
+  "icons": [
+    {
+      "src": "/pinme-mesh-mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

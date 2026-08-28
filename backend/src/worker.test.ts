@@ -5,6 +5,7 @@ import { MemoryPlatformStore } from './memoryStore';
 import { buildSettlementPlan, settlementDescriptor } from './chain';
 import { looksLikePrivyToken, verifyPrivyIdentityToken, verifyPrivyToken } from './privy';
 import { createApp, resolveWorkflowTransitions } from './worker';
+import { sha256Json } from './ipfsEvidence';
 
 type JsonBody = Record<string, any>;
 
@@ -21,6 +22,7 @@ let deliveredEmails: Array<{ to: string; subject: string; html: string }>;
 let currentNow: string;
 let requestedLlmModels: Array<string | undefined>;
 let requestedLlmInputs: JsonBody[];
+let ipfsResponder: (() => Response | Promise<Response>) | null;
 
 const testEnv: {
   API_KEY: string;
@@ -30,6 +32,7 @@ const testEnv: {
   AGENT_CREDENTIALS_ENCRYPTED_JSON?: string;
   AGENT_QUALITY_GATE_MODE?: string;
   EXPORT_SERVICE_TOKEN?: string;
+  IPFS_GATEWAY_BASE?: string;
   YD_RPC_URL: string;
   YD_CHAIN_ID: string;
   YD_TOKEN_ADDRESS: string;
@@ -207,11 +210,13 @@ beforeEach(() => {
   deliveredEmails = [];
   requestedLlmModels = [];
   requestedLlmInputs = [];
+  ipfsResponder = null;
   currentNow = '2026-08-16T00:00:00.000Z';
   delete testEnv.AGENT_CREDENTIALS_JSON;
   delete testEnv.AGENT_CREDENTIALS_ENCRYPTED_JSON;
   delete testEnv.AGENT_QUALITY_GATE_MODE;
   delete testEnv.EXPORT_SERVICE_TOKEN;
+  delete testEnv.IPFS_GATEWAY_BASE;
   store = new MemoryPlatformStore();
   store.profiles.set(requester.id, requester);
   store.profiles.set(developer.id, developer);
@@ -230,7 +235,8 @@ beforeEach(() => {
       return { uid, provider: 'pinme', email: profile?.email, displayName: profile?.displayName, claims: {} };
     },
     now: () => new Date(currentNow),
-    fetcher: async (_input, init) => {
+    fetcher: async (input, init) => {
+      if (String(input).includes('/ipfs/') && ipfsResponder) return ipfsResponder();
       dispatchedBody = JSON.parse(String(init?.body ?? '{}')) as JsonBody;
       dispatchedBodies.push(dispatchedBody);
       const headers = new Headers(init?.headers);
@@ -323,6 +329,14 @@ describe('AgentMesh Worker', () => {
     const publicConfig = await api('/api/yd/config');
     expect(publicConfig.response.status).toBe(200);
     expect(publicConfig.body.data).toMatchObject({ configured: true, escrowSeparated: true, earnVaultEnabled: false });
+    expect(publicConfig.body.data.publicAsset).toEqual({
+      name: 'pinme-mesh Contribution',
+      symbol: 'PM',
+      testName: 'pinme-mesh Test PM',
+      testSymbol: 'PM',
+      purpose: 'contribution_and_governance',
+      officialPinmeToken: false,
+    });
 
     const forbidden = await api('/api/yd/admin/epochs', {
       method: 'POST', body: JSON.stringify({}),
@@ -590,21 +604,36 @@ describe('AgentMesh Worker', () => {
   });
 
   it('defaults CORS to the production domains instead of a wildcard', async () => {
-    const primaryDomain = await app.fetch(new Request('http://local.test/api/health', {
-      headers: { Origin: 'https://agentmesh.pinit.eth.limo' },
-    }), testEnv);
-    const pinmeDomain = await app.fetch(new Request('http://local.test/api/health', {
-      headers: { Origin: 'https://agentmesh.pinme.dev' },
+    const productionDomains = [
+      'https://agentmesh.pinit.eth.limo',
+      'https://mesh-pinme.pinit.eth.limo',
+      'https://meshpin-agentmesh.pinit.eth.limo',
+      'https://agentmesh.pinme.dev',
+      'https://mesh-pinme.pinme.dev',
+      'https://meshpin-agentmesh.pinme.dev',
+    ];
+    const responses = await Promise.all(productionDomains.map((origin) => app.fetch(
+      new Request('http://local.test/api/health', { headers: { Origin: origin } }),
+      testEnv,
+    )));
+    const preflight = await app.fetch(new Request('http://local.test/api/health', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://mesh-pinme.pinme.dev',
+        'Access-Control-Request-Method': 'GET',
+      },
     }), testEnv);
     const rejected = await app.fetch(new Request('http://local.test/api/health', {
       headers: { Origin: 'https://evil.example' },
     }), testEnv);
 
-    expect(primaryDomain.status).toBe(200);
-    expect(primaryDomain.headers.get('Access-Control-Allow-Origin')).toBe('https://agentmesh.pinit.eth.limo');
-    expect(primaryDomain.headers.get('Strict-Transport-Security')).toContain('max-age=31536000');
-    expect(pinmeDomain.status).toBe(200);
-    expect(pinmeDomain.headers.get('Access-Control-Allow-Origin')).toBe('https://agentmesh.pinme.dev');
+    responses.forEach((response, index) => {
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe(productionDomains[index]);
+    });
+    expect(responses[0].headers.get('Strict-Transport-Security')).toContain('max-age=31536000');
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('https://mesh-pinme.pinme.dev');
     expect(rejected.status).toBe(403);
     expect(rejected.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });
@@ -817,6 +846,29 @@ describe('AgentMesh Worker', () => {
 
     const users = await api('/api/admin/users', {}, admin.id);
     expect(users.body.data.find((item: JsonBody) => item.id === otherDeveloper.id).arbitration).toEqual({ status: 'active', power: 7 });
+  });
+
+  it('lets an active arbitration member read the frozen dispute dossier without ordinary Mission access', async () => {
+    const { mission } = await createFundedMission();
+    const opened = await api(`/api/missions/${mission.id}/disputes`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: '需要独立委员核对冻结交付、验收标准和工作流版本。', evidence: [] }),
+    }, requester.id);
+    expect(opened.response.status).toBe(201);
+    const disputeId = opened.body.data.id as string;
+    const evidenceReviewer = {
+      id: 'USER-evidence-reviewer', email: 'evidence-reviewer@example.test',
+      displayName: 'Evidence Reviewer', role: 'requester' as const,
+    };
+    store.profiles.set(evidenceReviewer.id, evidenceReviewer);
+    await store.setArbitrationMember(evidenceReviewer.id, true, admin.id, currentNow, 1);
+
+    const frozenDossier = await api(
+      `/api/missions/${mission.id}/evidence/dossier?kind=dispute&subjectId=${encodeURIComponent(disputeId)}`,
+      {}, evidenceReviewer.id,
+    );
+    expect(frozenDossier.response.status).toBe(200);
+    expect(frozenDossier.body.data.dossier).toMatchObject({ kind: 'dispute', subjectId: disputeId, missionId: mission.id });
   });
 
   it('freezes Power voting, preserves the first round, and allows exactly one expanded-council appeal', async () => {
@@ -2734,6 +2786,54 @@ describe('AgentMesh Worker', () => {
     }, developer.id);
     expect(submitted.response.status).toBe(201);
 
+    const implementStage = (store.stages.get(mission.id) ?? []).find((stage) => stage.input.executionMode === 'implement')!;
+    const evidenceContext = await api(`/api/missions/${mission.id}/evidence/context?stageId=${encodeURIComponent(implementStage.id)}`, {}, developer.id);
+    expect(evidenceContext.response.status).toBe(200);
+    const manifest = {
+      ...evidenceContext.body.data.manifestTemplate,
+      logicalName: 'PinMe 证据目录',
+      files: [{ path: 'report.json', sha256: `sha256:${'b'.repeat(64)}`, mimeType: 'application/json', byteSize: 42 }],
+    };
+    const ipfsSubmitted = await api(`/api/missions/${mission.id}/deliverables`, {
+      method: 'POST',
+      body: JSON.stringify({
+        stageId: implementStage.id,
+        name: manifest.logicalName,
+        ipfsEvidence: {
+          rootCid: 'bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm',
+          manifestSha256: await sha256Json(manifest), manifest, visibility: 'public', supersedesDeliverableId: null,
+        },
+      }),
+    }, developer.id);
+    expect(ipfsSubmitted.response.status).toBe(201);
+    expect(ipfsSubmitted.body.data.ipfsEvidence).toMatchObject({ versionNo: 1, verificationStatus: 'declared' });
+
+    const unavailableVerification = await api(`/api/missions/${mission.id}/deliverables/${ipfsSubmitted.body.data.id}/verify`, {
+      method: 'POST', body: '{}',
+    }, developer.id);
+    expect(unavailableVerification.response.status).toBe(200);
+    expect(unavailableVerification.body.data.ipfsEvidence.verificationStatus).toBe('unavailable');
+
+    testEnv.IPFS_GATEWAY_BASE = 'https://gateway.example.test';
+    ipfsResponder = () => new Response('x'.repeat(256 * 1024 + 1), { status: 200 });
+    const oversizedVerification = await api(`/api/missions/${mission.id}/deliverables/${ipfsSubmitted.body.data.id}/verify`, {
+      method: 'POST', body: '{}',
+    }, developer.id);
+    expect(oversizedVerification.body.data.ipfsEvidence.verificationStatus).toBe('invalid_manifest');
+
+    ipfsResponder = () => Response.json(manifest);
+    const verified = await api(`/api/missions/${mission.id}/deliverables/${ipfsSubmitted.body.data.id}/verify`, {
+      method: 'POST', body: '{}',
+    }, developer.id);
+    expect(verified.body.data.ipfsEvidence.verificationStatus).toBe('verified');
+
+    ipfsResponder = () => new Response(null, { status: 302, headers: { Location: 'https://redirect.example.test/manifest.json' } });
+    const redirected = await api(`/api/missions/${mission.id}/deliverables/${ipfsSubmitted.body.data.id}/verify`, {
+      method: 'POST', body: '{}',
+    }, developer.id);
+    expect(redirected.body.data.ipfsEvidence.verificationStatus).toBe('verified');
+    expect(redirected.body.data.ipfsEvidence.lastVerificationError).toContain('HTTP 302');
+
     const prematureReview = await api(`/api/missions/${mission.id}/review`, { method: 'POST', body: '{}' }, developer.id);
     expect(prematureReview.response.status).toBe(409);
     expect(prematureReview.body.error.code).toBe('WORKFLOW_INCOMPLETE');
@@ -2755,6 +2855,24 @@ describe('AgentMesh Worker', () => {
     expect(accepted.response.status).toBe(200);
     expect(accepted.body.data.mission.status).toBe('completed');
     expect(accepted.body.data.escrow.status).toBe('released');
+    expect(accepted.body.data.deliverables.find((item: JsonBody) => item.id === ipfsSubmitted.body.data.id).ipfsEvidence.rootCid)
+      .toBe(ipfsSubmitted.body.data.ipfsEvidence.rootCid);
+
+    const dossier = await api(`/api/missions/${mission.id}/evidence/dossier?kind=acceptance&subjectId=${encodeURIComponent(mission.id)}`, {}, requester.id);
+    expect(dossier.response.status).toBe(200);
+    expect(dossier.body.data.dossier.snapshot.acceptanceCriteriaSha256).toBe(evidenceContext.body.data.acceptanceCriteriaSha256);
+    expect(dossier.body.data.dossier.snapshot.deliverables).toEqual(expect.arrayContaining([
+      expect.objectContaining({ deliverableId: ipfsSubmitted.body.data.id, versionNo: 1 }),
+    ]));
+    expect(dossier.body.data.payloadSha256).toMatch(/^sha256:[a-f0-9]{64}$/);
+    const mismatchedDossier = await api(`/api/missions/${mission.id}/evidence/dossier?kind=acceptance&subjectId=MISSION_OTHER`, {}, requester.id);
+    expect(mismatchedDossier.response.status).toBe(400);
+    expect(mismatchedDossier.body.error.code).toBe('INVALID_DOSSIER_SUBJECT');
+
+    const quality = await api(`/api/agents/${encodeURIComponent(implementStage.agentId)}/quality`);
+    expect(quality.body.data.cidPortfolio).toEqual(expect.arrayContaining([
+      expect.objectContaining({ missionId: mission.id, rootCid: ipfsSubmitted.body.data.ipfsEvidence.rootCid }),
+    ]));
 
     const ledger = await api('/api/developer/ledger?limit=20', {}, developer.id);
     expect(ledger.response.status).toBe(200);

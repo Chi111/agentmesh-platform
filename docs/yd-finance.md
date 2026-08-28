@@ -1,24 +1,26 @@
-# YD Rewards and Governance
+# pinme-mesh Contribution (PM) Rewards and Governance
+
+Public branding is `pinme-mesh Contribution / PM`; internal contract filenames, `/api/yd/*` routes and `YD_*` environment variables remain unchanged for compatibility. PM is the pinme-mesh contribution and governance asset name, not a PinMe-official token.
 
 AgentMesh keeps four ledgers separate:
 
 1. task settlement (`mUSDC`, `sETH`, or Web2 CREDIT),
 2. real yield (not implemented in this release),
-3. YD contribution rewards,
+3. PM contribution rewards,
 4. non-transferable governance Power.
 
-The Phase 1/2 implementation does not modify `AgentMeshEscrow` and never uses escrowed task funds to pay YD rewards.
+The Phase 1/2 implementation does not modify `AgentMeshEscrow` and never uses escrowed task funds to pay PM rewards.
 
 ## Release scope
 
 - `YDRewardDistributor`: immutable, Treasury-prefunded Merkle reward epochs. It has no mint function.
-- `YDStaking`: verified-account YD locks, reputation-adjusted Power, delegation and historical checkpoints.
+- `YDStaking`: verified-account PM locks, reputation-adjusted Power, delegation and historical checkpoints.
 - `TestYDToken`: fixed-supply Sepolia mapping token for testing only.
 - D1 reward activities, epochs, allocations, claims, staking read models, governance snapshots and votes.
 - Worker APIs that verify chain receipts/events before recording claims, publications or staking state.
 - `/yd-finance`: reward claim, staking, delegation and ecosystem voting UI.
 
-Not included: Earn Vaults, real APY, real DeFi strategies, cross-chain YD, task-dispute token voting, or runtime mutation of task escrow.
+Not included: Earn Vaults, real APY, real DeFi strategies, cross-chain PM, task-dispute token voting, or runtime mutation of task escrow.
 
 ## Phase 0 deployment gate
 
@@ -38,6 +40,15 @@ Mainnet remains blocked until contract audit and economic-model stress testing a
 
 ## Sepolia deployment
 
+Current PM test deployment:
+
+- Token: `0xfdf06a468dcc7464c3871057acd863d6bc514bae` (`pinme-mesh Test PM / PM`, fixed supply `100,000,000`)
+- Reward distributor: `0x852c36af469f0eea10c6aa26cf9489423c7d037e`
+- Staking and Power: `0x9875e2eabe942dd9f8dd0e7bcb6f36071040a5c2`
+- Chain: Sepolia (`11155111`); admin and Treasury use the dedicated test deployment wallet recorded in `shared/pmDeployment.ts`.
+
+The public deployment metadata is centralized in `shared/pmDeployment.ts`. Runtime variables are optional overrides, not a second required source of truth.
+
 Compile and deploy without writing a private key to repository files:
 
 ```bash
@@ -56,6 +67,20 @@ YD_DEPLOY_TEST_TOKEN=true YD_TEST_SUPPLY=100000000 npm run deploy:yd:sepolia
 ```
 
 The script verifies the chain and deployed constructor state. It does not publish roots or move Treasury funds.
+
+After deployment, the reversible Sepolia smoke run exercises the live reward and staking lifecycle, then restores zero Distributor/Staking token balances and zero locked Power:
+
+```bash
+npm run smoke:pm:sepolia
+```
+
+The smoke signer must be the configured test admin. It funds and publishes a single-account reward epoch, claims it, recovers unused pool funds, verifies the account, approves and locks PM, checks delegated Power, then uses the paused emergency path to return the lock. Every transaction and final invariant is printed for audit.
+
+Independently verify a completed epoch through the public read-only RPC, without loading a private key:
+
+```bash
+PM_VERIFY_EPOCH=<epoch-id> npm run verify:pm:sepolia
+```
 
 ## Runtime configuration
 
@@ -91,7 +116,7 @@ Reward roots are immutable. Corrections require a new epoch, not a root replacem
 
 1. A role-separated account with `ACCOUNT_VERIFIER_ROLE` verifies a wallet already bound to an AgentMesh profile.
 2. `REPUTATION_MANAGER_ROLE` may set the bounded reputation coefficient (0.5–1.5x).
-3. The user locks YD for 30–730 days. The contract checkpoints Power through OpenZeppelin `Votes`.
+3. The user locks PM for 30–730 days. The contract checkpoints Power through OpenZeppelin `Votes`.
 4. Revoking account verification immediately removes its Power. An expired lock also has zero effective Power, but checkpointed voting units require a transaction; anyone may call `syncExpiredPower(account)` before a snapshot.
 5. Ecosystem proposal creation reads `getPastVotes` at a confirmation-safe historical block and persists an immutable electorate. A requested block newer than the safe head is rejected.
 6. Before accepting a snapshot, the Worker checks every linked electorate wallet at that block. Stale Power from an expired/revoked/inconsistent position fails with `YD_POWER_REQUIRES_SYNC`; call the permissionless cleanup, wait for confirmations, and create the proposal at a later block.

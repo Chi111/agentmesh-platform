@@ -18,6 +18,7 @@ import type {
   AuthIdentityInput,
   DeveloperLedger,
   Deliverable,
+  DeliverableIpfsEvidence,
   Dispute,
   DisputeAction,
   DisputeAppealResult,
@@ -35,7 +36,9 @@ import type {
   EcosystemVoteChoice,
   EcosystemVoteResult,
   Escrow,
+  EvidencePublication,
   ExecutionEvent,
+  AgentCidPortfolioItem,
   GovernancePowerSnapshot,
   GovernanceExecutionItem,
   IdempotencyClaim,
@@ -48,6 +51,7 @@ import type {
   LedgerExportPrivateArtifact,
   LedgerExportRequestResult,
   Mission,
+  MissionEvidenceSnapshot,
   MissionChangeRequest,
   MissionPauseMode,
   Notification,
@@ -75,6 +79,7 @@ import type {
   WorkflowTemplateVersion,
   WorkflowViewport,
 } from './contracts';
+import { BRAND, normalizePlatformUserName } from '../../shared/brand';
 import { AGENT_QUALITY_FORMULA_VERSION, calculateAgentQuality, feedbackWeightForPriorCount } from './agentQuality';
 import {
   arbitrationAppealEndsAt,
@@ -132,11 +137,13 @@ function boolean(value: unknown): boolean {
   return value === true || value === 1 || value === '1';
 }
 
+const defaultUserNamePlaceholders = BRAND.platform.defaultUserNames.map(() => '?').join(', ');
+
 function mapProfile(row: Row): UserContext {
   return {
     id: text(row.id),
     email: text(row.email) || undefined,
-    displayName: text(row.display_name) || 'AgentMesh User',
+    displayName: normalizePlatformUserName(text(row.display_name)),
     role: text(row.role) as UserContext['role'],
     walletAddress: text(row.wallet_address) || undefined,
   };
@@ -157,7 +164,7 @@ function mapAdminUser(row: Row): AdminUser {
 function mapArbitrationMember(row: Row): ArbitrationMember {
   return {
     userId: text(row.user_id),
-    displayName: text(row.display_name) || 'AgentMesh User',
+    displayName: normalizePlatformUserName(text(row.display_name)),
     email: text(row.email) || undefined,
     role: text(row.role) as ArbitrationMember['role'],
     status: text(row.status) as ArbitrationMember['status'],
@@ -216,7 +223,7 @@ function mapGovernanceExecution(row: Row): GovernanceExecutionItem {
 function mapArbitrationElector(row: Row): ArbitrationElector {
   return {
     userId: text(row.user_id),
-    displayName: text(row.display_name) || 'AgentMesh User',
+    displayName: normalizePlatformUserName(text(row.display_name)),
     powerSnapshot: number(row.power_snapshot),
     voteWeight: number(row.vote_weight),
   };
@@ -227,7 +234,7 @@ function mapDisputeVote(row: Row): DisputeVote {
     id: text(row.id),
     proposalId: text(row.proposal_id),
     voterId: text(row.voter_id),
-    voterDisplayName: text(row.display_name) || 'AgentMesh User',
+    voterDisplayName: normalizePlatformUserName(text(row.display_name)),
     choice: text(row.choice) as DisputeVote['choice'],
     reason: text(row.reason),
     voteWeight: number(row.vote_weight),
@@ -682,6 +689,22 @@ function mapEvent(row: Row): ExecutionEvent {
 }
 
 function mapDeliverable(row: Row): Deliverable {
+  const ipfsEvidence: DeliverableIpfsEvidence | null = text(row.root_cid) ? {
+    provider: 'pinme_ipfs',
+    rootCid: text(row.root_cid),
+    manifestPath: '/manifest.json',
+    manifestSha256: text(row.manifest_sha256),
+    manifest: parseJson(row.manifest_json, {} as DeliverableIpfsEvidence['manifest']),
+    fileCount: number(row.file_count),
+    totalBytes: number(row.total_bytes),
+    visibility: text(row.visibility) as DeliverableIpfsEvidence['visibility'],
+    versionNo: number(row.version_no),
+    supersedesDeliverableId: text(row.supersedes_deliverable_id) || null,
+    scopeKey: text(row.scope_key),
+    verificationStatus: text(row.verification_status) as DeliverableIpfsEvidence['verificationStatus'],
+    lastVerifiedAt: text(row.last_verified_at) || null,
+    lastVerificationError: text(row.last_verification_error) || null,
+  } : null;
   return {
     id: text(row.id),
     missionId: text(row.mission_id),
@@ -694,6 +717,31 @@ function mapDeliverable(row: Row): Deliverable {
     mimeType: text(row.mime_type),
     status: text(row.status) as Deliverable['status'],
     createdAt: text(row.created_at),
+    ipfsEvidence,
+  };
+}
+
+function mapEvidenceSnapshot(row: Row, prefix = ''): MissionEvidenceSnapshot | null {
+  const missionId = text(row[`${prefix}mission_id`]);
+  const deliverablesJson = row[`${prefix}deliverables_json`];
+  if (!missionId || typeof deliverablesJson !== 'string') return null;
+  return {
+    missionId,
+    deliverables: parseJson(deliverablesJson, []),
+    acceptanceCriteriaSha256: text(row[`${prefix}acceptance_criteria_sha256`]),
+    workflowVersion: number(row[`${prefix}workflow_version`]),
+    schedulerRevision: number(row[`${prefix}scheduler_revision`]),
+    eventWatermark: text(row[`${prefix}event_watermark`]) || null,
+    frozenBy: text(row[`${prefix}frozen_by`]),
+    frozenAt: text(row[`${prefix}snapshot_created_at`]),
+  };
+}
+
+function mapEvidencePublication(row: Row): EvidencePublication {
+  return {
+    id: text(row.id), missionId: text(row.mission_id), kind: text(row.kind) as EvidencePublication['kind'],
+    subjectId: text(row.subject_id), payloadSha256: text(row.payload_sha256), rootCid: text(row.root_cid),
+    publishedBy: text(row.published_by), createdAt: text(row.created_at),
   };
 }
 
@@ -744,6 +792,7 @@ function mapDispute(row: Row): Dispute {
     resolutionTxHash: text(row.resolution_tx_hash) || null,
     createdAt: text(row.created_at),
     resolvedAt: text(row.resolved_at) || null,
+    evidenceSnapshot: mapEvidenceSnapshot(row, 'snapshot_'),
   };
 }
 
@@ -1039,10 +1088,10 @@ export class D1PlatformStore implements PlatformStore {
         VALUES (?, ?, ?, 'requester', ?)
         ON CONFLICT(id) DO UPDATE SET
           email = COALESCE(profiles.email, excluded.email),
-          display_name = CASE WHEN profiles.display_name = 'AgentMesh User' AND excluded.display_name <> '' THEN excluded.display_name ELSE profiles.display_name END,
+          display_name = CASE WHEN profiles.display_name IN (${defaultUserNamePlaceholders}) AND excluded.display_name <> '' THEN excluded.display_name ELSE profiles.display_name END,
           wallet_address = COALESCE(profiles.wallet_address, excluded.wallet_address),
           updated_at = datetime('now')
-      `).bind(profileId, normalizedEmail, identity.displayName, normalizedWallet).run();
+      `).bind(profileId, normalizedEmail, identity.displayName, normalizedWallet, ...BRAND.platform.defaultUserNames).run();
     } catch (error) {
       const raced = normalizedWallet
         ? await this.db.prepare('SELECT id FROM profiles WHERE lower(wallet_address) = ? LIMIT 1').bind(normalizedWallet).first<Row>()
@@ -1867,7 +1916,7 @@ export class D1PlatformStore implements PlatformStore {
     return Number(results[0]?.meta?.changes ?? 0) > 0;
   }
 
-  async acceptMission(id: string, actorId: string, releaseTxHash: string | null) {
+  async acceptMission(id: string, actorId: string, releaseTxHash: string | null, evidenceSnapshot?: MissionEvidenceSnapshot) {
     const mission = await this.getMission(id);
     const escrow = await this.getEscrow(id);
     if (!mission || !escrow) return null;
@@ -1920,6 +1969,24 @@ export class D1PlatformStore implements PlatformStore {
         JSON.stringify({ source: 'mission_settlement', releaseTxHash }), now, now, id, now, now,
       ),
     ];
+    if (evidenceSnapshot) {
+      statements.push(this.db.prepare(`
+        INSERT INTO mission_acceptance_snapshots
+          (mission_id, deliverables_json, acceptance_criteria_sha256, workflow_version, scheduler_revision,
+           event_watermark, accepted_by, created_at)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM missions m JOIN escrows e ON e.mission_id = m.id
+          WHERE m.id = ? AND m.status = 'completed' AND m.updated_at = ?
+            AND e.status = 'released' AND e.released_at = ?
+        )
+        ON CONFLICT(mission_id) DO NOTHING
+      `).bind(
+        evidenceSnapshot.missionId, JSON.stringify(evidenceSnapshot.deliverables), evidenceSnapshot.acceptanceCriteriaSha256,
+        evidenceSnapshot.workflowVersion, evidenceSnapshot.schedulerRevision, evidenceSnapshot.eventWatermark,
+        evidenceSnapshot.frozenBy, evidenceSnapshot.frozenAt, id, now, now,
+      ));
+    }
     const payouts = new Map<string, number>();
     for (const stage of stages) {
       if (!stage.agentId) continue;
@@ -2622,7 +2689,20 @@ export class D1PlatformStore implements PlatformStore {
       `).bind(deliverable.missionId, deliverable.stageId).first<Row>();
       attemptNo = row ? number(row.attempt_no) : null;
     }
-    const result = await this.db.prepare(`
+    if (deliverable.ipfsEvidence) {
+      const latest = await this.db.prepare(`
+        SELECT e.deliverable_id, e.version_no, e.root_cid
+        FROM deliverable_ipfs_evidence e
+        WHERE e.mission_id = ? AND e.scope_key = ?
+        ORDER BY e.version_no DESC LIMIT 1
+      `).bind(deliverable.missionId, deliverable.ipfsEvidence.scopeKey).first<Row>();
+      const expectedVersion = latest ? number(latest.version_no) + 1 : 1;
+      const expectedParent = latest ? text(latest.deliverable_id) : null;
+      if (deliverable.ipfsEvidence.versionNo !== expectedVersion) throw new Error('IPFS_VERSION_CONFLICT');
+      if (deliverable.ipfsEvidence.supersedesDeliverableId !== expectedParent) throw new Error('IPFS_PARENT_CONFLICT');
+      if (deliverable.ipfsEvidence.manifest.supersedesRootCid !== (latest ? text(latest.root_cid) : null)) throw new Error('IPFS_PARENT_CID_CONFLICT');
+    }
+    const insertDeliverable = this.db.prepare(`
       INSERT INTO deliverables
         (id, mission_id, stage_id, attempt_no, agent_id, name, uri, content_hash, mime_type, status, created_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -2635,14 +2715,118 @@ export class D1PlatformStore implements PlatformStore {
       deliverable.name, deliverable.uri, deliverable.contentHash, deliverable.mimeType,
       deliverable.status, deliverable.createdAt,
       deliverable.stageId, deliverable.missionId, deliverable.stageId, attemptNo,
-    ).run();
-    if (Number(result.meta.changes ?? 0) === 0) throw new Error('STALE_STAGE_ATTEMPT');
+    );
+    if (!deliverable.ipfsEvidence) {
+      const result = await insertDeliverable.run();
+      if (Number(result.meta.changes ?? 0) === 0) throw new Error('STALE_STAGE_ATTEMPT');
+      return { ...deliverable, attemptNo };
+    }
+    const evidence = deliverable.ipfsEvidence;
+    const results = await this.db.batch([
+      insertDeliverable,
+      this.db.prepare(`
+        INSERT INTO deliverable_ipfs_evidence
+          (deliverable_id, mission_id, scope_key, version_no, supersedes_deliverable_id, provider, root_cid,
+           manifest_path, manifest_sha256, manifest_json, file_count, total_bytes, visibility, verification_status,
+           last_verified_at, last_verification_error, submitted_by, created_at)
+        SELECT ?, ?, ?, ?, ?, 'pinme_ipfs', ?, '/manifest.json', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?
+        WHERE EXISTS (SELECT 1 FROM deliverables WHERE id = ? AND mission_id = ?)
+      `).bind(
+        deliverable.id, deliverable.missionId, evidence.scopeKey, evidence.versionNo, evidence.supersedesDeliverableId,
+        evidence.rootCid, evidence.manifestSha256, JSON.stringify(evidence.manifest), evidence.fileCount,
+        evidence.totalBytes, evidence.visibility, evidence.verificationStatus, deliverable.agentId ?? 'platform',
+        deliverable.createdAt, deliverable.id, deliverable.missionId,
+      ),
+    ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0 || Number(results[1]?.meta?.changes ?? 0) === 0) {
+      throw new Error('STALE_STAGE_ATTEMPT');
+    }
     return { ...deliverable, attemptNo };
   }
 
   async listDeliverables(missionId: string): Promise<Deliverable[]> {
-    const { results } = await this.db.prepare('SELECT * FROM deliverables WHERE mission_id = ? ORDER BY created_at ASC').bind(missionId).all<Row>();
+    const { results } = await this.db.prepare(`
+      SELECT d.*, e.scope_key, e.version_no, e.supersedes_deliverable_id, e.root_cid, e.manifest_sha256,
+        e.manifest_json, e.file_count, e.total_bytes, e.visibility, e.verification_status,
+        e.last_verified_at, e.last_verification_error
+      FROM deliverables d LEFT JOIN deliverable_ipfs_evidence e ON e.deliverable_id = d.id
+      WHERE d.mission_id = ? ORDER BY d.created_at ASC, d.id ASC
+    `).bind(missionId).all<Row>();
     return results.map(mapDeliverable);
+  }
+
+  async updateDeliverableIpfsVerification(
+    missionId: string,
+    deliverableId: string,
+    status: DeliverableIpfsEvidence['verificationStatus'],
+    verifiedAt: string,
+    error: string | null,
+  ): Promise<Deliverable | null> {
+    const result = await this.db.prepare(`
+      UPDATE deliverable_ipfs_evidence
+      SET verification_status = CASE WHEN verification_status = 'verified' AND ? = 'unavailable' THEN verification_status ELSE ? END,
+        last_verified_at = ?, last_verification_error = ?
+      WHERE deliverable_id = ? AND mission_id = ?
+    `).bind(status, status, verifiedAt, error, deliverableId, missionId).run();
+    if (Number(result.meta.changes ?? 0) === 0) return null;
+    return (await this.listDeliverables(missionId)).find((item) => item.id === deliverableId) ?? null;
+  }
+
+  async getAcceptanceEvidenceSnapshot(missionId: string): Promise<MissionEvidenceSnapshot | null> {
+    const row = await this.db.prepare(`
+      SELECT mission_id, deliverables_json, acceptance_criteria_sha256, workflow_version, scheduler_revision,
+        event_watermark, accepted_by AS frozen_by, created_at AS snapshot_created_at
+      FROM mission_acceptance_snapshots WHERE mission_id = ?
+    `).bind(missionId).first<Row>();
+    return row ? mapEvidenceSnapshot(row) : null;
+  }
+
+  async recordEvidencePublication(publication: EvidencePublication): Promise<EvidencePublication> {
+    const result = await this.db.prepare(`
+      INSERT INTO evidence_publications
+        (id, mission_id, kind, subject_id, payload_sha256, root_cid, published_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(kind, subject_id) DO NOTHING
+    `).bind(
+      publication.id, publication.missionId, publication.kind, publication.subjectId, publication.payloadSha256,
+      publication.rootCid, publication.publishedBy, publication.createdAt,
+    ).run();
+    if (Number(result.meta.changes ?? 0) === 0) {
+      const existing = await this.db.prepare('SELECT * FROM evidence_publications WHERE kind = ? AND subject_id = ?')
+        .bind(publication.kind, publication.subjectId).first<Row>();
+      if (!existing || text(existing.payload_sha256) !== publication.payloadSha256 || text(existing.root_cid) !== publication.rootCid) {
+        throw new Error('EVIDENCE_PUBLICATION_CONFLICT');
+      }
+      return mapEvidencePublication(existing);
+    }
+    return publication;
+  }
+
+  async listEvidencePublications(missionId: string): Promise<EvidencePublication[]> {
+    const { results } = await this.db.prepare(`
+      SELECT * FROM evidence_publications WHERE mission_id = ? ORDER BY created_at DESC, id DESC
+    `).bind(missionId).all<Row>();
+    return results.map(mapEvidencePublication);
+  }
+
+  async listAgentCidPortfolio(agentId: string, limit = 20): Promise<AgentCidPortfolioItem[]> {
+    const { results } = await this.db.prepare(`
+      SELECT m.id AS mission_id, m.title AS mission_title, m.updated_at AS completed_at,
+        d.id AS deliverable_id, d.name, e.root_cid, e.manifest_sha256, e.version_no, e.visibility, e.verification_status
+      FROM missions m JOIN deliverables d ON d.mission_id = m.id
+      JOIN deliverable_ipfs_evidence e ON e.deliverable_id = d.id
+      LEFT JOIN workflow_stage_attempts a ON a.mission_id = d.mission_id AND a.stage_id = d.stage_id AND a.is_current = 1
+      WHERE m.status = 'completed' AND d.agent_id = ?
+        AND (d.stage_id IS NULL OR d.attempt_no = a.attempt_no)
+      ORDER BY m.updated_at DESC, e.version_no DESC LIMIT ?
+    `).bind(agentId, Math.max(1, Math.min(50, limit))).all<Row>();
+    return results.map((row) => ({
+      missionId: text(row.mission_id), missionTitle: text(row.mission_title), deliverableId: text(row.deliverable_id),
+      name: text(row.name), rootCid: text(row.root_cid), manifestSha256: text(row.manifest_sha256),
+      versionNo: number(row.version_no), visibility: text(row.visibility) as AgentCidPortfolioItem['visibility'],
+      verificationStatus: text(row.verification_status) as AgentCidPortfolioItem['verificationStatus'],
+      completedAt: text(row.completed_at),
+    }));
   }
 
   async getEscrow(missionId: string): Promise<Escrow | null> {
@@ -2683,11 +2867,25 @@ export class D1PlatformStore implements PlatformStore {
       "SELECT user_id FROM arbitration_members WHERE user_id = ? AND status = 'active'",
     ).bind(user.id).first<Row>();
     if (user.role === 'admin' || arbitrationMember) {
-      const { results } = await this.db.prepare('SELECT * FROM disputes ORDER BY created_at DESC LIMIT 200').all<Row>();
+      const { results } = await this.db.prepare(`
+        SELECT d.*, es.mission_id AS snapshot_mission_id, es.deliverables_json AS snapshot_deliverables_json,
+          es.acceptance_criteria_sha256 AS snapshot_acceptance_criteria_sha256,
+          es.workflow_version AS snapshot_workflow_version, es.scheduler_revision AS snapshot_scheduler_revision,
+          es.event_watermark AS snapshot_event_watermark, es.frozen_by AS snapshot_frozen_by,
+          es.created_at AS snapshot_snapshot_created_at
+        FROM disputes d LEFT JOIN dispute_evidence_snapshots es ON es.dispute_id = d.id
+        ORDER BY d.created_at DESC LIMIT 200
+      `).all<Row>();
       return results.map(mapDispute);
     }
     const { results } = await this.db.prepare(`
-      SELECT DISTINCT d.* FROM disputes d
+      SELECT DISTINCT d.*, es.mission_id AS snapshot_mission_id, es.deliverables_json AS snapshot_deliverables_json,
+        es.acceptance_criteria_sha256 AS snapshot_acceptance_criteria_sha256,
+        es.workflow_version AS snapshot_workflow_version, es.scheduler_revision AS snapshot_scheduler_revision,
+        es.event_watermark AS snapshot_event_watermark, es.frozen_by AS snapshot_frozen_by,
+        es.created_at AS snapshot_snapshot_created_at
+      FROM disputes d
+      LEFT JOIN dispute_evidence_snapshots es ON es.dispute_id = d.id
       JOIN missions m ON m.id = d.mission_id
       LEFT JOIN workflow_stages s ON s.mission_id = m.id
       LEFT JOIN agents a ON a.id = s.agent_id
@@ -2703,19 +2901,42 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async getDisputes(missionId: string): Promise<Dispute[]> {
-    const { results } = await this.db.prepare('SELECT * FROM disputes WHERE mission_id = ? ORDER BY created_at DESC').bind(missionId).all<Row>();
+    const { results } = await this.db.prepare(`
+      SELECT d.*, es.mission_id AS snapshot_mission_id, es.deliverables_json AS snapshot_deliverables_json,
+        es.acceptance_criteria_sha256 AS snapshot_acceptance_criteria_sha256,
+        es.workflow_version AS snapshot_workflow_version, es.scheduler_revision AS snapshot_scheduler_revision,
+        es.event_watermark AS snapshot_event_watermark, es.frozen_by AS snapshot_frozen_by,
+        es.created_at AS snapshot_snapshot_created_at
+      FROM disputes d LEFT JOIN dispute_evidence_snapshots es ON es.dispute_id = d.id
+      WHERE d.mission_id = ? ORDER BY d.created_at DESC
+    `).bind(missionId).all<Row>();
     return results.map(mapDispute);
   }
 
   async createDispute(dispute: Dispute): Promise<Dispute> {
-    await this.db.batch([
+    const statements: D1Statement[] = [
       this.db.prepare(`
         INSERT INTO disputes
           (id, mission_id, opened_by, reason, evidence_json, status, resolution, freeze_tx_hash, resolution_tx_hash, created_at, resolved_at)
         VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, NULL)
       `).bind(dispute.id, dispute.missionId, dispute.openedBy, dispute.reason, JSON.stringify(dispute.evidence), dispute.status, dispute.freezeTxHash, dispute.createdAt),
       this.db.prepare("UPDATE escrows SET status = 'frozen', freeze_tx_hash = ?, updated_at = datetime('now') WHERE mission_id = ? AND status = 'held'").bind(dispute.freezeTxHash, dispute.missionId),
-    ]);
+    ];
+    if (dispute.evidenceSnapshot) {
+      const snapshot = dispute.evidenceSnapshot;
+      statements.push(this.db.prepare(`
+        INSERT INTO dispute_evidence_snapshots
+          (dispute_id, mission_id, deliverables_json, acceptance_criteria_sha256, workflow_version,
+           scheduler_revision, event_watermark, frozen_by, created_at)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM disputes WHERE id = ? AND mission_id = ?)
+      `).bind(
+        dispute.id, snapshot.missionId, JSON.stringify(snapshot.deliverables), snapshot.acceptanceCriteriaSha256,
+        snapshot.workflowVersion, snapshot.schedulerRevision, snapshot.eventWatermark, snapshot.frozenBy,
+        snapshot.frozenAt, dispute.id, dispute.missionId,
+      ));
+    }
+    await this.db.batch(statements);
     return dispute;
   }
 
@@ -3314,7 +3535,24 @@ export class D1PlatformStore implements PlatformStore {
       update.stageId, update.missionId, update.agentId, artifactAttemptNo, update.runId,
       );
     });
-    const appliedIndex = 10 + artifactStatements.length;
+    const artifactEvidenceStatements = (update.artifacts ?? []).flatMap((artifact) => {
+      const evidence = artifact.ipfsEvidence;
+      if (!evidence) return [];
+      return [this.db.prepare(`
+        INSERT INTO deliverable_ipfs_evidence
+          (deliverable_id, mission_id, scope_key, version_no, supersedes_deliverable_id, provider, root_cid,
+           manifest_path, manifest_sha256, manifest_json, file_count, total_bytes, visibility, verification_status,
+           last_verified_at, last_verification_error, submitted_by, created_at)
+        SELECT ?, ?, ?, ?, ?, 'pinme_ipfs', ?, '/manifest.json', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?
+        WHERE EXISTS (SELECT 1 FROM deliverables WHERE id = ? AND mission_id = ?)
+      `).bind(
+        artifact.id, artifact.missionId, evidence.scopeKey, evidence.versionNo, evidence.supersedesDeliverableId,
+        evidence.rootCid, evidence.manifestSha256, JSON.stringify(evidence.manifest), evidence.fileCount,
+        evidence.totalBytes, evidence.visibility, evidence.verificationStatus, artifact.agentId ?? update.agentId,
+        artifact.createdAt, artifact.id, artifact.missionId,
+      )];
+    });
+    const appliedIndex = 10 + artifactStatements.length + artifactEvidenceStatements.length;
     const results = await this.db.batch([
       this.db.prepare(`
         INSERT OR IGNORE INTO agent_callback_events (run_id, callback_id, created_at)
@@ -3426,6 +3664,7 @@ export class D1PlatformStore implements PlatformStore {
         update.runId, update.callbackId, processingToken,
       ),
       ...artifactStatements,
+      ...artifactEvidenceStatements,
       this.db.prepare(`
         UPDATE agent_callback_events SET applied_at = ?
         WHERE run_id = ? AND callback_id = ? AND processing_token = ? AND applied_at IS NULL
@@ -3439,9 +3678,12 @@ export class D1PlatformStore implements PlatformStore {
       return text(callback?.applied_at) ? { state: 'duplicate' as const } : { state: 'invalid' as const };
     }
     const artifactInsertFailed = artifactStatements.some((_, index) => Number(results[10 + index]?.meta?.changes ?? 0) === 0);
+    const artifactEvidenceInsertFailed = artifactEvidenceStatements.some((_, index) => (
+      Number(results[10 + artifactStatements.length + index]?.meta?.changes ?? 0) === 0
+    ));
     if (Number(results[2]?.meta?.changes ?? 0) === 0
       || Number(results[3]?.meta?.changes ?? 0) === 0
-      || Number(results[4]?.meta?.changes ?? 0) === 0 || artifactInsertFailed
+      || Number(results[4]?.meta?.changes ?? 0) === 0 || artifactInsertFailed || artifactEvidenceInsertFailed
       || Number(results[appliedIndex]?.meta?.changes ?? 0) === 0) {
       throw new Error('AGENT_CALLBACK_ATOMICITY_FAILED');
     }

@@ -1,4 +1,5 @@
 import { createRemoteJWKSet, decodeJwt, importJWK, importSPKI, jwtVerify, type JWK } from 'jose';
+import { BRAND } from '../../shared/brand';
 import type { VerifiedIdentity } from './pinme';
 
 export interface PrivyEnv {
@@ -83,7 +84,7 @@ export async function verifyPrivyToken(env: PrivyEnv, accessToken: string): Prom
       identity: {
         uid: payload.sub,
         provider: 'privy',
-        displayName: 'AgentMesh User',
+        displayName: BRAND.platform.defaultUserName,
         claims: {
           authProvider: 'privy',
           ...(typeof payload.sid === 'string' ? { sessionId: payload.sid } : {}),
@@ -138,7 +139,7 @@ export async function verifyPrivyIdentityToken(
     const walletAddress = accountText(walletAccount, ['address'])?.toLocaleLowerCase();
     const displayName = accountText(emailAccount, ['name'])
       ?? email?.split('@')[0]
-      ?? (walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : 'AgentMesh User');
+      ?? (walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : BRAND.platform.defaultUserName);
 
     return {
       status: 200,

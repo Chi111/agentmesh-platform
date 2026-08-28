@@ -8,8 +8,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
-/// @notice Treasury-prefunded, immutable-root YD reward epochs.
-/// @dev This contract cannot mint YD and cannot spend funds reserved by another epoch.
+/// @notice Treasury-prefunded, immutable-root PM reward epochs.
+/// @dev This contract cannot mint PM and cannot spend funds reserved by another epoch.
 contract YDRewardDistributor is AccessControl, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 

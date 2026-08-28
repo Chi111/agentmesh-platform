@@ -134,6 +134,20 @@ export interface AgentQualityPublicDetail {
   agent: Agent;
   feedback: AgentFeedback[];
   snapshots: AgentReputationSnapshot[];
+  cidPortfolio: AgentCidPortfolioItem[];
+}
+
+export interface AgentCidPortfolioItem {
+  missionId: string;
+  missionTitle: string;
+  deliverableId: string;
+  name: string;
+  rootCid: string;
+  manifestSha256: string;
+  versionNo: number;
+  visibility: 'public' | 'encrypted';
+  verificationStatus: IpfsVerificationStatus;
+  completedAt: string;
 }
 
 export interface AdminAgentQualityRow {
@@ -336,6 +350,57 @@ export interface Deliverable {
   mimeType: string;
   status: 'submitted' | 'accepted' | 'rejected';
   createdAt?: string;
+  ipfsEvidence?: DeliverableIpfsEvidence | null;
+}
+
+export type IpfsVerificationStatus = 'declared' | 'verified' | 'unavailable' | 'hash_mismatch' | 'invalid_manifest';
+
+export interface DeliverableManifest {
+  schema: 'agentmesh.deliverable-manifest.v1';
+  missionId: string;
+  stageId: string | null;
+  attemptNo: number | null;
+  agentId: string | null;
+  logicalName: string;
+  versionNo: number;
+  supersedesRootCid: string | null;
+  acceptanceCriteriaSha256: string;
+  encryptionKeyFingerprint?: string | null;
+  createdAt: string;
+  generator: string;
+  files: Array<{ path: string; sha256: string; mimeType: string; byteSize: number }>;
+}
+
+export interface DeliverableIpfsEvidence {
+  provider: 'pinme_ipfs';
+  rootCid: string;
+  manifestPath: '/manifest.json';
+  manifestSha256: string;
+  manifest: DeliverableManifest;
+  fileCount: number;
+  totalBytes: number;
+  visibility: 'public' | 'encrypted';
+  versionNo: number;
+  supersedesDeliverableId: string | null;
+  scopeKey: string;
+  verificationStatus: IpfsVerificationStatus;
+  lastVerifiedAt: string | null;
+  lastVerificationError: string | null;
+}
+
+export interface MissionEvidenceSnapshot {
+  missionId: string;
+  deliverables: Array<{
+    deliverableId: string; stageId: string | null; attemptNo: number | null; agentId: string | null; name: string;
+    rootCid: string | null; manifestSha256: string | null; versionNo: number | null;
+    verificationStatus: IpfsVerificationStatus | 'legacy'; createdAt: string;
+  }>;
+  acceptanceCriteriaSha256: string;
+  workflowVersion: number;
+  schedulerRevision: number;
+  eventWatermark: string | null;
+  frozenBy: string;
+  frozenAt: string;
 }
 
 export interface Escrow {
@@ -366,6 +431,7 @@ export interface Dispute {
   resolutionTxHash: string | null;
   createdAt: string;
   resolvedAt: string | null;
+  evidenceSnapshot?: MissionEvidenceSnapshot | null;
 }
 
 export type DisputeVoteChoice = 'support_refund' | 'oppose_refund' | 'abstain';
@@ -507,9 +573,40 @@ export interface MissionDetail {
 export interface NewDeliverableInput {
   stageId?: string;
   name: string;
-  uri: string;
-  contentHash: string;
-  mimeType: string;
+  uri?: string;
+  contentHash?: string;
+  mimeType?: string;
+  ipfsEvidence?: {
+    rootCid: string;
+    manifestSha256: string;
+    manifest: DeliverableManifest;
+    visibility: 'public' | 'encrypted';
+    supersedesDeliverableId: string | null;
+  };
+}
+
+export interface IpfsEvidenceContext {
+  acceptanceCriteria: Record<string, unknown>;
+  acceptanceCriteriaSha256: string;
+  scopeKey: string;
+  nextVersionNo: number;
+  supersedesDeliverableId: string | null;
+  supersedesRootCid: string | null;
+  manifestTemplate: DeliverableManifest;
+}
+
+export interface ReviewDossierResponse {
+  dossier: {
+    schema: 'agentmesh.review-dossier.v1'; kind: 'acceptance' | 'dispute'; subjectId: string;
+    missionId: string; snapshot: MissionEvidenceSnapshot;
+  };
+  canonicalJson: string;
+  payloadSha256: string;
+  publications: Array<{
+    id: string; missionId: string; kind: 'acceptance_dossier' | 'dispute_dossier'; subjectId: string;
+    payloadSha256: string; rootCid: string; publishedBy: string; createdAt: string;
+  }>;
+  publishGuide: { command: string; note: string };
 }
 
 export interface NotificationItem {

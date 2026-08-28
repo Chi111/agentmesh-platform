@@ -1,6 +1,6 @@
-# MeshPin 品牌与 PinMe IPFS 交付证据设计
+# pinme-mesh 品牌与 PinMe IPFS 交付证据设计
 
-状态：待方案批准
+状态：已实现并通过本地审阅；部署待单独批准
 审批门禁：`meshpin-ipfs-evidence-004`
 
 ## 设计结论
@@ -20,6 +20,8 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
         |                                      |
         |                                      +-> 返工/版本时间线
         +-> 验收快照 -> 纠纷冻结快照 -> 仲裁视图 -> pinme export CID（离线 CAR）
+        +-> 确定性审核档案 -> 用户 pinme upload -> 档案 CID 登记
+        +-> 已完成 Mission -> Agent 公开 CID 履历
 ```
 
 ## 现有基础
@@ -35,10 +37,10 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
 
 ```ts
 {
-  name: 'MeshPin Contribution',
-  symbol: 'MPIN',
-  testName: 'AgentMesh Test MeshPin',
-  testSymbol: 'tMPIN',
+  name: 'pinme-mesh Contribution',
+  symbol: 'PM',
+  testName: 'pinme-mesh Test PM',
+  testSymbol: 'PM',
   purpose: 'contribution_and_governance',
 }
 ```
@@ -46,7 +48,7 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
 - Worker API 和前端从同一逻辑常量生成公开文案。
 - `/api/yd/*`、`YD_*`、`ydFinance`、Solidity 文件名和既有数据库表名首版保持兼容。
 - `TestYDToken` 仅修改未来部署时的 ERC-20 name/symbol；没有部署行为，也不修改任何已存在地址。
-- UI 和文档明确 MPIN 与任务支付资产隔离，不出现 APY、价格或投资回报暗示。
+- UI 和文档明确 PM 与任务支付资产隔离，不出现 APY、价格或投资回报暗示。
 
 ## Manifest 规范
 
@@ -62,6 +64,8 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
   "logicalName": "研究报告与数据包",
   "versionNo": 3,
   "supersedesRootCid": "bafy...",
+  "acceptanceCriteriaSha256": "sha256:...",
+  "encryptionKeyFingerprint": null,
   "createdAt": "2026-08-27T00:00:00.000Z",
   "generator": "agentmesh-pinme-publisher/1",
   "files": [
@@ -76,6 +80,8 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
 ```
 
 规范化规则：UTF-8、相对 POSIX 路径、按路径排序、禁止重复/绝对/父目录路径、时间使用 UTC ISO 8601、整数使用十进制 JSON number。Manifest 不能包含根 CID 自身，避免自引用；D1 将根 CID 与 Manifest hash 绑定。
+
+`public` 可省略 `encryptionKeyFingerprint` 或设为 `null`；`encrypted` 必须填写 `sha256:` 密钥指纹，平台只保存指纹，不接收明文密钥或口令。
 
 ## D1 模型
 
@@ -100,10 +106,22 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
 
 ### `dispute_evidence_snapshots`
 
-- `dispute_id`、`deliverable_id` 联合主键。
-- 冻结 `root_cid`、`manifest_sha256`、`version_no`、`stage_id`、`attempt_no`。
-- 冻结 `workflow_version`、`scheduler_revision`、`acceptance_criteria_hash`、`event_watermark`。
-- `snapshot_at`。
+- `dispute_id` 主键，并绑定 `mission_id`。
+- `deliverables_json` 一次性冻结当时适用的交付 ID、`root_cid`、`manifest_sha256`、`version_no`、`stage_id` 和 `attempt_no` 集合。
+- 同行冻结 `workflow_version`、`scheduler_revision`、`acceptance_criteria_sha256`、`event_watermark`、冻结人和时间。
+- 采用整案 JSON 快照避免案件读取时重新拼接“最新交付物”；只追加创建，不提供更新接口。
+
+### `mission_acceptance_snapshots`
+
+- `mission_id` 主键，冻结当前 attempt 的交付版本集合。
+- 保存 `acceptance_criteria_sha256`、`workflow_version`、`scheduler_revision`、`event_watermark`、接受者和时间。
+- Mission 完成后不能因新交付、返工或元数据变化而改写。
+
+### `evidence_publications`
+
+- 保存验收或纠纷审核档案的 `payload_sha256`、可选 `root_cid`、发布者和发布时间。
+- payload 由 `agentmesh.review-dossier.v1` canonical JSON 确定性生成；平台只登记用户通过 PinMe 发布后的 CID。
+- 同一 subject/kind 只允许一个 payload hash；再次登记必须与冻结快照一致。
 
 数据库中不保存文件本体、PinMe AppKey 或解密密钥。已有交付记录不回填虚构证据行。
 
@@ -121,19 +139,29 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
   "contentHash": "sha256:...",
   "mimeType": "application/vnd.agentmesh.manifest+json",
   "ipfsEvidence": {
-    "provider": "pinme_ipfs",
     "rootCid": "bafy...",
-    "manifestPath": "/manifest.json",
     "manifestSha256": "sha256:...",
-    "fileCount": 2,
-    "totalBytes": 123456,
+    "manifest": {
+      "schema": "agentmesh.deliverable-manifest.v1",
+      "missionId": "TASK-...",
+      "stageId": "stage-...",
+      "attemptNo": 2,
+      "agentId": "agent-...",
+      "logicalName": "研究报告与数据包",
+      "versionNo": 2,
+      "supersedesRootCid": "bafy-parent...",
+      "acceptanceCriteriaSha256": "sha256:...",
+      "createdAt": "2026-08-27T00:00:00.000Z",
+      "generator": "agentmesh-pinme-publisher/1",
+      "files": [{ "path": "report.pdf", "sha256": "sha256:...", "mimeType": "application/pdf", "byteSize": 123456 }]
+    },
     "visibility": "public",
-    "versionNo": 2,
     "supersedesDeliverableId": "DEL-..."
   }
 }
 ```
 
+- `uri`、`contentHash`、MIME、文件数量、总大小、scope 和版本号均由已校验的 CID/Manifest/当前父版本派生，客户端不能单独覆盖。
 - 现有无 `ipfsEvidence` 请求保持兼容，响应标记为 legacy/unverified。
 - Agent callback 的 artifact 结构使用同一验证函数，避免手工提交与自动回调产生不同规则。
 - 新版本写入 deliverable、IPFS evidence 和事件必须在同一 Store 原子边界完成。
@@ -145,6 +173,12 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
 - Mission detail 和验收页面默认返回当前 attempt 的最新版本，同时允许显式读取历史版本。
 - Dispute detail 返回创建时冻结的 `evidenceSnapshot`，不动态替换为新版本。
 
+### 审核档案与 Agent CID 履历
+
+- `GET /api/missions/:missionId/evidence/dossier?kind=acceptance|dispute&subjectId=...` 返回确定性审核档案与 payload SHA-256。
+- `POST /api/missions/:missionId/evidence/publications` 登记用户通过 `pinme upload` 得到的档案 CID；平台校验 CID 和 payload hash，不接收 AppKey。
+- Agent public quality/detail 响应增加 `cidPortfolio`，由已完成 Mission 的当前 attempt PinMe 证据派生，并按完成时间倒序返回有界列表。
+
 ## CID 与 Gateway 验证
 
 - 引入直接依赖的 Worker 兼容 CID 解析库（优先 `multiformats`），拒绝非规范 CID、超长值和不支持的 scheme。
@@ -154,6 +188,7 @@ AgentMesh Worker -> D1 deliverables + deliverable_ipfs_evidence + 审计事件
 - 校验 schema、Mission/stage/attempt/version/父 CID、Manifest SHA-256、文件数量和总大小。
 - 首版不在 Worker 请求内下载所有大文件重算 SHA-256；根 CID保证 DAG 内容寻址，逐文件 hash 用于本地/审阅工具复核。
 - 验证结果追加事件。`hash_mismatch` 和 `invalid_manifest` 不能被“人工确认”覆盖，只能提交新版本。
+- 首版展示并冻结验证状态，但不改变既有 Mission 的验收政策；只有未来在 Mission 启动前固化 `pinme_required` 策略后，才可把未验证状态设为验收硬门禁。
 
 ## 版本并发与状态
 
@@ -168,6 +203,7 @@ verified -> availability_warning（只追加事件，不撤销历史验证）
 - 客户端提供的 `versionNo` 只作为 CAS 预期，服务端不接受跳号。
 - 被拒绝版本仍保留；新版本引用它，不能修改其 CID、Manifest 或创建时间。
 - 验收快照保存实际版本 ID 列表，而不是“当前最新”查询条件。
+- 当前适用验收标准先规范化为有序 JSON 再计算 SHA-256；Manifest 声明、验收快照和纠纷快照必须使用同一结果。
 
 ## 前端体验
 
@@ -217,10 +253,11 @@ verified -> availability_warning（只追加事件，不撤销历史验证）
 - 方案批准后才允许写业务代码；实现完成后仍需 Review Gate 与 QA。
 - D1 迁移仅新增 companion tables；功能回滚可停止写入新表并继续读取 legacy deliverables。
 - 前端/Worker/D1 部署必须再次获得用户明确授权，并使用项目规定的 `pinme save`。
-- MPIN 测试合约或正式合约部署不包含在本功能授权中。
+- PM 主网正式合约部署不包含在本功能授权中。
 
 ## 后续阶段
 
 - PinMe 若提供稳定、受支持的服务端上传 API，再设计 Worker 侧短期上传授权或上传代理；不得从 CLI 私有实现猜测接口。
 - 可增加客户端加密、组织密钥管理、多 pin provider 和周期可达性监测。
 - 可生成每次验收的不可变静态审阅页并独立上传到 IPFS。
+- 后续可把 JSON 审核档案扩展为静态 HTML 审阅站点；首版以确定性 JSON 为证据真相，HTML 只作展示。

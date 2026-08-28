@@ -16,8 +16,10 @@ import {
   Sparkles,
   WalletCards,
 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { Link } from 'react-router-dom';
+import { BrandMark } from '../components/brand/BrandMark';
+import { BRAND } from '../constants/brand';
 import {
   formatContractAsset,
   publicContractConfig,
@@ -25,6 +27,9 @@ import {
   type ContractActivity,
   type ContractPublicSnapshot,
 } from '../services/contractPublic';
+
+// Immutable identifier of the already-deployed contract; it is not a display brand.
+const ESCROW_CONTRACT_NAME = 'AgentMeshEscrow';
 
 const activityMeta = {
   deposited: { label: '资金进入托管', accent: 'text-[#85e9f7]', dot: 'bg-[#32d4e7]' },
@@ -71,27 +76,77 @@ function PublicAddress({ label, value, href }: { label: string; value: string; h
   );
 }
 
-function ProtocolOrbit({ live }: { live: boolean }) {
+function ProtocolOrbit({ live, blockNumber }: { live: boolean; blockNumber?: bigint }) {
+  const moveScene = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const x = ((event.clientX - bounds.left) / bounds.width - 0.5) * 2;
+    const y = ((event.clientY - bounds.top) / bounds.height - 0.5) * 2;
+    event.currentTarget.style.setProperty('--scene-shift-x', `${(x * 12).toFixed(2)}px`);
+    event.currentTarget.style.setProperty('--scene-shift-y', `${(y * 10).toFixed(2)}px`);
+    event.currentTarget.style.setProperty('--scene-rotate-x', `${(-y * 4).toFixed(2)}deg`);
+    event.currentTarget.style.setProperty('--scene-rotate-y', `${(x * 5).toFixed(2)}deg`);
+  };
+
+  const resetScene = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.currentTarget.style.setProperty('--scene-shift-x', '0px');
+    event.currentTarget.style.setProperty('--scene-shift-y', '0px');
+    event.currentTarget.style.setProperty('--scene-rotate-x', '0deg');
+    event.currentTarget.style.setProperty('--scene-rotate-y', '0deg');
+  };
+
   return (
-    <div className="contract-orbit relative mx-auto aspect-square w-full max-w-[520px]" aria-label="AgentMesh 托管协议结构示意">
-      <div className="absolute inset-[8%] rounded-full border border-white/[0.08]" />
-      <div className="absolute inset-[22%] rounded-full border border-dashed border-[#32d4e7]/25" />
-      <div className="contract-orbit-ring absolute inset-[8%] rounded-full">
-        <span className="absolute left-1/2 top-0 flex -translate-x-1/2 -translate-y-1/2 items-center gap-2 rounded-full border border-white/10 bg-[#0c171e] px-3 py-2 font-mono text-[10px] text-white/60 shadow-2xl">
-          <WalletCards size={13} className="text-[#32d4e7]" /> mUSDC
-        </span>
-        <span className="absolute bottom-[9%] left-[3%] flex items-center gap-2 rounded-full border border-white/10 bg-[#0c171e] px-3 py-2 font-mono text-[10px] text-white/60 shadow-2xl">
-          <Network size={13} className="text-[#b7f34a]" /> SEPOLIA
-        </span>
-        <span className="absolute bottom-[9%] right-[3%] flex items-center gap-2 rounded-full border border-white/10 bg-[#0c171e] px-3 py-2 font-mono text-[10px] text-white/60 shadow-2xl">
-          <Fingerprint size={13} className="text-[#ffd36a]" /> PAYOUT HASH
-        </span>
+    <div
+      className="protocol-stage relative mx-auto aspect-square w-full max-w-[620px]"
+      aria-label={`${BRAND.platform.name} 托管协议动态结构示意`}
+      onPointerMove={moveScene}
+      onPointerLeave={resetScene}
+    >
+      <div className="protocol-stage__aura" aria-hidden="true" />
+      <div className="protocol-stage__grid" aria-hidden="true" />
+      <svg className="protocol-stage__mesh" viewBox="0 0 640 640" fill="none" aria-hidden="true">
+        <path className="protocol-stage__path protocol-stage__path--one" d="M82 174C180 56 294 118 320 252" />
+        <path className="protocol-stage__path protocol-stage__path--two" d="M558 174C460 56 346 118 320 252" />
+        <path className="protocol-stage__path protocol-stage__path--three" d="M92 466C170 574 292 526 320 388" />
+        <path className="protocol-stage__path protocol-stage__path--four" d="M548 466C470 574 348 526 320 388" />
+        <circle cx="82" cy="174" r="4" />
+        <circle cx="558" cy="174" r="4" />
+        <circle cx="92" cy="466" r="4" />
+        <circle cx="548" cy="466" r="4" />
+      </svg>
+
+      <div className="protocol-stage__ring protocol-stage__ring--outer" aria-hidden="true" />
+      <div className="protocol-stage__ring protocol-stage__ring--inner" aria-hidden="true" />
+
+      <div className="protocol-stage__node protocol-stage__node--asset">
+        <span><WalletCards size={14} /></span>
+        <div><small>01 · ASSET</small><strong>mUSDC / sETH</strong></div>
       </div>
-      <div className="absolute inset-[31%] flex flex-col items-center justify-center rounded-full border border-[#32d4e7]/30 bg-[radial-gradient(circle_at_40%_35%,rgba(50,212,231,.18),rgba(8,19,25,.94)_66%)] text-center shadow-[0_0_90px_rgba(50,212,231,.12)]">
-        <span className={`mb-3 size-2 rounded-full ${live ? 'bg-[#b7f34a] shadow-[0_0_18px_rgba(183,243,74,.9)]' : 'bg-[#ef7d7d]'}`} />
-        <Blocks size={30} className="text-[#85e9f7]" />
-        <strong className="mt-4 text-base tracking-tight text-white">AgentMeshEscrow</strong>
-        <span className="mt-2 font-mono text-[9px] uppercase tracking-[0.16em] text-white/35">Non-custodial protocol</span>
+      <div className="protocol-stage__node protocol-stage__node--network">
+        <span><Network size={14} /></span>
+        <div><small>02 · NETWORK</small><strong>Sepolia verified</strong></div>
+      </div>
+      <div className="protocol-stage__node protocol-stage__node--proof">
+        <span><Fingerprint size={14} /></span>
+        <div><small>03 · COMMITMENT</small><strong>Payout hash</strong></div>
+      </div>
+
+      <div className="protocol-stage__device">
+        <div className="protocol-stage__device-edge" aria-hidden="true" />
+        <div className="protocol-stage__scan" aria-hidden="true" />
+        <div className="protocol-stage__device-content">
+          <div className="protocol-stage__device-topline">
+            <span>PROTOCOL / 01</span>
+            <i className={live ? 'is-live' : undefined} />
+          </div>
+          <div className="protocol-stage__core-mark"><Blocks size={30} /></div>
+          <p>NON-CUSTODIAL</p>
+          <strong>{ESCROW_CONTRACT_NAME}</strong>
+          <div className="protocol-stage__device-status">
+            <span>{live ? 'LIVE' : 'VERIFYING'}</span>
+            <small>{blockNumber ? `BLOCK ${blockNumber.toLocaleString('en-US')}` : 'PUBLIC RPC'}</small>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -101,6 +156,7 @@ export function ContractShowcasePage() {
   const [snapshot, setSnapshot] = useState<ContractPublicSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const heroRef = useRef<HTMLElement>(null);
 
   const loadSnapshot = useCallback(async () => {
     setLoading(true);
@@ -121,21 +177,101 @@ export function ContractShowcasePage() {
     return () => window.clearInterval(interval);
   }, [loadSnapshot]);
 
+  useEffect(() => {
+    const hero = heroRef.current;
+    if (!hero || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    let frame = 0;
+    const clamp = (value: number) => Math.min(1, Math.max(0, value));
+    const smoothstep = (start: number, end: number, value: number) => {
+      const normalized = clamp((value - start) / (end - start));
+      return normalized * normalized * (3 - 2 * normalized);
+    };
+    const update = () => {
+      frame = 0;
+      const bounds = hero.getBoundingClientRect();
+      const distance = Math.max(1, hero.offsetHeight - window.innerHeight);
+      const progress = clamp(-bounds.top / distance);
+      const compact = window.innerWidth < 1024;
+      const copyOut = smoothstep(0.06, 0.42, progress);
+      const stageMorph = smoothstep(0.14, 0.82, progress);
+      const chapter = smoothstep(0.4, 0.7, progress);
+      const transitionWindow = clamp((progress - 0.2) / 0.58);
+      const transitionPulse = Math.sin(transitionWindow * Math.PI);
+      const exit = smoothstep(0.84, 0.98, progress);
+
+      hero.style.setProperty('--hero-copy-opacity', (1 - copyOut).toFixed(3));
+      hero.style.setProperty('--hero-copy-y', `${(-copyOut * (compact ? 54 : 92)).toFixed(2)}px`);
+      hero.style.setProperty('--hero-copy-scale', (1 - copyOut * 0.1).toFixed(3));
+      hero.style.setProperty('--hero-copy-blur', `${(copyOut * 7).toFixed(2)}px`);
+      hero.style.setProperty('--hero-stage-x', compact ? '0px' : `${(-stageMorph * 20).toFixed(2)}vw`);
+      hero.style.setProperty('--hero-stage-y', compact ? `${(-stageMorph * 18).toFixed(2)}vh` : `${(stageMorph * 1.8).toFixed(2)}vh`);
+      hero.style.setProperty('--hero-stage-scale', (1 + stageMorph * (compact ? 0.42 : 0.52)).toFixed(3));
+      hero.style.setProperty('--hero-stage-rotate', `${(-stageMorph * 1.4).toFixed(2)}deg`);
+      hero.style.setProperty('--hero-stage-opacity', (1 - chapter * 0.2).toFixed(3));
+      hero.style.setProperty('--hero-node-opacity', (1 - smoothstep(0.2, 0.62, progress)).toFixed(3));
+      hero.style.setProperty('--hero-chapter-opacity', chapter.toFixed(3));
+      hero.style.setProperty('--hero-chapter-y', `${((1 - chapter) * 42).toFixed(2)}px`);
+      hero.style.setProperty('--hero-chapter-eyebrow', smoothstep(0.38, 0.54, progress).toFixed(3));
+      hero.style.setProperty('--hero-title-one', smoothstep(0.43, 0.62, progress).toFixed(3));
+      hero.style.setProperty('--hero-title-two', smoothstep(0.5, 0.7, progress).toFixed(3));
+      hero.style.setProperty('--hero-flow-one', smoothstep(0.58, 0.72, progress).toFixed(3));
+      hero.style.setProperty('--hero-flow-two', smoothstep(0.67, 0.81, progress).toFixed(3));
+      hero.style.setProperty('--hero-flow-three', smoothstep(0.76, 0.9, progress).toFixed(3));
+      hero.style.setProperty('--hero-chapter-line', smoothstep(0.58, 0.9, progress).toFixed(3));
+      hero.style.setProperty('--hero-portal-opacity', (transitionPulse * 0.72).toFixed(3));
+      hero.style.setProperty('--hero-portal-scale', (0.72 + stageMorph * 0.7).toFixed(3));
+      hero.style.setProperty('--hero-portal-rotate', `${(progress * 38).toFixed(2)}deg`);
+      hero.style.setProperty('--hero-wipe-opacity', (transitionPulse * 0.58).toFixed(3));
+      hero.style.setProperty('--hero-wipe-x', `${(-34 + progress * 68).toFixed(2)}vw`);
+      hero.style.setProperty('--hero-exit-opacity', exit.toFixed(3));
+      hero.style.setProperty('--hero-exit-y', `${((1 - exit) * 24).toFixed(2)}px`);
+      hero.style.setProperty('--hero-cue-opacity', (1 - smoothstep(0.02, 0.16, progress)).toFixed(3));
+      hero.style.setProperty('--hero-wordmark-y', `${(-stageMorph * 112).toFixed(2)}px`);
+      hero.style.setProperty('--hero-progress', `${(progress * 100).toFixed(2)}%`);
+    };
+    const requestUpdate = () => {
+      if (!frame) frame = window.requestAnimationFrame(update);
+    };
+
+    update();
+    window.addEventListener('scroll', requestUpdate, { passive: true });
+    window.addEventListener('resize', requestUpdate);
+    return () => {
+      window.removeEventListener('scroll', requestUpdate);
+      window.removeEventListener('resize', requestUpdate);
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  useEffect(() => {
+    const targets = Array.from(document.querySelectorAll<HTMLElement>('[data-contract-reveal]'));
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      targets.forEach((target) => target.classList.add('is-visible'));
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        entry.target.classList.add('is-visible');
+        observer.unobserve(entry.target);
+      }
+    }, { rootMargin: '0px 0px -12% 0px', threshold: 0.12 });
+    targets.forEach((target) => observer.observe(target));
+    return () => observer.disconnect();
+  }, []);
+
   const contractAddress = publicContractConfig.escrowAddress;
   const live = Boolean(snapshot?.codeAvailable && !snapshot.paused);
   const heldTotal = (snapshot?.states.held ?? 0) + (snapshot?.states.frozen ?? 0);
 
   return (
-    <div className="min-h-screen overflow-hidden bg-[#071016] text-[#eaf1ec]">
-      <header className="relative z-20 border-b border-white/[0.07]">
-        <div className="mx-auto flex h-20 max-w-[1400px] items-center justify-between px-5 sm:px-8 lg:px-12">
-          <Link to="/dashboard" className="flex items-center gap-3">
-            <span className="relative flex size-10 items-center justify-center rounded-2xl border border-[#32d4e7]/30 bg-[#32d4e7]/10">
-              <span className="absolute left-2.5 top-4 size-1.5 rounded-full bg-[#32d4e7]" />
-              <span className="absolute right-2.5 top-2.5 size-1.5 rounded-full bg-[#b7f34a]" />
-              <span className="h-px w-4 -rotate-[28deg] bg-[#32d4e7]" />
-            </span>
-            <span><strong className="block text-sm tracking-tight">AgentMesh</strong><small className="mt-1 block font-mono text-[8px] uppercase tracking-[0.2em] text-white/35">Open settlement layer</small></span>
+    <div className="contract-home min-h-screen overflow-x-clip bg-[#071016] text-[#eaf1ec]">
+      <header className="contract-site-header absolute inset-x-0 top-0 z-20 border-b border-white/[0.07]">
+        <div className="mx-auto flex h-[72px] max-w-[1400px] items-center justify-between px-5 sm:h-20 sm:px-8 lg:px-12">
+          <Link to="/" className="flex items-center gap-3" aria-label={`${BRAND.platform.name} 首页`}>
+            <BrandMark className="size-10" />
+            <span><strong className="block text-sm tracking-tight">{BRAND.platform.name}</strong><small className="mt-1 block font-mono text-[8px] uppercase tracking-[0.2em] text-white/35">Open settlement layer</small></span>
           </Link>
           <nav className="flex items-center gap-2" aria-label="公开页面导航">
             <Link className="hidden rounded-full px-4 py-2 text-xs font-semibold text-white/55 transition hover:text-white sm:block" to="/agents">浏览 Agents</Link>
@@ -145,30 +281,61 @@ export function ContractShowcasePage() {
       </header>
 
       <main>
-        <section className="contract-hero-glow relative">
-          <div className="mx-auto grid min-h-[720px] max-w-[1400px] items-center gap-10 px-5 py-20 sm:px-8 lg:grid-cols-[1.08fr_.92fr] lg:px-12 lg:py-24">
-            <div className="relative z-10 min-w-0 max-w-3xl">
-              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.035] px-3 py-2 font-mono text-[10px] uppercase tracking-[0.16em] text-white/55">
-                <span className={`size-1.5 rounded-full ${live ? 'bg-[#b7f34a]' : loading ? 'animate-pulse bg-[#ffd36a]' : 'bg-[#ef7d7d]'}`} />
-                {loading && !snapshot ? '正在连接 Sepolia' : live ? 'Sepolia · Contract live' : snapshot?.paused ? 'Sepolia · Contract paused' : 'Sepolia · Status unavailable'}
+        <section ref={heroRef} className="contract-hero relative h-[215svh]">
+          <div className="contract-hero__sticky sticky top-0 flex h-[100svh] items-center overflow-hidden">
+            <div className="contract-hero__aurora contract-hero__aurora--cyan" aria-hidden="true" />
+            <div className="contract-hero__aurora contract-hero__aurora--lime" aria-hidden="true" />
+            <div className="contract-hero__wordmark" aria-hidden="true">MESH</div>
+            <div className="contract-hero__grain" aria-hidden="true" />
+            <div className="contract-hero__streak contract-hero__streak--one" aria-hidden="true" />
+            <div className="contract-hero__streak contract-hero__streak--two" aria-hidden="true" />
+            <div className="contract-hero__streak contract-hero__streak--three" aria-hidden="true" />
+            <div className="contract-hero__portal" aria-hidden="true"><span /><span /><i /></div>
+            <div className="contract-hero__wipe" aria-hidden="true" />
+            <div className="contract-hero__layout mx-auto grid w-full max-w-[1400px] items-center gap-8 px-5 pb-16 pt-28 sm:px-8 sm:pb-20 sm:pt-32 lg:grid-cols-[1.02fr_.98fr] lg:gap-4 lg:px-12 lg:pb-16 lg:pt-28">
+              <div className="contract-hero__copy relative z-10 min-w-0 max-w-3xl">
+                <div className="contract-hero__intro contract-hero__intro--one inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.035] px-3 py-2 font-mono text-[10px] uppercase tracking-[0.16em] text-white/55 backdrop-blur-xl">
+                  <span className={`size-1.5 rounded-full ${live ? 'bg-[#b7f34a]' : loading ? 'animate-pulse bg-[#ffd36a]' : 'bg-[#ef7d7d]'}`} />
+                  {loading && !snapshot ? '正在连接 Sepolia' : live ? 'Sepolia · Contract live' : snapshot?.paused ? 'Sepolia · Contract paused' : 'Sepolia · Status unavailable'}
+                </div>
+                <h1 className="mt-8 max-w-[780px] text-[clamp(3.25rem,7vw,6.8rem)] font-semibold leading-[.88] tracking-[-0.07em] text-white">
+                  <span className="contract-hero__line"><span>协作有共识，</span></span>
+                  <span className="contract-hero__line contract-hero__line--accent"><span>资金有路径。</span></span>
+                </h1>
+                <p className="contract-hero__intro contract-hero__intro--two mt-8 max-w-xl text-base leading-8 text-white/50 sm:text-lg">
+                  {ESCROW_CONTRACT_NAME} 把任务资金、分账承诺与争议状态写进公开合约。平台负责协作，合约负责执行；任何人都可以独立验证。
+                </p>
+                <div className="contract-hero__intro contract-hero__intro--three mt-10 flex flex-wrap gap-3">
+                  {contractAddress ? <a className="contract-hero__primary inline-flex min-h-12 items-center gap-2 rounded-full bg-[#b7f34a] px-5 text-sm font-semibold text-[#071016] transition" href={explorerUrl('address', contractAddress)} target="_blank" rel="noreferrer">在 Etherscan 验证 <ArrowUpRight size={16} /></a> : null}
+                  <a className="contract-hero__secondary inline-flex min-h-12 items-center gap-2 rounded-full border border-white/15 px-5 text-sm font-semibold text-white transition" href="#how-it-works">查看资金路径 <GitBranch size={16} /></a>
+                </div>
+                {contractAddress ? <div className="contract-hero__intro contract-hero__intro--four mt-9 flex max-w-xl min-w-0 items-center gap-3 overflow-hidden border-l border-[#32d4e7]/40 pl-4"><span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.15em] text-white/30">Contract</span><a className="min-w-0 flex-1 truncate font-mono text-xs text-white/60 transition hover:text-[#85e9f7]" href={explorerUrl('address', contractAddress)} target="_blank" rel="noreferrer">{contractAddress}</a></div> : null}
               </div>
-              <h1 className="mt-8 max-w-[760px] text-[clamp(3.1rem,7vw,6.8rem)] font-semibold leading-[.91] tracking-[-0.065em] text-white">
-                协作有共识，<br /><span className="text-[#85e9f7]">资金有路径。</span>
-              </h1>
-              <p className="mt-8 max-w-xl text-base leading-8 text-white/50 sm:text-lg">
-                AgentMeshEscrow 把任务资金、分账承诺与争议状态写进公开合约。平台负责协作，合约负责执行；任何人都可以独立验证。
-              </p>
-              <div className="mt-10 flex flex-wrap gap-3">
-                {contractAddress ? <a className="inline-flex min-h-12 items-center gap-2 rounded-full bg-[#b7f34a] px-5 text-sm font-semibold text-[#071016] transition hover:bg-[#ccff70]" href={explorerUrl('address', contractAddress)} target="_blank" rel="noreferrer">在 Etherscan 验证 <ArrowUpRight size={16} /></a> : null}
-                <a className="inline-flex min-h-12 items-center gap-2 rounded-full border border-white/15 px-5 text-sm font-semibold text-white transition hover:border-white/30 hover:bg-white/[0.04]" href="#how-it-works">查看资金路径 <GitBranch size={16} /></a>
+              <div className="contract-hero__stage-wrap relative z-[1] min-w-0">
+                <div className="contract-hero__stage-entry"><ProtocolOrbit live={live} blockNumber={snapshot?.blockNumber} /></div>
               </div>
-              {contractAddress ? <div className="mt-10 flex max-w-xl min-w-0 items-center gap-3 overflow-hidden border-l border-[#32d4e7]/40 pl-4"><span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.15em] text-white/30">Contract</span><a className="min-w-0 flex-1 truncate font-mono text-xs text-white/60 transition hover:text-[#85e9f7]" href={explorerUrl('address', contractAddress)} target="_blank" rel="noreferrer">{contractAddress}</a></div> : null}
             </div>
-            <ProtocolOrbit live={live} />
+
+            <div className="contract-hero__chapter-two">
+              <p>SCROLL CHAPTER / 02</p>
+              <h2>
+                <span className="contract-hero__chapter-line contract-hero__chapter-line--one"><span>一条路径，</span></span>
+                <span className="contract-hero__chapter-line contract-hero__chapter-line--two"><span>从承诺到结算。</span></span>
+              </h2>
+              <div className="contract-hero__chapter-flow" aria-label="资金路径：锁定、执行、结算">
+                {[['01', 'LOCK', '资金锁定'], ['02', 'RUN', '协作执行'], ['03', 'SETTLE', '验收分账']].map(([no, code, label]) => <div className="contract-hero__flow-step" key={code}><i>{no}</i><span><small>{code}</small><strong>{label}</strong></span></div>)}
+              </div>
+            </div>
+
+            <div className="contract-hero__progress" aria-hidden="true">
+              <span>01</span><i><b /></i><span>02</span>
+            </div>
+            <a className="contract-hero__scroll-cue" href="#how-it-works" aria-label="向下滚动查看资金路径"><span />SCROLL TO TRANSFORM</a>
+            <div className="contract-hero__exit-band" aria-hidden="true"><span>LIVE PROTOCOL TELEMETRY</span><i /><span>SEPOLIA / BLOCK STREAM</span></div>
           </div>
         </section>
 
-        <section className="border-y border-white/[0.08] bg-white/[0.025]" aria-live="polite">
+        <section className="contract-reveal-section border-y border-white/[0.08] bg-white/[0.025]" aria-live="polite" data-contract-reveal>
           <div className="mx-auto grid max-w-[1400px] grid-cols-2 px-5 sm:px-8 lg:grid-cols-4 lg:px-12">
             {[
               ['合约状态', loading && !snapshot ? '同步中' : live ? '运行中' : snapshot?.paused ? '已暂停' : '待连接', live ? 'BYTECODE PRESENT ONCHAIN' : 'PUBLIC RPC STATUS'],
@@ -179,7 +346,7 @@ export function ContractShowcasePage() {
           </div>
         </section>
 
-        <section id="how-it-works" className="mx-auto max-w-[1400px] px-5 py-28 sm:px-8 lg:px-12 lg:py-36">
+        <section id="how-it-works" className="contract-reveal-section mx-auto max-w-[1400px] px-5 py-28 sm:px-8 lg:px-12 lg:py-36" data-contract-reveal>
           <div className="max-w-3xl">
             <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-[#32d4e7]">Protocol flow / 01</p>
             <h2 className="mt-6 text-4xl font-semibold leading-tight tracking-[-0.045em] text-white sm:text-6xl">资金不是交给平台，<br />而是交给状态机。</h2>
@@ -195,12 +362,12 @@ export function ContractShowcasePage() {
           </div>
         </section>
 
-        <section className="bg-[#e8eee8] text-[#071016]">
+        <section className="contract-reveal-section bg-[#e8eee8] text-[#071016]" data-contract-reveal>
           <div className="mx-auto grid max-w-[1400px] gap-16 px-5 py-28 sm:px-8 lg:grid-cols-[.92fr_1.08fr] lg:px-12 lg:py-36">
             <div>
               <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-[#087e91]">Live state / 02</p>
               <h2 className="mt-6 text-4xl font-semibold leading-tight tracking-[-0.045em] sm:text-6xl">链上正在发生什么。</h2>
-              <p className="mt-6 max-w-lg text-base leading-8 text-[#4d5a57]">这些数字由浏览器直接读取 Sepolia RPC，不经过 AgentMesh 数据库。刷新页面即可独立复核。</p>
+              <p className="mt-6 max-w-lg text-base leading-8 text-[#4d5a57]">这些数字由浏览器直接读取 Sepolia RPC，不经过 {BRAND.platform.name} 数据库。刷新页面即可独立复核。</p>
 
               <div className="mt-14 grid grid-cols-2 gap-x-8 gap-y-10 border-t border-[#071016]/15 pt-8">
                 <div><p className="font-mono text-[9px] uppercase tracking-[0.15em] text-[#071016]/40">当前 mUSDC 托管</p><p className="mt-3 text-3xl font-semibold tracking-tight">{snapshot ? formatContractAsset(snapshot.contractTokenBalance, snapshot.tokenDecimals, 2) : '—'}</p><p className="mt-1 text-xs text-[#071016]/45">{snapshot?.tokenSymbol ?? 'mUSDC'}</p></div>
@@ -225,7 +392,7 @@ export function ContractShowcasePage() {
           </div>
         </section>
 
-        <section className="mx-auto grid max-w-[1400px] gap-16 px-5 py-28 sm:px-8 lg:grid-cols-[1fr_1fr] lg:px-12 lg:py-36">
+        <section className="contract-reveal-section mx-auto grid max-w-[1400px] gap-16 px-5 py-28 sm:px-8 lg:grid-cols-[1fr_1fr] lg:px-12 lg:py-36" data-contract-reveal>
           <div>
             <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-[#32d4e7]">Public record / 03</p>
             <h2 className="mt-6 max-w-xl text-4xl font-semibold leading-tight tracking-[-0.045em] sm:text-6xl">无需相信介绍，<br />只需核对记录。</h2>
@@ -246,15 +413,15 @@ export function ContractShowcasePage() {
           </div>
         </section>
 
-        <section className="border-t border-white/[0.08]">
+        <section className="contract-reveal-section border-t border-white/[0.08]" data-contract-reveal>
           <div className="mx-auto flex max-w-[1400px] flex-col gap-8 px-5 py-16 sm:px-8 md:flex-row md:items-end md:justify-between lg:px-12">
-            <div><p className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/25">AgentMesh Protocol</p><p className="mt-4 max-w-xl text-2xl font-semibold leading-snug text-white">让复杂 Agent 协作拥有一条所有参与者都能验证的资金路径。</p></div>
+            <div><p className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/25">{BRAND.platform.name} Protocol</p><p className="mt-4 max-w-xl text-2xl font-semibold leading-snug text-white">让复杂 Agent 协作拥有一条所有参与者都能验证的资金路径。</p></div>
             <div className="flex flex-wrap gap-3"><Link className="inline-flex min-h-11 items-center gap-2 rounded-full border border-white/15 px-5 text-xs font-semibold transition hover:bg-white/[0.05]" to="/agents">浏览 Agent 网络</Link><Link className="inline-flex min-h-11 items-center gap-2 rounded-full bg-white px-5 text-xs font-semibold text-[#071016] transition hover:bg-[#b7f34a]" to="/missions/new">创建任务 <ArrowRight size={14} /></Link></div>
           </div>
         </section>
       </main>
 
-      <footer className="border-t border-white/[0.06] px-5 py-8 sm:px-8 lg:px-12"><div className="mx-auto flex max-w-[1400px] flex-col gap-3 text-[10px] text-white/25 sm:flex-row sm:items-center sm:justify-between"><span>© 2026 AgentMesh · Open settlement on Sepolia</span><span className="inline-flex items-center gap-2">TESTNET ONLY <CirclePlay size={11} /> Public RPC data</span></div></footer>
+      <footer className="border-t border-white/[0.06] px-5 py-8 sm:px-8 lg:px-12"><div className="mx-auto flex max-w-[1400px] flex-col gap-3 text-[10px] text-white/25 sm:flex-row sm:items-center sm:justify-between"><span>© 2026 {BRAND.platform.name} · Open settlement on Sepolia</span><span className="inline-flex items-center gap-2">TESTNET ONLY <CirclePlay size={11} /> Public RPC data</span></div></footer>
     </div>
   );
 }

@@ -23,6 +23,7 @@ import type {
   Mission,
   MissionChangeRequest,
   MissionDetail,
+  IpfsEvidenceContext,
   NewAgentInput,
   NewDeliverableInput,
   NewMissionInput,
@@ -36,11 +37,13 @@ import type {
   YdFinanceOverview,
   RewardEpoch,
   RewardAllocation,
+  ReviewDossierResponse,
   WorkflowStage,
   WorkflowEdge,
   WorkflowTemplateDetail,
   WorkflowViewport,
 } from '../types/domain';
+import { BRAND } from '../constants/brand';
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
 
@@ -132,7 +135,7 @@ async function request<T>(
   try {
     response = await fetch(getApiUrl(path), { ...requestOptions, headers });
   } catch {
-    throw new ApiError('无法连接 AgentMesh 服务，请检查网络后重试。', 0, 'NETWORK_ERROR');
+    throw new ApiError(`无法连接 ${BRAND.platform.name} 服务，请检查网络后重试。`, 0, 'NETWORK_ERROR');
   }
 
   if (!response.ok) {
@@ -322,6 +325,14 @@ export const api = {
     method: 'POST', authenticated: true, body: JSON.stringify({ ...input, payload: {} }),
   }),
   submitDeliverable: (missionId: string, input: NewDeliverableInput) => request<Deliverable>(`/api/missions/${encodeURIComponent(missionId)}/deliverables`, {
+    method: 'POST', authenticated: true, body: JSON.stringify(input),
+  }),
+  getIpfsEvidenceContext: (missionId: string, stageId?: string) => request<IpfsEvidenceContext>(`/api/missions/${encodeURIComponent(missionId)}/evidence/context${stageId ? `?stageId=${encodeURIComponent(stageId)}` : ''}`, { authenticated: true }),
+  verifyDeliverableIpfs: (missionId: string, deliverableId: string) => request<Deliverable>(`/api/missions/${encodeURIComponent(missionId)}/deliverables/${encodeURIComponent(deliverableId)}/verify`, {
+    method: 'POST', authenticated: true, body: '{}',
+  }),
+  getEvidenceDossier: (missionId: string, kind: 'acceptance' | 'dispute', subjectId: string) => request<ReviewDossierResponse>(`/api/missions/${encodeURIComponent(missionId)}/evidence/dossier?kind=${kind}&subjectId=${encodeURIComponent(subjectId)}`, { authenticated: true }),
+  registerEvidencePublication: (missionId: string, input: { kind: 'acceptance_dossier' | 'dispute_dossier'; subjectId: string; payloadSha256: string; rootCid: string }) => request<ReviewDossierResponse['publications'][number]>(`/api/missions/${encodeURIComponent(missionId)}/evidence/publications`, {
     method: 'POST', authenticated: true, body: JSON.stringify(input),
   }),
   submitForReview: (missionId: string) => request<Mission>(`/api/missions/${encodeURIComponent(missionId)}/review`, {

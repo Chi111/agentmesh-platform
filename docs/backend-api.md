@@ -1,4 +1,4 @@
-# AgentMesh Worker API
+# pinme-mesh Worker API
 
 ## Runtime boundaries
 
@@ -8,7 +8,9 @@
 - 交付文件保存在 IPFS 或外部对象存储；D1 仅保存 URI、内容哈希和 MIME 类型。
 - Web2 模式下，`wallet_balances`、`wallet_transactions`、`escrows` 和 `ledger_entries` 组成可审计 CREDIT 测试账本。Web3 模式下，Worker 会验证 Sepolia 回执、目标合约、资产类型、确认数、任务键、金额、发送钱包和链上分账承诺，再推进 D1 状态。
 
-## YD rewards and governance (Phase 1/2)
+## pinme-mesh Contribution / PM rewards and governance (Phase 1/2)
+
+Public responses and UI use `pinme-mesh Contribution / PM`. Legacy `/api/yd/*`, `YD_*` configuration and database names remain stable for compatibility; PM is not presented as a PinMe-official token.
 
 - `GET /api/yd/config` — 公开链配置，并明确报告托管隔离与 Earn 未启用。
 - `GET /api/yd/epochs/:id/allocations` — 公开已计算/已发布清单，不返回用户 Merkle proof。
@@ -25,7 +27,17 @@
 - `POST /api/yd/admin/epochs/:id/expire` — 核验 Treasury sweep 交易，并把未领取分配标记为过期。
 - `POST /api/yd/admin/governance/proposals` — 从已确认历史区块读取 Power 并创建提案。
 
-所有写接口要求正常 Worker 登录；管理员接口还要求平台 `admin` 角色，链上动作同时要求签名钱包拥有对应合约角色。YD 路径不会修改任务 Escrow。
+所有写接口要求正常 Worker 登录；管理员接口还要求平台 `admin` 角色，链上动作同时要求签名钱包拥有对应合约角色。内部保留的 YD 兼容路径不会修改任务 Escrow。
+
+## PinMe/IPFS deliverable evidence
+
+- `GET /api/missions/:missionId/evidence/context?stageId=...` returns the current acceptance-criteria hash, next version and Manifest template.
+- `POST /api/missions/:missionId/deliverables` accepts optional structured `ipfsEvidence`; legacy URI submissions remain compatible.
+- `POST /api/missions/:missionId/deliverables/:deliverableId/verify` fetches `/ipfs/:cid/manifest.json` only through the fixed `IPFS_GATEWAY_BASE` HTTPS origin.
+- `GET /api/missions/:missionId/evidence/dossier` exports a deterministic acceptance or dispute review dossier.
+- `POST /api/missions/:missionId/evidence/publications` records the CID obtained after the user uploads that dossier with their own PinMe login.
+
+The Worker never runs `pinme` and the frontend never accepts a PinMe AppKey. See [pinme-mesh IPFS Evidence](meshpin-ipfs-evidence.md).
 
 ## Authentication
 

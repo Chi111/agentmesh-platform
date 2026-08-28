@@ -35,7 +35,7 @@ Prioritize keeping the template structure clean. Avoid unrelated refactoring.
 - Build backend: `npm run build:worker`
 - Build frontend: `npm run build:frontend`
 - Full build: `npm run build`
-- Redeploy after code changes: use only `pinme save`; do not use `pinme upload`
+- Full-stack redeploys may use `pinme save`. For an explicitly approved split release, run `pinme update-db` before `pinme update-worker`, stop if any migration fails, then publish only the built `frontend/dist` with `pinme upload frontend/dist --domain <independent-domain>`; never upload source files. Every newly bound frontend domain must be added to the Worker CORS allowlist and verified after deployment with both an Origin-bearing request and an OPTIONS preflight before handoff.
 
 ## Platform API Conventions
 

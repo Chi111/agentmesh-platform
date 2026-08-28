@@ -2,27 +2,30 @@
 
 ## 状态
 
-- 工作流：waiting at plan approval gate
+- 工作流：completed
 - 分支：`codex/meshpin-ipfs-evidence`
 - 功能：`specs/008-meshpin-ipfs-evidence`
-- 当前任务：T1（等待 `meshpin-ipfs-evidence-004`）
-- 旧 Gate：`platform-infrastructure-002` 仍 pending，未被本方案替代或批准
+- 任务：T1–T12 全部完成
+- 部署：D1 migration 026、Worker、前端独立 Domain 与 Sepolia PM 测试合约已部署；没有额外服务器、R2、Vectorize 或 Container
 
 ## 已完成
 
-- 完成任务暂停/恢复、紧急暂停升级、版本化返工、stage attempt 隔离与 D1 调度 checkpoint。
-- 暂停后的 Gate 返工只允许替换 approval 节点，运行中的 task 在 Store CAS 边界拒绝；历史 attempt 和返工前任务级交付不参与当前验收。
-- 完成受限条件边、JSON Pointer 映射、transition checkpoint、私有 append-only 模板版本和 1–5 次静态有界循环；已出资任务的 payout commitment 保持不变。
-- 完成显式一人一票/Power 权重版本、不可变冻结轮次、一轮扩大委员上诉和先入队后人工签名的治理执行边界；首轮非方向性结果可上诉，入队与上诉在 D1/Memory 均互斥。
-- 完成 5,000 行阈值的直接/异步导出切换、所有者隔离作业、attempt fencing、进度/取消/重试、固定 7 天任务期限、24 小时私有制品和 fail-closed 短期签名器接口。
-- T6 Review Gate 最终 PASS；Backend 151/151、Chromium 29/29、完整生产构建和最终 Worker dry-run 均通过。
-- 已按用户明确授权部署一版 Wave A 预览：现有 PinMe 前端、Worker 与增量 D1 migrations 001–025 已更新；Worker deployment ID 为 `fbdd19fbd6cb4a438723abbe095c8a75`，前端 CID 为 `bafybeiemwlu6yt3gtsd52yalctzpwda7u3czllj4xp23u35vuktvyycree`。
-- 线上 health/capabilities 通过；未配置私有导出服务时 claim 按设计 fail closed。自定义 `eth.limo` 域名已传播到新 CID，入口 JS/CSS 均返回 HTTP 200。
-- 未执行 R2、Vectorize、Containers、合约、测试网/主网交易或资金 mutation。
+- 公共品牌统一为 `pinme-mesh Contribution / PM`，明确不是 PinMe 官方发行或背书的代币；内部 `/api/yd/*`、表名与文件名保持兼容。
+- `agentmesh.deliverable-manifest.v1` 绑定 Mission、stage/attempt、Agent、验收标准 hash、父 CID 和逐文件 hash；真实 CID 解析与 canonical JSON 安全上限已落实。
+- 手工交付和 Agent callback 共用验证，D1/MemoryStore 实现 append-only scope/version/parent 约束及 companion table 原子写入。
+- 固定 HTTPS Gateway 验证具备禁止重定向、5 秒、256 KiB、hash/schema/context 校验和可用性状态机；未配置时 fail closed。
+- 验收和纠纷冻结当前 attempt 的版本集合、验收标准、工作流/revision 与事件水位；生成确定性审核档案并允许登记用户自行 PinMe 发布后的档案 CID。
+- 验收 UI 提供自动 canonical hash、父版本 Manifest diff、CID/Manifest 操作和 CAR 命令；仲裁 UI 提供冻结 CID CAR 与纠纷档案登记；Agent 详情提供已完成 Mission CID portfolio。
+- migration 026、API/隐私/运营文档、Review/QA/lessons 与部署审批包已完成。
+
+## 证据
+
+- Backend 159/159；Chromium 29/29，更新后的验收与仲裁交互定向复跑通过。
+- Frontend TypeScript/production build、Worker dry-run、contracts build 通过。
+- 全量 SQLite migration + 026 重放及 `integrity_check` 通过；`git diff --check` 通过。
+- 外部 Codex review 因代码外传授权风险被策略拒绝；已记录 ERROR，并以本地只读 Review Gate 完成 ALLOW，不声称获得外部审阅结果。
 
 ## 下一步
 
-- 评审 `specs/008-meshpin-ipfs-evidence/{requirements,design,tasks}.md`。
-- 推荐批准 option 1：`MeshPin Contribution / MPIN` + 上传者 PinMe CLI + CID/Manifest 版本链 + 验收/纠纷冻结；保持 legacy 兼容且不做浏览器 AppKey 直传。
-- 批准命令：`/chill-ai approve meshpin-ipfs-evidence-004 option 1`。
-- 批准前不得开始实现；实现完成后部署、MPIN 合约和任何外部资源仍需独立授权。
+- 主预览：`https://mesh-pinme.pinit.eth.limo`，CID `bafybeiavuejpxvp3g4abo6sa6i2buzcmg64pl5rg53yjbyci53ntrzt2eq`。
+- 新 Worker 健康、能力、Agent 列表和 PM 元数据 smoke 已通过；PM 奖励、领取、锁仓、Power、暂停和紧急退出的 Sepolia 可回收冒烟及独立 RPC 复核通过。未配置 `IPFS_GATEWAY_BASE`，因此真实 Gateway Manifest 验证仍 fail closed 为 `unavailable`。

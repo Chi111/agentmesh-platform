@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom';
 import { MetricCard } from '../components/ui/MetricCard';
 import { PageHeader } from '../components/ui/PageHeader';
 import { StatusBadge } from '../components/ui/StatusBadge';
+import { BRAND } from '../constants/brand';
 import { api } from '../services/api';
 import { formatYdUnits } from '../services/ydFinance';
 import { useAppStore } from '../store/useAppStore';
@@ -87,10 +88,10 @@ export function DashboardPage() {
       <PageHeader
         eyebrow="Mission Control / 任务方"
         title="让复杂目标，沿着可信工作流推进"
-        description="描述结果，AgentMesh 负责任务拆解、可信组队、执行监控与合约结算。你始终保留关键确认权。"
+        description={`描述结果，${BRAND.platform.name} 负责任务拆解、可信组队、执行监控与合约结算。你始终保留关键确认权。`}
         actions={
           <>
-            <Link className="btn-secondary" to="/yd-finance"><Coins size={17} />YD 与 Power</Link>
+            <Link className="btn-secondary" to="/yd-finance"><Coins size={17} />{BRAND.contribution.navigationLabel}</Link>
             <Link className="btn-secondary" to="/agents"><Bot size={17} />浏览 Agent</Link>
             <Link className="btn-primary" to="/missions/new"><Plus size={17} />发布新任务</Link>
           </>
@@ -143,18 +144,18 @@ export function DashboardPage() {
       <section className="yd-home-panel relative overflow-hidden rounded-[26px] border border-lime/45 p-5 shadow-card md:p-7">
         <div className="relative grid gap-7 xl:grid-cols-[minmax(0,1fr)_minmax(460px,.92fr)] xl:items-center">
           <div className="max-w-2xl">
-            <div className="flex flex-wrap items-center gap-2"><span className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white/55 px-3 py-1.5 font-mono text-[9px] font-semibold uppercase tracking-[0.12em]"><Coins size={12} />YD Rewards & Governance</span><span className={`rounded-full px-3 py-1.5 font-mono text-[9px] font-semibold ${ydOverview?.config.configured ? 'bg-ink text-lime' : 'border border-ink/10 bg-white/45 text-ink/55'}`}>{ydLoading ? 'SYNCING' : ydOverview?.config.configured ? 'NETWORK READY' : 'TESTNET SETUP'}</span></div>
-            <h2 className="mt-5 max-w-xl font-display text-2xl font-bold leading-tight tracking-[-0.04em] md:text-3xl">任务完成不是终点，贡献会进入 YD 网络。</h2>
-            <p className="mt-4 max-w-xl text-sm leading-6 text-ink/60">已验收、已结算且无未决争议的贡献进入周期评分；领取 YD 后可主动锁仓生成治理 Power。任务支付与 YD 奖励始终独立。</p>
-            <div className="mt-5 flex flex-wrap items-center gap-2 text-[10px] font-medium text-ink/50"><span>任务结算</span><ArrowRight size={12} /><span>贡献积分</span><ArrowRight size={12} /><span>领取 YD</span><ArrowRight size={12} /><span>锁仓 Power</span></div>
-            <Link className="btn-primary mt-6" to="/yd-finance">进入 YD 中心 <ArrowRight size={15} /></Link>
+            <div className="flex flex-wrap items-center gap-2"><span className="inline-flex items-center gap-2 whitespace-nowrap rounded-full border border-ink/10 bg-white/55 px-3 py-1.5 font-mono text-[9px] font-semibold uppercase tracking-[0.12em]"><Coins size={12} />{BRAND.contribution.eyebrow}</span><StatusBadge tone={ydLoading ? 'neutral' : ydOverview?.config.configured ? 'success' : 'warning'}>{ydLoading ? 'SYNCING' : ydOverview?.config.configured ? 'NETWORK READY' : 'TESTNET SETUP'}</StatusBadge></div>
+            <h2 className="mt-5 max-w-xl font-display text-2xl font-bold leading-tight tracking-[-0.04em] md:text-3xl">任务完成不是终点，贡献会进入 {BRAND.contribution.shortName} 网络。</h2>
+            <p className="mt-4 max-w-xl text-sm leading-6 text-ink/60">已验收、已结算且无未决争议的贡献进入周期评分；领取 {BRAND.contribution.symbol} 后可主动锁仓生成治理 {BRAND.contribution.powerName}。任务支付与 {BRAND.contribution.symbol} 奖励始终独立。</p>
+            <div className="mt-5 flex flex-wrap items-center gap-2 text-[10px] font-medium text-ink/50"><span>任务结算</span><ArrowRight size={12} /><span>贡献积分</span><ArrowRight size={12} /><span>领取 {BRAND.contribution.symbol}</span><ArrowRight size={12} /><span>锁仓 {BRAND.contribution.powerName}</span></div>
+            <Link className="btn-primary mt-6" to="/yd-finance">进入{BRAND.contribution.centerLabel} <ArrowRight size={15} /></Link>
           </div>
 
           <div className="grid grid-cols-2 gap-3">
             {[
-              [Gift, ydLoading ? '—' : `${claimableYd} YD`, '待领取奖励', '周期 Merkle Claim'],
-              [LockKeyhole, ydLoading ? '—' : `${lockedYd} YD`, '已锁定', ydOverview?.staking?.unlockTime ? `解锁 ${new Date(ydOverview.staking.unlockTime).toLocaleDateString('zh-CN')}` : '尚未锁仓'],
-              [Vote, ydLoading ? '—' : governancePower, '治理 Power', ydOverview?.staking?.verified ? '认证账户' : '等待认证或锁仓'],
+              [Gift, ydLoading ? '—' : `${claimableYd} ${BRAND.contribution.symbol}`, '待领取奖励', '周期 Merkle Claim'],
+              [LockKeyhole, ydLoading ? '—' : `${lockedYd} ${BRAND.contribution.symbol}`, '已锁定', ydOverview?.staking?.unlockTime ? `解锁 ${new Date(ydOverview.staking.unlockTime).toLocaleDateString('zh-CN')}` : '尚未锁仓'],
+              [Vote, ydLoading ? '—' : governancePower, `治理 ${BRAND.contribution.powerName}`, ydOverview?.staking?.verified ? '认证账户' : '等待认证或锁仓'],
               [Sparkles, ydLoading ? '—' : String(activeProposals), '活跃提案', activeProposals ? '可查看快照与投票' : '暂无进行中提案'],
             ].map(([Icon, value, label, detailText]) => {
               const YdIcon = Icon as typeof Gift;

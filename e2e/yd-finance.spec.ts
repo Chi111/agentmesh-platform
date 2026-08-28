@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { BRAND } from '../shared/brand';
 
 const profile = {
   id: 'USER-e2e-requester',
@@ -17,7 +18,7 @@ const overview = {
     decimals: 18,
     confirmations: 3,
     testnet: true,
-    rewardLabel: '测试 YD 奖励',
+    rewardLabel: `测试 ${BRAND.contribution.symbol} 奖励`,
     yieldLabel: 'Earn Vault 未启用',
   },
   epochs: [{
@@ -76,26 +77,27 @@ test.beforeEach(async ({ page }) => {
   await mockWorkspace(page);
 });
 
-test('YD Finance keeps rewards, Power and task settlement visibly separated', async ({ page }) => {
+test(`${BRAND.contribution.name} keeps rewards, Power and task settlement visibly separated`, async ({ page }) => {
   await page.goto('/#/yd-finance');
 
-  await expect(page.getByRole('heading', { name: 'YD Finance' })).toBeVisible();
-  await expect(page.getByText('YD 是贡献奖励与治理凭证，不是任务支付资产')).toBeVisible();
-  await expect(page.getByText('125 YD')).toBeVisible();
+  await expect(page.getByRole('heading', { name: BRAND.contribution.displayName, exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: BRAND.contribution.navigationLabel, exact: true })).toBeVisible();
+  await expect(page.getByText(`${BRAND.contribution.symbol} 是 ${BRAND.platform.name} 的${BRAND.contribution.purposeLabel}，不是任务支付资产`)).toBeVisible();
+  await expect(page.getByText(`125 ${BRAND.contribution.symbol}`)).toBeVisible();
   await expect(page.getByText('12,500,000,000')).toBeVisible();
   await expect(page.getByRole('heading', { name: '周期奖励' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '锁仓与 Power' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: `锁仓与 ${BRAND.contribution.powerName}` })).toBeVisible();
   await expect(page.getByRole('heading', { name: '生态治理' })).toBeVisible();
   await expect(page.getByText('任务争议仍由仲裁委员会一人一票')).toBeVisible();
-  await expect(page.getByText('YD 测试网合约尚未完整配置')).toBeVisible();
+  await expect(page.getByText(`${BRAND.contribution.symbol} 测试网合约尚未完整配置`)).toBeVisible();
   await expect(page.getByText(/真实收益或 APY/)).toBeVisible();
   await expect(page.getByText(/测试奖励率|真实 APY/)).toHaveCount(0);
 });
 
-test('YD Finance has no horizontal overflow on mobile', async ({ page }) => {
+test(`${BRAND.contribution.name} has no horizontal overflow on mobile`, async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/#/yd-finance');
-  await expect(page.getByRole('heading', { name: 'YD Finance' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: BRAND.contribution.displayName, exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
   await expect(page.getByRole('heading', { name: '周期奖励' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '生态治理' })).toBeVisible();

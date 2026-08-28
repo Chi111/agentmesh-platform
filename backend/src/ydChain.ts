@@ -7,6 +7,8 @@ import {
   type Hex,
 } from 'viem';
 import type { GovernancePowerSnapshot, RewardEpoch, YdStakingPosition } from './contracts';
+import { BRAND } from '../../shared/brand';
+import { PM_SEPOLIA_DEPLOYMENT } from '../../shared/pmDeployment';
 
 export interface YdChainEnv {
   YD_RPC_URL?: string;
@@ -115,14 +117,14 @@ function isHash(value: string): value is Hex {
 
 function config(env: YdChainEnv) {
   return {
-    rpcUrl: env.YD_RPC_URL?.trim() || env.BASE_RPC_URL?.trim() || '',
-    chainId: Number(env.YD_CHAIN_ID ?? env.BASE_CHAIN_ID ?? 11155111),
-    tokenAddress: env.YD_TOKEN_ADDRESS?.trim() || '',
-    distributorAddress: env.YD_DISTRIBUTOR_ADDRESS?.trim() || '',
-    stakingAddress: env.YD_STAKING_ADDRESS?.trim() || '',
-    decimals: Math.max(0, Math.min(18, Number(env.YD_TOKEN_DECIMALS ?? 18))),
-    confirmations: Math.max(1, Number(env.YD_MIN_CONFIRMATIONS ?? 2)),
-    testnet: env.YD_TESTNET?.trim().toLocaleLowerCase() !== 'false',
+    rpcUrl: env.YD_RPC_URL?.trim() || env.BASE_RPC_URL?.trim() || PM_SEPOLIA_DEPLOYMENT.rpcUrl,
+    chainId: Number(env.YD_CHAIN_ID ?? env.BASE_CHAIN_ID ?? PM_SEPOLIA_DEPLOYMENT.chainId),
+    tokenAddress: env.YD_TOKEN_ADDRESS?.trim() || PM_SEPOLIA_DEPLOYMENT.tokenAddress,
+    distributorAddress: env.YD_DISTRIBUTOR_ADDRESS?.trim() || PM_SEPOLIA_DEPLOYMENT.distributorAddress,
+    stakingAddress: env.YD_STAKING_ADDRESS?.trim() || PM_SEPOLIA_DEPLOYMENT.stakingAddress,
+    decimals: Math.max(0, Math.min(18, Number(env.YD_TOKEN_DECIMALS ?? PM_SEPOLIA_DEPLOYMENT.decimals))),
+    confirmations: Math.max(1, Number(env.YD_MIN_CONFIRMATIONS ?? PM_SEPOLIA_DEPLOYMENT.confirmations)),
+    testnet: env.YD_TESTNET?.trim().toLocaleLowerCase() !== 'false' && PM_SEPOLIA_DEPLOYMENT.testnet,
   };
 }
 
@@ -141,7 +143,7 @@ export function ydChainDescriptor(env: YdChainEnv) {
     decimals: value.decimals,
     confirmations: value.confirmations,
     testnet: value.testnet,
-    rewardLabel: value.testnet ? '测试 YD 奖励' : 'YD 奖励',
+    rewardLabel: value.testnet ? `测试 ${BRAND.contribution.symbol} 奖励` : `${BRAND.contribution.symbol} 奖励`,
     yieldLabel: '不包含 Earn 或真实收益',
   };
 }
@@ -149,7 +151,7 @@ export function ydChainDescriptor(env: YdChainEnv) {
 async function receiptContext(env: YdChainEnv, txHash: string, contractAddress: string) {
   const value = config(env);
   if (!value.rpcUrl || !isAddress(contractAddress)) {
-    return { error: { ok: false, status: 503, code: 'YD_CHAIN_NOT_CONFIGURED', message: 'YD chain contracts are not configured' } as const };
+    return { error: { ok: false, status: 503, code: 'YD_CHAIN_NOT_CONFIGURED', message: `${BRAND.contribution.symbol}-compatible chain contracts are not configured` } as const };
   }
   if (!isHash(txHash)) return { error: { ok: false, status: 400, code: 'INVALID_TX_HASH', message: 'A valid transaction hash is required' } as const };
   const client = createPublicClient({ transport: http(value.rpcUrl) });
@@ -160,10 +162,10 @@ async function receiptContext(env: YdChainEnv, txHash: string, contractAddress: 
       client.getBlockNumber(),
       client.getChainId(),
     ]);
-    if (networkChainId !== value.chainId) return { error: { ok: false, status: 409, code: 'WRONG_YD_CHAIN', message: 'YD RPC chain ID does not match configuration' } as const };
-    if (receipt.status !== 'success') return { error: { ok: false, status: 409, code: 'TX_REVERTED', message: 'The YD transaction reverted' } as const };
+    if (networkChainId !== value.chainId) return { error: { ok: false, status: 409, code: 'WRONG_YD_CHAIN', message: `${BRAND.contribution.symbol} RPC chain ID does not match configuration` } as const };
+    if (receipt.status !== 'success') return { error: { ok: false, status: 409, code: 'TX_REVERTED', message: `The ${BRAND.contribution.symbol} transaction reverted` } as const };
     if (transaction.to?.toLocaleLowerCase() !== contractAddress.toLocaleLowerCase()) {
-      return { error: { ok: false, status: 400, code: 'WRONG_YD_CONTRACT', message: 'The transaction target is not the configured YD contract' } as const };
+      return { error: { ok: false, status: 400, code: 'WRONG_YD_CONTRACT', message: `The transaction target is not the configured ${BRAND.contribution.symbol} contract` } as const };
     }
     const confirmations = Number(latestBlock - receipt.blockNumber + 1n);
     if (confirmations < value.confirmations) {
@@ -171,7 +173,7 @@ async function receiptContext(env: YdChainEnv, txHash: string, contractAddress: 
     }
     return { client, receipt, transaction, confirmations };
   } catch {
-    return { error: { ok: false, status: 409, code: 'TX_NOT_AVAILABLE', message: 'The YD transaction is not available from the configured RPC yet' } as const };
+    return { error: { ok: false, status: 409, code: 'TX_NOT_AVAILABLE', message: `The ${BRAND.contribution.symbol} transaction is not available from the configured RPC yet` } as const };
   }
 }
 
@@ -224,7 +226,7 @@ export async function verifyRewardClaim(
       // Ignore unrelated logs.
     }
   }
-  return { ok: false, status: 400, code: 'YD_CLAIM_EVENT_MISMATCH', message: 'Transaction does not contain the expected YD claim' };
+  return { ok: false, status: 400, code: 'YD_CLAIM_EVENT_MISMATCH', message: `Transaction does not contain the expected ${BRAND.contribution.symbol} claim` };
 }
 
 export async function verifyRewardEpochSwept(
@@ -247,7 +249,7 @@ export async function verifyRewardEpochSwept(
       // Ignore unrelated logs.
     }
   }
-  return { ok: false, status: 400, code: 'YD_SWEEP_EVENT_MISMATCH', message: 'Transaction does not sweep the expected YD epoch' };
+  return { ok: false, status: 400, code: 'YD_SWEEP_EVENT_MISMATCH', message: `Transaction does not sweep the expected ${BRAND.contribution.symbol} epoch` };
 }
 
 export async function syncStakingTransaction(

@@ -13,6 +13,8 @@
     "build:contracts": "solcjs --bin --abi --base-path . --include-path node_modules --output-dir dist-contracts contracts/*.sol",
     "deploy:contract:sepolia": "node scripts/deployEscrow.mjs",
     "deploy:yd:sepolia": "npm run build:contracts && node scripts/deployYdFinance.mjs",
+    "smoke:pm:sepolia": "node scripts/smokePmFinance.mjs",
+    "verify:pm:sepolia": "node scripts/verifyPmFinance.mjs",
     "smoke:contract:sepolia": "node scripts/smokeEscrow.mjs",
     "build:worker": "cd backend && wrangler deploy --dry-run --outdir ../dist-worker",
     "dev:frontend": "cd frontend && npm run dev",
@@ -21,6 +23,7 @@
     "test:e2e": "playwright test"
   },
   "overrides": {
+    "three": "0.180.0",
     "uuid": "11.1.1",
     "tmp": "0.2.7",
     "@coinbase/cdp-sdk": {
@@ -35,8 +38,10 @@
     "@playwright/test": "1.62.1",
     "@types/react": "18.3.1",
     "@types/react-dom": "18.3.1",
+    "@types/three": "0.180.0",
     "axios": "1.19.0",
     "solc": "0.8.36",
+    "three": "0.180.0",
     "wrangler": "4.123.0",
     "ws": "8.21.3"
   }

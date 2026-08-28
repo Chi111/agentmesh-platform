@@ -11,7 +11,9 @@ import {
   type Hex,
 } from 'viem';
 import type { RewardEpoch } from '../types/domain';
+import { BRAND } from '../constants/brand';
 import type { SendTransaction } from './settlement';
+import { PM_SEPOLIA_DEPLOYMENT } from '../../../shared/pmDeployment';
 
 const erc20Abi = parseAbi([
   'function allowance(address owner,address spender) view returns (uint256)',
@@ -37,12 +39,12 @@ const stakingAbi = parseAbi([
   'function setReputation(address account,uint16 newBps)',
 ]);
 
-const chainId = Number(import.meta.env.VITE_YD_CHAIN_ID ?? import.meta.env.VITE_BASE_CHAIN_ID ?? 11155111);
-const rpcUrl = (import.meta.env.VITE_YD_RPC_URL ?? import.meta.env.VITE_BASE_RPC_URL)?.trim();
-const tokenAddress = import.meta.env.VITE_YD_TOKEN_ADDRESS?.trim();
-const distributorAddress = import.meta.env.VITE_YD_DISTRIBUTOR_ADDRESS?.trim();
-const stakingAddress = import.meta.env.VITE_YD_STAKING_ADDRESS?.trim();
-const decimals = Math.max(0, Math.min(18, Number(import.meta.env.VITE_YD_TOKEN_DECIMALS ?? 18)));
+const chainId = Number(import.meta.env.VITE_YD_CHAIN_ID ?? import.meta.env.VITE_BASE_CHAIN_ID ?? PM_SEPOLIA_DEPLOYMENT.chainId);
+const rpcUrl = (import.meta.env.VITE_YD_RPC_URL ?? import.meta.env.VITE_BASE_RPC_URL)?.trim() || PM_SEPOLIA_DEPLOYMENT.rpcUrl;
+const tokenAddress = import.meta.env.VITE_YD_TOKEN_ADDRESS?.trim() || PM_SEPOLIA_DEPLOYMENT.tokenAddress;
+const distributorAddress = import.meta.env.VITE_YD_DISTRIBUTOR_ADDRESS?.trim() || PM_SEPOLIA_DEPLOYMENT.distributorAddress;
+const stakingAddress = import.meta.env.VITE_YD_STAKING_ADDRESS?.trim() || PM_SEPOLIA_DEPLOYMENT.stakingAddress;
+const decimals = Math.max(0, Math.min(18, Number(import.meta.env.VITE_YD_TOKEN_DECIMALS ?? PM_SEPOLIA_DEPLOYMENT.decimals)));
 
 const configured = Boolean(
   rpcUrl
@@ -53,11 +55,11 @@ const configured = Boolean(
 
 const chain = defineChain({
   id: chainId,
-  name: import.meta.env.VITE_BASE_CHAIN_NAME?.trim() || 'Sepolia',
+  name: import.meta.env.VITE_BASE_CHAIN_NAME?.trim() || PM_SEPOLIA_DEPLOYMENT.networkName,
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-  rpcUrls: { default: { http: rpcUrl ? [rpcUrl] : ['https://ethereum-sepolia-rpc.publicnode.com'] } },
+  rpcUrls: { default: { http: [rpcUrl] } },
 });
-const publicClient = createPublicClient({ chain, transport: http(rpcUrl || chain.rpcUrls.default.http[0]) });
+const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
 
 export type YdWalletAction =
   | { type: 'claim'; epochNumber: number; amountUnits: string; proof: string[] }
@@ -73,7 +75,7 @@ export type YdWalletAction =
   | { type: 'sweep_epoch'; epochNumber: number };
 
 function requireConfig() {
-  if (!configured) throw new Error('YD 测试网合约尚未配置。');
+  if (!configured) throw new Error(`${BRAND.contribution.symbol} 测试网合约尚未配置。`);
   return {
     token: tokenAddress as Address,
     distributor: distributorAddress as Address,
@@ -83,8 +85,8 @@ function requireConfig() {
 
 function positiveUnits(value: string) {
   const units = parseUnits(value.trim(), decimals);
-  if (units <= 0n) throw new Error('YD 数量必须大于 0。');
-  if (units > 2n ** 128n - 1n) throw new Error('YD 数量超过合约上限。');
+  if (units <= 0n) throw new Error(`${BRAND.contribution.symbol} 数量必须大于 0。`);
+  if (units > 2n ** 128n - 1n) throw new Error(`${BRAND.contribution.symbol} 数量超过合约上限。`);
   return units;
 }
 
@@ -95,7 +97,7 @@ function durationSeconds(days: number) {
 
 async function waitForSuccess(hash: Hex) {
   const receipt = await publicClient.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 90_000 });
-  if (receipt.status !== 'success') throw new Error('YD 链上交易执行失败。');
+  if (receipt.status !== 'success') throw new Error(`${BRAND.contribution.symbol} 链上交易执行失败。`);
 }
 
 async function sendAndWait(sendTransaction: SendTransaction, to: Address, data: Hex) {
@@ -159,7 +161,7 @@ export async function submitYdAction(
       args: [owner],
     });
     if (balance < amount) {
-      throw new Error(`YD 余额不足：可用 ${formatYdUnits(balance.toString())} YD，需要 ${formatYdUnits(amount.toString())} YD。`);
+      throw new Error(`${BRAND.contribution.symbol} 余额不足：可用 ${formatYdUnits(balance.toString())} ${BRAND.contribution.symbol}，需要 ${formatYdUnits(amount.toString())} ${BRAND.contribution.symbol}。`);
     }
     await ensureAllowance(sendTransaction, owner, amount);
     return sendAndWait(sendTransaction, staking, encodeFunctionData({

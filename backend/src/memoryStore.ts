@@ -16,6 +16,7 @@ import type {
   ArbitrationMember,
   ArbitrationProposal,
   AuthIdentityInput,
+  AgentCidPortfolioItem,
   Deliverable,
   DeveloperLedger,
   Dispute,
@@ -35,6 +36,7 @@ import type {
   EcosystemVoteChoice,
   EcosystemVoteResult,
   Escrow,
+  EvidencePublication,
   ExecutionEvent,
   GovernancePowerSnapshot,
   GovernanceExecutionItem,
@@ -48,6 +50,7 @@ import type {
   LedgerExportPrivateArtifact,
   LedgerExportRequestResult,
   Mission,
+  MissionEvidenceSnapshot,
   MissionChangeRequest,
   MissionPauseMode,
   Notification,
@@ -73,6 +76,7 @@ import type {
   WorkflowTemplateSaveResult,
   WorkflowViewport,
 } from './contracts';
+import { isDefaultPlatformUserName } from '../../shared/brand';
 import { calculateAgentQuality, feedbackWeightForPriorCount } from './agentQuality';
 import {
   arbitrationAppealEndsAt,
@@ -130,6 +134,8 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly agentPerformance = new Map<string, { agentId: string; outcome: 'done' | 'failed' }>();
   readonly events = new Map<string, ExecutionEvent[]>();
   readonly deliverables = new Map<string, Deliverable[]>();
+  readonly acceptanceEvidenceSnapshots = new Map<string, MissionEvidenceSnapshot>();
+  readonly evidencePublications = new Map<string, EvidencePublication[]>();
   readonly escrows = new Map<string, Escrow>();
   readonly disputes = new Map<string, Dispute[]>();
   readonly disputeActions = new Map<string, DisputeAction[]>();
@@ -234,7 +240,7 @@ export class MemoryPlatformStore implements PlatformStore {
         ...existing,
         email: existing.email ?? normalizedEmail,
         walletAddress: existing.walletAddress ?? normalizedWallet,
-        displayName: existing.displayName === 'AgentMesh User' ? identity.displayName : existing.displayName,
+        displayName: isDefaultPlatformUserName(existing.displayName) ? identity.displayName : existing.displayName,
       };
       this.profiles.set(profileId, updated);
       return copy(updated);
@@ -730,7 +736,7 @@ export class MemoryPlatformStore implements PlatformStore {
     return true;
   }
 
-  async acceptMission(id: string, actorId: string, releaseTxHash: string | null) {
+  async acceptMission(id: string, actorId: string, releaseTxHash: string | null, evidenceSnapshot?: MissionEvidenceSnapshot) {
     const mission = this.missions.get(id);
     const escrow = this.escrows.get(id);
     if (!mission || !escrow) return null;
@@ -751,6 +757,9 @@ export class MemoryPlatformStore implements PlatformStore {
       createdAt: now,
     };
     this.events.set(id, [...(this.events.get(id) ?? []), acceptedEvent]);
+    if (evidenceSnapshot && !this.acceptanceEvidenceSnapshots.has(id)) {
+      this.acceptanceEvidenceSnapshots.set(id, copy(evidenceSnapshot));
+    }
     await this.recordRewardActivity({
       id: `YDACT-${id}-requester`,
       sourceKey: `${id}:settlement:requester`,
@@ -1232,6 +1241,18 @@ export class MemoryPlatformStore implements PlatformStore {
       : null;
     const attemptNo = stage ? deliverable.attemptNo ?? stage.attemptNo : null;
     if (deliverable.stageId && (!stage || attemptNo !== stage.attemptNo)) throw new Error('STALE_STAGE_ATTEMPT');
+    if (deliverable.ipfsEvidence) {
+      const prior = (this.deliverables.get(deliverable.missionId) ?? [])
+        .filter((item) => item.ipfsEvidence?.scopeKey === deliverable.ipfsEvidence?.scopeKey)
+        .sort((left, right) => (right.ipfsEvidence?.versionNo ?? 0) - (left.ipfsEvidence?.versionNo ?? 0))[0];
+      const expectedVersion = prior ? prior.ipfsEvidence!.versionNo + 1 : 1;
+      if (deliverable.ipfsEvidence.versionNo !== expectedVersion) throw new Error('IPFS_VERSION_CONFLICT');
+      if (deliverable.ipfsEvidence.supersedesDeliverableId !== (prior?.id ?? null)) throw new Error('IPFS_PARENT_CONFLICT');
+      if (deliverable.ipfsEvidence.manifest.supersedesRootCid !== (prior?.ipfsEvidence?.rootCid ?? null)) throw new Error('IPFS_PARENT_CID_CONFLICT');
+      if ((this.deliverables.get(deliverable.missionId) ?? []).some((item) =>
+        item.ipfsEvidence?.scopeKey === deliverable.ipfsEvidence?.scopeKey
+        && item.ipfsEvidence.rootCid === deliverable.ipfsEvidence?.rootCid)) throw new Error('IPFS_CID_CONFLICT');
+    }
     const stored = { ...deliverable, attemptNo };
     this.deliverables.set(deliverable.missionId, [...(this.deliverables.get(deliverable.missionId) ?? []), copy(stored)]);
     return copy(stored);
@@ -1239,6 +1260,68 @@ export class MemoryPlatformStore implements PlatformStore {
 
   async listDeliverables(missionId: string): Promise<Deliverable[]> {
     return copy(this.deliverables.get(missionId) ?? []);
+  }
+
+  async updateDeliverableIpfsVerification(
+    missionId: string,
+    deliverableId: string,
+    status: NonNullable<Deliverable['ipfsEvidence']>['verificationStatus'],
+    verifiedAt: string,
+    error: string | null,
+  ): Promise<Deliverable | null> {
+    const rows = this.deliverables.get(missionId) ?? [];
+    const index = rows.findIndex((item) => item.id === deliverableId && item.ipfsEvidence);
+    if (index < 0) return null;
+    const next = [...rows];
+    const persistedStatus = next[index].ipfsEvidence!.verificationStatus === 'verified' && status === 'unavailable'
+      ? 'verified'
+      : status;
+    next[index] = {
+      ...next[index],
+      ipfsEvidence: { ...next[index].ipfsEvidence!, verificationStatus: persistedStatus, lastVerifiedAt: verifiedAt, lastVerificationError: error },
+    };
+    this.deliverables.set(missionId, next);
+    return copy(next[index]);
+  }
+
+  async getAcceptanceEvidenceSnapshot(missionId: string): Promise<MissionEvidenceSnapshot | null> {
+    return copy(this.acceptanceEvidenceSnapshots.get(missionId) ?? null);
+  }
+
+  async recordEvidencePublication(publication: EvidencePublication): Promise<EvidencePublication> {
+    const rows = this.evidencePublications.get(publication.missionId) ?? [];
+    const existing = rows.find((item) => item.kind === publication.kind && item.subjectId === publication.subjectId);
+    if (existing) {
+      if (existing.payloadSha256 !== publication.payloadSha256 || existing.rootCid !== publication.rootCid) {
+        throw new Error('EVIDENCE_PUBLICATION_CONFLICT');
+      }
+      return copy(existing);
+    }
+    this.evidencePublications.set(publication.missionId, [...rows, copy(publication)]);
+    return copy(publication);
+  }
+
+  async listEvidencePublications(missionId: string): Promise<EvidencePublication[]> {
+    return copy([...(this.evidencePublications.get(missionId) ?? [])].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }
+
+  async listAgentCidPortfolio(agentId: string, limit = 20): Promise<AgentCidPortfolioItem[]> {
+    const rows: AgentCidPortfolioItem[] = [];
+    for (const mission of this.missions.values()) {
+      if (mission.status !== 'completed') continue;
+      const attempts = new Map((this.stages.get(mission.id) ?? []).map((stage) => [stage.id, stage.attemptNo]));
+      for (const deliverable of this.deliverables.get(mission.id) ?? []) {
+        const evidence = deliverable.ipfsEvidence;
+        if (!evidence || deliverable.agentId !== agentId) continue;
+        if (deliverable.stageId && deliverable.attemptNo !== attempts.get(deliverable.stageId)) continue;
+        rows.push({
+          missionId: mission.id, missionTitle: mission.title, deliverableId: deliverable.id, name: deliverable.name,
+          rootCid: evidence.rootCid, manifestSha256: evidence.manifestSha256, versionNo: evidence.versionNo,
+          visibility: evidence.visibility, verificationStatus: evidence.verificationStatus, completedAt: mission.updatedAt,
+        });
+      }
+    }
+    return copy(rows.sort((a, b) => b.completedAt.localeCompare(a.completedAt) || b.versionNo - a.versionNo).slice(0, Math.max(1, Math.min(50, limit))));
   }
 
   async getEscrow(missionId: string): Promise<Escrow | null> {

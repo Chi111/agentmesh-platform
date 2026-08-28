@@ -35,3 +35,21 @@
   来源：`specs/007-platform-completion/t6-async-export`、多轮 Review Gate。
   适用：开发者收益账本、导出作业、内部服务回调、私有制品和审计事件。
   复核条件：批准 `platform-infrastructure-002` 并接入真实私有存储、向量索引或隔离 Runtime。
+
+- 日期：2026-08-27
+  决策：`meshpin-ipfs-evidence-004` 选择 option 1。最终公开品牌统一为 `pinme-mesh Contribution / PM`，但不宣称 PinMe 官方代币；上传继续由 Agent/开发者自己的 PinMe CLI 登录态完成，AgentMesh 只保存、验证和冻结 CID/Manifest 证据。首版同时生成不可变审核档案、展示 Agent CID 履历，并把验收标准 SHA-256 固化到 Manifest、验收和纠纷快照。所有实现只在需求分支进行，部署、远程 D1、云资源或合约操作需另行授权。
+  来源：用户回复“OK，可以，先实现一版，还是需求分支，不要影响线上代码”；`specs/008-meshpin-ipfs-evidence`。
+  适用：公开品牌、交付版本链、审核档案、Agent 履历、验收与仲裁证据。
+  复核条件：需要浏览器直传、服务端代传、PM 主网合约、强制 IPFS 策略或额外线上基础设施时。
+
+- 日期：2026-08-28
+  决策：用户批准 MeshPin 拆分发布：先 `pinme update-db`，确认 026 成功后执行 `pinme update-worker`，前端只上传 `frontend/dist` 并绑定 `mesh-pinme`；不使用 `pinme save` 或 `pinme update-web`。
+  来源：用户明确回复“可以”并把域名指定为 `mesh-pinme`。
+  适用：MeshPin migration 026、Worker 和独立 PinMe Domain 预览。
+  复核条件：部署合约、配置 Gateway、创建额外资源或执行资金操作时。
+
+- 日期：2026-08-28
+  决策：公开品牌最终统一为 `pinme-mesh Contribution / PM`，运行时代码只从 `shared/brand.ts` 派生；用户批准复用 Sepolia 专用测试账户完成 PM 合约部署和可回收奖励/锁仓冒烟。批次 `1787896008` 结清后，Treasury 恢复完整固定供应，Distributor/Staking/Power 均归零。
+  来源：用户明确指定品牌和 PM 首字母缩写，并明确允许执行 Sepolia PM 完整冒烟交易。
+  适用：当前 Sepolia PM 测试发布、UI/API 公共文案和部署审计。
+  复核条件：变更公开品牌、部署主网、迁移旧资产或引入正式经济价值时。

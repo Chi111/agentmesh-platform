@@ -10,6 +10,7 @@ import { StatusBadge } from '../components/ui/StatusBadge';
 import { useMission } from '../hooks/useMission';
 import { useAppStore } from '../store/useAppStore';
 import { api } from '../services/api';
+import { shortWalletAddress } from '../services/ens';
 import type { WorkflowEdge, WorkflowStage, WorkflowTemplateDetail, WorkflowViewport } from '../types/domain';
 import { formatPaymentAmount, isWeb3Payment, paymentToken } from '../utils/payments';
 
@@ -18,7 +19,7 @@ export function WorkflowPage() {
   const { missionId: routeMissionId = '' } = useParams();
   const mission = useMission();
   const missionId = mission?.id ?? routeMissionId;
-  const { onchainSettlement, depositEscrow, linkedWalletAddress, walletAddress, linkWallet } = useAuth();
+  const { onchainSettlement, depositEscrow, linkedWalletAddress, walletAddress, ensName, linkWallet } = useAuth();
   const agents = useAppStore((state) => state.agents);
   const candidateMatches = useAppStore((state) => state.candidateMatches[missionId]) ?? [];
   const detail = useAppStore((state) => state.missionDetails[missionId]);
@@ -197,7 +198,7 @@ export function WorkflowPage() {
 
       <Modal open={startOpen} onClose={() => setStartOpen(false)} title="确认托管并启动 DAG" description={usesWeb3 ? `钱包将把 ${token} 存入 Sepolia 托管合约；根节点会并行派发。` : '平台将锁定 Web2 余额；所有就绪根节点会写入派发队列。'}>
         <div className="rounded-xl border border-line bg-canvas p-4">
-          <div className="flex items-center justify-between"><span className="inline-flex items-center gap-2 text-sm font-semibold">{usesWeb3 ? <WalletCards size={17} /> : <Database size={17} />}{usesWeb3 ? walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : linkedWalletAddress ? '钱包连接已中断' : '需要关联 EVM 钱包' : 'Web2 充值余额'}</span><span className="mono-chip">{usesWeb3 ? 'SEPOLIA' : 'BALANCE'}</span></div>
+          <div className="flex items-center justify-between"><span className="inline-flex min-w-0 items-center gap-2 text-sm font-semibold">{usesWeb3 ? <WalletCards className="shrink-0" size={17} /> : <Database className="shrink-0" size={17} />}<span className="truncate">{usesWeb3 ? walletAddress ? ensName ?? shortWalletAddress(walletAddress) : linkedWalletAddress ? ensName ? `${ensName} · 钱包连接已中断` : '钱包连接已中断' : '需要关联 EVM 钱包' : 'Web2 充值余额'}</span></span><span className="mono-chip">{usesWeb3 ? 'SEPOLIA' : 'BALANCE'}</span></div>
           <p className="mt-3 font-mono text-xl font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</p>
           <p className="mt-3 text-xs leading-5 text-muted"><LockKeyhole size={14} className="mr-1.5 inline text-cyan" />启动后节点、连线、预算和 Agent 全部锁定。</p>
           {!usesWeb3 ? <Link className="mt-3 inline-flex text-xs font-semibold text-cyan" to="/wallet/test-funds">余额不足？领取测试充值</Link> : null}

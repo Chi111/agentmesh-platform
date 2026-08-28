@@ -1,0 +1,1 @@
+import{i as e,u as t}from"./vendor~index~AgentDetailPage~AgentMarketPage~DeveloperAgentsPage~DeveloperDashboardPage~Exe~fr426kdw-BE03NbPQ.js";import{t as n}from"./jsx-runtime-Bbae7Wnw.js";var r=n();function i(){let{missionId:n=``}=t();return(0,r.jsx)(e,{to:`/missions/${encodeURIComponent(n)}/workflow`,replace:!0})}export{i as TeamAssemblyPage};

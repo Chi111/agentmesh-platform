@@ -3,9 +3,24 @@ import {
   governancePowerRequiresSync,
   reconcileGovernanceDelegations,
   selectFinalizedSnapshotBlock,
+  ydChainDescriptor,
 } from './ydChain';
 
 describe('YD governance snapshot safety', () => {
+  it('uses the shared PM Sepolia deployment when no runtime override is present', () => {
+    expect(ydChainDescriptor({})).toMatchObject({
+      configured: true,
+      chainId: 11155111,
+      tokenAddress: '0xfdf06a468dcc7464c3871057acd863d6bc514bae',
+      distributorAddress: '0x852c36af469f0eea10c6aa26cf9489423c7d037e',
+      stakingAddress: '0x9875e2eabe942dd9f8dd0e7bcb6f36071040a5c2',
+      decimals: 18,
+      confirmations: 2,
+      testnet: true,
+      rewardLabel: '测试 PM 奖励',
+    });
+  });
+
   it('only selects blocks behind the configured confirmation depth', () => {
     expect(selectFinalizedSnapshotBlock(100n, 2, null)).toBe(98n);
     expect(selectFinalizedSnapshotBlock(100n, 2, 97n)).toBe(97n);

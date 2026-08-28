@@ -15,3 +15,12 @@
 - SQLite 外层 `INSERT OR IGNORE` 会把冲突策略传入 trigger，可能连 trigger 内本应执行的余额 UPSERT 一并忽略；应在目标幂等键上使用 `ON CONFLICT ... DO NOTHING`。
 - 负数钱包交易不能把负值作为新余额 UPSERT 的初始值，因为 CHECK 约束在冲突更新前验证；余额不足由 BEFORE trigger 拒绝，AFTER trigger 可用零作为负交易的安全初值。
 - 任务方与开发者页面代表不同账户视角，接单状态需要显式刷新或轮询，不能假设同一浏览器内的旧详情会自动同步。
+
+## 2026-08-27 PinMe/IPFS 交付证据
+
+- CID 只解决内容寻址，不自动表达 Mission、stage attempt、验收标准或父版本；业务证据必须用 canonical Manifest 和 D1 append-only 账本把这些上下文显式绑定。
+- 不能让 Worker 接受用户提供的 Gateway URL，也不能把 PinMe AppKey 放进浏览器；上传身份应留在用户自己的 CLI 登录态，平台只登记 CID、hash 和版本关系。
+- “当前交付”与“案件证据”不是同一个查询：验收和纠纷必须在状态转换的原子边界冻结 deliverable ID 集合，否则后续返工会让历史决定指向新的内容。
+- 已验证 CID 后续暂时不可达属于可用性观察，不应撤销历史完整性结论；Gateway 超时、重定向、体积限制和验证状态需要分别建模。
+- 仲裁委员需要访问冻结纠纷档案，但不应因此获得整项 Mission 的普通编辑/读取权限；案件级 evidence authorization 应与 Mission participant authorization 分开。
+- 公共 Agent CID 履历只能由已完成 Mission 的当前 attempt 派生，且 encrypted 证据只公开摘要，不能复用内部 Manifest 读取接口直接暴露文件清单。

@@ -8,12 +8,14 @@ import type {
   AgentTrial,
   Deliverable,
   Dispute,
+  EvidencePublication,
   LedgerExportPrivateArtifact,
   LedgerCursor,
   ExecutionEvent,
   IdempotentResult,
   Mission,
   MissionDetail,
+  MissionEvidenceSnapshot,
   Notification,
   PaymentMethod,
   StageOffer,
@@ -103,6 +105,18 @@ import {
 } from './workflowCompiler';
 import { REWARD_FORMULA_VERSION } from './ydFinance';
 import { EXPORT_DOWNLOAD_TOKEN_MS } from './exportJobs';
+import { MESHPIN_PUBLIC_ASSET } from './meshpin';
+import { BRAND } from '../../shared/brand';
+import {
+  acceptanceCriteriaEvidence,
+  canonicalJson,
+  frozenDeliverables,
+  IpfsEvidenceError,
+  normalizeCid,
+  parseIpfsEvidence,
+  reviewDossier,
+  sha256Json,
+} from './ipfsEvidence';
 import {
   readGovernancePowerSnapshot,
   syncStakingTransaction,
@@ -124,6 +138,7 @@ export interface Env extends PinmeEnv, PrivyEnv, SettlementEnv, YdChainEnv {
   PUBLIC_BASE_URL?: string;
   AGENT_QUALITY_GATE_MODE?: string;
   EXPORT_SERVICE_TOKEN?: string;
+  IPFS_GATEWAY_BASE?: string;
 }
 
 interface WorkerExecutionContext {
@@ -339,7 +354,11 @@ class ApiError extends Error {
 const MAX_JSON_BYTES = 1_000_000;
 const DEFAULT_CORS_ORIGINS = [
   'https://agentmesh.pinit.eth.limo',
+  'https://mesh-pinme.pinit.eth.limo',
+  'https://meshpin-agentmesh.pinit.eth.limo',
   'https://agentmesh.pinme.dev',
+  'https://mesh-pinme.pinme.dev',
+  'https://meshpin-agentmesh.pinme.dev',
   'http://localhost:5173',
   'http://127.0.0.1:4173',
 ];
@@ -657,40 +676,64 @@ function handoffSummary(stage: WorkflowStage): Record<string, unknown> {
   return handoff;
 }
 
-function callbackArtifacts(
+async function callbackArtifacts(
   body: Record<string, unknown>,
   missionId: string,
   stageId: string,
   attemptNo: number,
   agentId: string,
   createdAt: string,
-): Deliverable[] {
+  acceptanceCriteriaSha256: string,
+  existingDeliverables: Deliverable[],
+): Promise<Deliverable[]> {
   if (body.artifacts === undefined) return [];
   if (!Array.isArray(body.artifacts)) throw new ApiError(400, 'VALIDATION_ERROR', 'artifacts must be an array');
   if (body.artifacts.length > 20) throw new ApiError(400, 'VALIDATION_ERROR', 'artifacts must contain at most 20 values');
-  return body.artifacts.map((value, index) => {
+  const parsed: Deliverable[] = [];
+  for (let index = 0; index < body.artifacts.length; index += 1) {
+    const value = body.artifacts[index];
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new ApiError(400, 'VALIDATION_ERROR', `artifacts[${index}] must be an object`);
     }
     const artifact = value as Record<string, unknown>;
-    const contentHash = requiredString(artifact, 'contentHash', 8, 256);
+    const id = makeId('DEL');
+    const name = requiredString(artifact, 'name', 2, 180);
+    let ipfsEvidence: Deliverable['ipfsEvidence'] = null;
+    if (artifact.ipfsEvidence !== undefined) {
+      try {
+        ipfsEvidence = await parseIpfsEvidence(artifact.ipfsEvidence, {
+          missionId, stageId, attemptNo, agentId, logicalName: name, acceptanceCriteriaSha256,
+        });
+      } catch (error) { ipfsEvidenceApiError(error); }
+      const prior = [...existingDeliverables, ...parsed]
+        .filter((item) => item.ipfsEvidence?.scopeKey === ipfsEvidence.scopeKey)
+        .sort((left, right) => (right.ipfsEvidence?.versionNo ?? 0) - (left.ipfsEvidence?.versionNo ?? 0))[0];
+      if (ipfsEvidence.versionNo !== (prior?.ipfsEvidence?.versionNo ?? 0) + 1
+        || ipfsEvidence.supersedesDeliverableId !== (prior?.id ?? null)
+        || ipfsEvidence.manifest.supersedesRootCid !== (prior?.ipfsEvidence?.rootCid ?? null)) {
+        throw new ApiError(409, 'IPFS_VERSION_CONFLICT', `artifacts[${index}] does not extend the latest CID version`);
+      }
+    }
+    const contentHash = ipfsEvidence ? ipfsEvidence.manifestSha256 : requiredString(artifact, 'contentHash', 8, 256);
     if (!/^sha256:[a-f0-9]{64}$/i.test(contentHash)) {
       throw new ApiError(400, 'VALIDATION_ERROR', `artifacts[${index}].contentHash must be a sha256 digest`);
     }
-    return {
-      id: makeId('DEL'),
+    parsed.push({
+      id,
       missionId,
       stageId,
       attemptNo,
       agentId,
-      name: requiredString(artifact, 'name', 2, 180),
-      uri: safeUrl(requiredString(artifact, 'uri', 8, 2_000), `artifacts[${index}].uri`),
+      name,
+      uri: ipfsEvidence ? `ipfs://${ipfsEvidence.rootCid}` : safeUrl(requiredString(artifact, 'uri', 8, 2_000), `artifacts[${index}].uri`),
       contentHash,
-      mimeType: requiredString(artifact, 'mimeType', 3, 120),
+      mimeType: ipfsEvidence ? 'application/vnd.agentmesh.manifest+json' : requiredString(artifact, 'mimeType', 3, 120),
       status: 'submitted',
       createdAt,
-    };
-  });
+      ipfsEvidence,
+    });
+  }
+  return parsed;
 }
 
 function requireWorkflowDelivery(stages: WorkflowStage[], deliverables: Deliverable[]): void {
@@ -711,6 +754,76 @@ function requireWorkflowDelivery(stages: WorkflowStage[], deliverables: Delivera
     readiness.code,
     `Completed task nodes require a valid structured result: ${readiness.missingOutputStageIds.join(', ')}`,
   );
+}
+
+async function missionEvidenceSnapshot(
+  store: PlatformStore,
+  mission: Mission,
+  stages: WorkflowStage[],
+  deliverables: Deliverable[],
+  frozenBy: string,
+  frozenAt: string,
+): Promise<MissionEvidenceSnapshot> {
+  const [changeRequests, events] = await Promise.all([
+    store.listMissionChangeRequests(mission.id),
+    store.listEvents(mission.id),
+  ]);
+  const criteria = await acceptanceCriteriaEvidence(mission, stages, changeRequests);
+  return {
+    missionId: mission.id,
+    deliverables: frozenDeliverables(deliverables, stages),
+    acceptanceCriteriaSha256: criteria.sha256,
+    workflowVersion: mission.workflowVersion,
+    schedulerRevision: mission.schedulerRevision,
+    eventWatermark: events.at(-1)?.id ?? null,
+    frozenBy,
+    frozenAt,
+  };
+}
+
+function ipfsEvidenceApiError(error: unknown): never {
+  if (error instanceof IpfsEvidenceError) throw new ApiError(400, error.code, error.message);
+  if (error instanceof Error && error.message.startsWith('IPFS_')) {
+    throw new ApiError(409, error.message, 'The IPFS version chain changed; refresh and submit the next version');
+  }
+  throw error;
+}
+
+function configuredIpfsGateway(env: Env): URL {
+  const value = env.IPFS_GATEWAY_BASE?.trim();
+  if (!value) throw new ApiError(503, 'IPFS_GATEWAY_NOT_CONFIGURED', 'IPFS verification gateway is not configured');
+  let url: URL;
+  try { url = new URL(value); } catch { throw new ApiError(503, 'IPFS_GATEWAY_NOT_CONFIGURED', 'IPFS verification gateway is invalid'); }
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash
+    || host === 'localhost' || host === '127.0.0.1' || host === '::1'
+    || /^10\.|^192\.168\.|^169\.254\.|^172\.(1[6-9]|2\d|3[01])\./.test(host)) {
+    throw new ApiError(503, 'IPFS_GATEWAY_NOT_CONFIGURED', 'IPFS verification gateway must be a fixed public HTTPS origin');
+  }
+  return url;
+}
+
+async function boundedResponseText(response: Response, maximumBytes = 256 * 1024): Promise<string> {
+  const declared = Number(response.headers.get('content-length') ?? 0);
+  if (declared > maximumBytes) throw new IpfsEvidenceError('MANIFEST_TOO_LARGE', 'Gateway Manifest exceeds 256 KiB');
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maximumBytes) {
+      await reader.cancel();
+      throw new IpfsEvidenceError('MANIFEST_TOO_LARGE', 'Gateway Manifest exceeds 256 KiB');
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
 function agentEventPayload(body: Record<string, unknown>, artifactCount: number): Record<string, unknown> {
@@ -1036,7 +1149,7 @@ async function requireUser(
 ): Promise<UserContext> {
   const identity = await resolveIdentity(request, env, dependencies);
   const claimName = typeof identity.claims.name === 'string' ? identity.claims.name : '';
-  const displayName = identity.displayName || claimName || identity.email?.split('@')[0] || 'AgentMesh User';
+  const displayName = identity.displayName || claimName || identity.email?.split('@')[0] || BRAND.platform.defaultUserName;
   let user: UserContext;
   try {
     user = await store.ensureIdentityProfile({
@@ -1221,8 +1334,8 @@ async function deliverNotification(
       try {
         await (dependencies.emailSender ?? sendPinmeEmail)(env, {
           to: recipient.email,
-          subject: `[AgentMesh] ${input.title}`,
-          html: `<div style="font-family:Inter,Arial,sans-serif;line-height:1.6;color:#0b1117"><p style="font-size:12px;letter-spacing:.12em;color:#64717d">AGENTMESH WORKSPACE</p><h2>${escapeHtml(input.title)}</h2><p>${escapeHtml(input.detail)}</p><p style="font-size:12px;color:#64717d">此邮件依据你的 AgentMesh 通知偏好发送。</p></div>`,
+          subject: `[${BRAND.platform.name}] ${input.title}`,
+          html: `<div style="font-family:Inter,Arial,sans-serif;line-height:1.6;color:#0b1117"><p style="font-size:12px;letter-spacing:.12em;color:#64717d">${escapeHtml(BRAND.platform.name.toLocaleUpperCase())} WORKSPACE</p><h2>${escapeHtml(input.title)}</h2><p>${escapeHtml(input.detail)}</p><p style="font-size:12px;color:#64717d">此邮件依据你的 ${escapeHtml(BRAND.platform.name)} 通知偏好发送。</p></div>`,
         });
       } catch {
         // Notification persistence is authoritative; a transient email failure must not roll back business state.
@@ -2243,6 +2356,17 @@ async function requireMissionAccess(store: PlatformStore, user: UserContext, mis
   return { mission, stages, edges, agents };
 }
 
+async function requireDisputeEvidenceAccess(
+  store: PlatformStore,
+  user: UserContext,
+  missionId: string,
+  disputeId: string,
+): Promise<Dispute> {
+  const dispute = (await store.listDisputes(user)).find((item) => item.id === disputeId && item.missionId === missionId);
+  if (!dispute) throw new ApiError(403, 'FORBIDDEN', 'You do not have access to this dispute evidence');
+  return dispute;
+}
+
 async function runIdempotent(
   request: Request,
   store: PlatformStore,
@@ -2426,7 +2550,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             subject: identity.uid,
             email: identity.email,
             walletAddress: identity.walletAddress,
-            displayName: identity.displayName ?? identity.email?.split('@')[0] ?? 'AgentMesh User',
+            displayName: identity.displayName ?? identity.email?.split('@')[0] ?? BRAND.platform.defaultUserName,
           });
           return success(request, env, requestId, { profile });
         }
@@ -2439,7 +2563,8 @@ export function createApp(dependencies: AppDependencies = {}) {
             phase: 'rewards_and_governance',
             escrowSeparated: true,
             earnVaultEnabled: false,
-            warnings: ['YD 不参与任务托管', '当前不提供真实收益或 APY', '主网前必须完成旧 YD 合约审计'],
+            publicAsset: MESHPIN_PUBLIC_ASSET,
+            warnings: [`${BRAND.contribution.symbol} 不参与任务托管`, `${BRAND.contribution.symbol} 不是 ${BRAND.evidence.providerName} 官方代币`, '当前不提供真实收益或 APY', '主网前必须完成兼容合约审计'],
           });
         }
 
@@ -2523,13 +2648,15 @@ export function createApp(dependencies: AppDependencies = {}) {
           const agentId = decodeURIComponent(publicAgentQualityMatch[1]);
           const agent = await store.getAgent(agentId);
           if (!agent) throw new ApiError(404, 'AGENT_NOT_FOUND', 'Agent not found');
-          const [stats, feedback, snapshots] = await Promise.all([
+          const [stats, feedback, snapshots, cidPortfolio] = await Promise.all([
             store.getAgentQualityStats(agentId), store.listAgentFeedback(agentId, 20), store.listAgentReputationSnapshots(agentId, 20),
+            store.listAgentCidPortfolio(agentId, 20),
           ]);
           return success(request, env, requestId, {
             agent: agentClientView(request, agent, stats, env.AGENT_QUALITY_GATE_MODE),
             feedback: feedback.map(({ requesterId: _requesterId, ...item }) => item),
             snapshots,
+            cidPortfolio,
           });
         }
 
@@ -2592,7 +2719,13 @@ export function createApp(dependencies: AppDependencies = {}) {
           let artifacts: Deliverable[];
           try {
             output = normalizeCallbackOutput(body.output === undefined ? undefined : recordValue(body, 'output'));
-            artifacts = callbackArtifacts(body, missionId, stageId, stage.attemptNo, agentId, callbackCreatedAt);
+            const criteria = await acceptanceCriteriaEvidence(
+              mission, stages, await store.listMissionChangeRequests(missionId),
+            );
+            artifacts = await callbackArtifacts(
+              body, missionId, stageId, stage.attemptNo, agentId, callbackCreatedAt,
+              criteria.sha256, existingDeliverables,
+            );
           } catch (error) {
             if (stageStatus === 'done') await recordInvalidDelivery(error instanceof ApiError ? error.code : 'INVALID_DELIVERY_PAYLOAD');
             throw error;
@@ -2810,7 +2943,7 @@ export function createApp(dependencies: AppDependencies = {}) {
         if (pathname === '/api/yd/admin/epochs' && method === 'POST') {
           if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
           const descriptor = ydChainDescriptor(env);
-          if (!descriptor.configured || !descriptor.distributorAddress) throw new ApiError(503, 'YD_CHAIN_NOT_CONFIGURED', 'Configure YD contracts before creating an epoch');
+          if (!descriptor.configured || !descriptor.distributorAddress) throw new ApiError(503, 'YD_CHAIN_NOT_CONFIGURED', `Configure ${BRAND.contribution.symbol}-compatible contracts before creating an epoch`);
           const body = await readObject(request);
           const epochNumber = Math.floor(finiteNumber(body, 'epochNumber', 1, 1_000_000_000));
           const startsAt = isoTimestamp(body, 'startsAt');
@@ -2881,7 +3014,7 @@ export function createApp(dependencies: AppDependencies = {}) {
         }
 
         if (pathname === '/api/yd/claims/sync' && method === 'POST') {
-          if (!user.walletAddress) throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', 'Link the wallet used to claim YD');
+          if (!user.walletAddress) throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', `Link the wallet used to claim ${BRAND.contribution.symbol}`);
           const body = await readObject(request);
           const epochId = requiredString(body, 'epochId', 8, 120);
           const txHash = requiredString(body, 'txHash', 66, 66);
@@ -2914,7 +3047,7 @@ export function createApp(dependencies: AppDependencies = {}) {
         }
 
         if (pathname === '/api/yd/staking/sync' && method === 'POST') {
-          if (!user.walletAddress) throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', 'Link the wallet used for YD staking');
+          if (!user.walletAddress) throw new ApiError(409, 'WALLET_IDENTITY_REQUIRED', `Link the wallet used for ${BRAND.contribution.symbol} staking`);
           const body = await readObject(request);
           const txHash = requiredString(body, 'txHash', 66, 66);
           const sync = await (dependencies.ydStakingSynchronizer ?? syncStakingTransaction)(
@@ -2943,7 +3076,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             );
           } catch (snapshotError) {
             const code = snapshotError instanceof Error ? snapshotError.message : 'YD_SNAPSHOT_FAILED';
-            throw new ApiError(503, code, 'Unable to read a finalized YD Power snapshot');
+            throw new ApiError(503, code, `Unable to read a finalized ${BRAND.contribution.symbol} ${BRAND.contribution.powerName} snapshot`);
           }
           if (snapshot.electorate.length === 0 || BigInt(snapshot.eligiblePower) <= 0n) {
             throw new ApiError(409, 'NO_ELIGIBLE_GOVERNANCE_POWER', 'No linked wallet has Power at the snapshot block');
@@ -3667,6 +3800,148 @@ export function createApp(dependencies: AppDependencies = {}) {
           return success(request, env, requestId, { mission: await refreshWorkflowAggregate(store, missionId), stages: retrySnapshot, edges: context.edges });
         }
 
+        const deliverableVerificationMatch = pathname.match(/^\/api\/missions\/([^/]+)\/deliverables\/([^/]+)\/verify$/);
+        if (deliverableVerificationMatch && method === 'POST') {
+          const missionId = decodeURIComponent(deliverableVerificationMatch[1]);
+          const deliverableId = decodeURIComponent(deliverableVerificationMatch[2]);
+          await requireMissionAccess(store, user, missionId);
+          const deliverable = (await store.listDeliverables(missionId)).find((item) => item.id === deliverableId);
+          if (!deliverable?.ipfsEvidence) throw new ApiError(404, 'IPFS_EVIDENCE_NOT_FOUND', `${BRAND.evidence.compactLabel} evidence was not found`);
+          const verifiedAt = (dependencies.now?.() ?? new Date()).toISOString();
+          let status: NonNullable<Deliverable['ipfsEvidence']>['verificationStatus'] = 'verified';
+          let verificationError: string | null = null;
+          try {
+            const gateway = configuredIpfsGateway(env);
+            gateway.pathname = `${gateway.pathname.replace(/\/$/, '')}/ipfs/${deliverable.ipfsEvidence.rootCid}/manifest.json`;
+            const response = await (dependencies.fetcher ?? fetch)(gateway.toString(), {
+              method: 'GET', redirect: 'manual', headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(5_000),
+            });
+            if (!response.ok || response.status >= 300) throw new Error(`Gateway returned HTTP ${response.status}`);
+            const text = await boundedResponseText(response);
+            let fetchedManifest: unknown;
+            try { fetchedManifest = JSON.parse(text); } catch { throw new IpfsEvidenceError('INVALID_MANIFEST', 'Gateway returned invalid JSON'); }
+            await parseIpfsEvidence({ ...deliverable.ipfsEvidence, manifest: fetchedManifest }, {
+              missionId, stageId: deliverable.stageId, attemptNo: deliverable.attemptNo ?? null,
+              agentId: deliverable.agentId, logicalName: deliverable.name,
+              acceptanceCriteriaSha256: deliverable.ipfsEvidence.manifest.acceptanceCriteriaSha256,
+            });
+          } catch (error) {
+            if (error instanceof IpfsEvidenceError) {
+              status = error.code === 'MANIFEST_HASH_MISMATCH' ? 'hash_mismatch' : 'invalid_manifest';
+              verificationError = error.message.slice(0, 500);
+            } else {
+              status = 'unavailable';
+              verificationError = error instanceof Error ? error.message.slice(0, 500) : 'Gateway unavailable';
+            }
+          }
+          const saved = await store.updateDeliverableIpfsVerification(missionId, deliverableId, status, verifiedAt, verificationError);
+          if (!saved) throw new ApiError(409, 'IPFS_EVIDENCE_CHANGED', 'Evidence changed before verification was recorded');
+          await store.addEvent({
+            id: makeId('EVT'), missionId, stageId: deliverable.stageId, type: 'deliverable.ipfs_verified',
+            message: status === 'verified' ? `${deliverable.name} 的 ${BRAND.evidence.compactLabel} Manifest 已验证` : `${deliverable.name} 的 ${BRAND.evidence.compactLabel} 验证状态：${status}`,
+            actorType: user.role === 'developer' ? 'developer' : user.role === 'requester' ? 'requester' : 'platform',
+            actorId: user.id, payload: {
+              deliverableId, rootCid: deliverable.ipfsEvidence.rootCid, observationStatus: status,
+              verificationStatus: saved.ipfsEvidence?.verificationStatus,
+            }, createdAt: verifiedAt,
+          });
+          return success(request, env, requestId, saved);
+        }
+
+        const missionEvidenceMatch = pathname.match(/^\/api\/missions\/([^/]+)\/evidence\/(context|dossier|publications)$/);
+        if (missionEvidenceMatch) {
+          const missionId = decodeURIComponent(missionEvidenceMatch[1]);
+          const action = missionEvidenceMatch[2];
+          if (action === 'context' && method === 'GET') {
+            const context = await requireMissionAccess(store, user, missionId);
+            const stageId = url.searchParams.get('stageId');
+            const stage = stageId ? context.stages.find((item) => item.id === stageId) : null;
+            if (stageId && !stage) throw new ApiError(400, 'INVALID_STAGE', 'stageId does not belong to this mission');
+            const [criteria, deliverables] = await Promise.all([
+              acceptanceCriteriaEvidence(context.mission, context.stages, await store.listMissionChangeRequests(missionId)),
+              store.listDeliverables(missionId),
+            ]);
+            const scopeKey = stage ? `stage:${stage.id}:attempt:${stage.attemptNo}` : 'mission:final';
+            const latest = deliverables.filter((item) => item.ipfsEvidence?.scopeKey === scopeKey)
+              .sort((left, right) => (right.ipfsEvidence?.versionNo ?? 0) - (left.ipfsEvidence?.versionNo ?? 0))[0];
+            return success(request, env, requestId, {
+              acceptanceCriteria: criteria.criteria,
+              acceptanceCriteriaSha256: criteria.sha256,
+              scopeKey,
+              nextVersionNo: (latest?.ipfsEvidence?.versionNo ?? 0) + 1,
+              supersedesDeliverableId: latest?.id ?? null,
+              supersedesRootCid: latest?.ipfsEvidence?.rootCid ?? null,
+              manifestTemplate: {
+                schema: 'agentmesh.deliverable-manifest.v1', missionId, stageId: stage?.id ?? null,
+                attemptNo: stage?.attemptNo ?? null, agentId: stage?.agentId ?? null, logicalName: '',
+                versionNo: (latest?.ipfsEvidence?.versionNo ?? 0) + 1,
+                supersedesRootCid: latest?.ipfsEvidence?.rootCid ?? null,
+                acceptanceCriteriaSha256: criteria.sha256,
+                encryptionKeyFingerprint: null,
+                createdAt: (dependencies.now?.() ?? new Date()).toISOString(), generator: 'agentmesh-pinme-publisher/1', files: [],
+              },
+            });
+          }
+          if (action === 'dossier' && method === 'GET') {
+            const kind = url.searchParams.get('kind') === 'dispute' ? 'dispute' : 'acceptance';
+            const requestedSubjectId = url.searchParams.get('subjectId')?.trim();
+            if (kind === 'acceptance' && requestedSubjectId && requestedSubjectId !== missionId) {
+              throw new ApiError(400, 'INVALID_DOSSIER_SUBJECT', 'Acceptance dossier subjectId must match the mission id');
+            }
+            const subjectId = kind === 'acceptance' ? missionId : requestedSubjectId || missionId;
+            if (kind === 'acceptance') await requireMissionAccess(store, user, missionId);
+            else {
+              if (!requestedSubjectId) throw new ApiError(400, 'INVALID_DOSSIER_SUBJECT', 'Dispute dossier subjectId is required');
+              await requireDisputeEvidenceAccess(store, user, missionId, subjectId);
+            }
+            const snapshot = kind === 'acceptance'
+              ? await store.getAcceptanceEvidenceSnapshot(missionId)
+              : (await store.getDisputes(missionId)).find((item) => item.id === subjectId)?.evidenceSnapshot ?? null;
+            if (!snapshot) throw new ApiError(404, 'EVIDENCE_SNAPSHOT_NOT_FOUND', 'Frozen evidence snapshot was not found');
+            const dossier = reviewDossier(kind, subjectId, snapshot);
+            const payloadSha256 = await sha256Json(dossier);
+            return success(request, env, requestId, {
+              dossier, canonicalJson: canonicalJson(dossier), payloadSha256,
+              publications: await store.listEvidencePublications(missionId),
+              publishGuide: {
+                command: `pinme upload ./agentmesh-review-${subjectId}`,
+                note: `下载 JSON 到独立目录后，使用你自己的 ${BRAND.evidence.providerName} 登录态上传；不要把 AppKey 粘贴到 ${BRAND.platform.name}。`,
+              },
+            });
+          }
+          if (action === 'publications' && method === 'POST') {
+            const body = await readObject(request);
+            const kind = enumValue(body, 'kind', ['acceptance_dossier', 'dispute_dossier'] as const);
+            const subjectId = requiredString(body, 'subjectId', 3, 120);
+            if (kind === 'acceptance_dossier' && subjectId !== missionId) {
+              throw new ApiError(400, 'INVALID_DOSSIER_SUBJECT', 'Acceptance dossier subjectId must match the mission id');
+            }
+            if (kind === 'acceptance_dossier') await requireMissionAccess(store, user, missionId);
+            else await requireDisputeEvidenceAccess(store, user, missionId, subjectId);
+            const snapshot = kind === 'acceptance_dossier'
+              ? await store.getAcceptanceEvidenceSnapshot(missionId)
+              : (await store.getDisputes(missionId)).find((item) => item.id === subjectId)?.evidenceSnapshot ?? null;
+            if (!snapshot) throw new ApiError(404, 'EVIDENCE_SNAPSHOT_NOT_FOUND', 'Frozen evidence snapshot was not found');
+            const expectedHash = await sha256Json(reviewDossier(kind === 'acceptance_dossier' ? 'acceptance' : 'dispute', subjectId, snapshot));
+            const payloadSha256 = requiredString(body, 'payloadSha256', 71, 80).toLowerCase();
+            if (payloadSha256 !== expectedHash) throw new ApiError(409, 'DOSSIER_HASH_MISMATCH', 'The dossier hash does not match the frozen snapshot');
+            let rootCid: string;
+            try { rootCid = normalizeCid(requiredString(body, 'rootCid', 10, 128)); }
+            catch (error) { ipfsEvidenceApiError(error); }
+            const publication: EvidencePublication = {
+              id: makeId('EVID'), missionId, kind, subjectId, payloadSha256, rootCid,
+              publishedBy: user.id, createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
+            };
+            try { return success(request, env, requestId, await store.recordEvidencePublication(publication), 201); }
+            catch (error) {
+              if (error instanceof Error && error.message === 'EVIDENCE_PUBLICATION_CONFLICT') {
+                throw new ApiError(409, error.message, 'A different CID is already registered for this frozen dossier');
+              }
+              ipfsEvidenceApiError(error);
+            }
+          }
+        }
+
         const missionActionMatch = pathname.match(/^\/api\/missions\/([^/]+)\/(compile|candidates|workflow|start|dispatch|events|deliverables|review|accept|disputes)$/);
         if (missionActionMatch) {
           const missionId = decodeURIComponent(missionActionMatch[1]);
@@ -3994,21 +4269,38 @@ export function createApp(dependencies: AppDependencies = {}) {
               const assignedAgent = context.agents.find((candidate) => candidate.id === stage.agentId);
               if (!assignedAgent || assignedAgent.ownerId !== user.id) throw new ApiError(403, 'FORBIDDEN', 'Developers can only submit deliverables for their own assigned Agent');
             }
+            const name = requiredString(body, 'name', 2, 180);
+            let ipfsEvidence: Deliverable['ipfsEvidence'] = null;
+            if (body.ipfsEvidence !== undefined) {
+              const criteria = await acceptanceCriteriaEvidence(
+                context.mission, context.stages, await store.listMissionChangeRequests(missionId),
+              );
+              try {
+                ipfsEvidence = await parseIpfsEvidence(body.ipfsEvidence, {
+                  missionId, stageId, attemptNo: stage?.attemptNo ?? null, agentId: stage?.agentId ?? null,
+                  logicalName: name, acceptanceCriteriaSha256: criteria.sha256,
+                });
+              } catch (error) { ipfsEvidenceApiError(error); }
+            }
             const deliverable: Deliverable = {
               id: makeId('DEL'), missionId, stageId,
               attemptNo: stage?.attemptNo ?? null,
               agentId: stage?.agentId ?? null,
-              name: requiredString(body, 'name', 2, 180),
-              uri: safeUrl(requiredString(body, 'uri', 8, 2_000), 'uri'),
-              contentHash: requiredString(body, 'contentHash', 8, 256),
-              mimeType: requiredString(body, 'mimeType', 3, 120),
+              name,
+              uri: ipfsEvidence ? `ipfs://${ipfsEvidence.rootCid}` : safeUrl(requiredString(body, 'uri', 8, 2_000), 'uri'),
+              contentHash: ipfsEvidence ? ipfsEvidence.manifestSha256 : requiredString(body, 'contentHash', 8, 256),
+              mimeType: ipfsEvidence ? 'application/vnd.agentmesh.manifest+json' : requiredString(body, 'mimeType', 3, 120),
               status: 'submitted',
               createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
+              ipfsEvidence,
             };
-            await store.addDeliverable(deliverable);
+            try { await store.addDeliverable(deliverable); } catch (error) { ipfsEvidenceApiError(error); }
             await store.addEvent({
               id: makeId('EVT'), missionId, stageId, type: 'deliverable.submitted', message: `${deliverable.name} 已提交`,
-              actorType: 'developer', actorId: user.id, payload: { deliverableId: deliverable.id, contentHash: deliverable.contentHash },
+              actorType: 'developer', actorId: user.id, payload: {
+                deliverableId: deliverable.id, contentHash: deliverable.contentHash,
+                rootCid: ipfsEvidence?.rootCid, versionNo: ipfsEvidence?.versionNo,
+              },
               createdAt: deliverable.createdAt,
             });
             await deliverNotification(store, env, dependencies, {
@@ -4095,7 +4387,11 @@ export function createApp(dependencies: AppDependencies = {}) {
             } else if (releaseTxHash) {
               throw new ApiError(400, 'UNEXPECTED_CHAIN_TRANSACTION', 'Web2 余额结算不接受链上交易哈希');
             }
-            const acceptance = await store.acceptMission(missionId, user.id, releaseTxHash);
+            const acceptedAt = (dependencies.now?.() ?? new Date()).toISOString();
+            const evidenceSnapshot = await missionEvidenceSnapshot(
+              store, context.mission, context.stages, deliverables, user.id, acceptedAt,
+            );
+            const acceptance = await store.acceptMission(missionId, user.id, releaseTxHash, evidenceSnapshot);
             if (!acceptance) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission or escrow not found');
             if (acceptance.mission.status === 'completed') {
               await recordSettlementAgentQuality(store, acceptance.mission, context.stages, acceptance.mission.updatedAt);
@@ -4159,6 +4455,9 @@ export function createApp(dependencies: AppDependencies = {}) {
               freezeTxHash, resolutionTxHash: null,
               createdAt: (dependencies.now?.() ?? new Date()).toISOString(), resolvedAt: null,
             };
+            dispute.evidenceSnapshot = await missionEvidenceSnapshot(
+              store, context.mission, context.stages, await store.listDeliverables(missionId), user.id, dispute.createdAt,
+            );
             try {
               await store.createDispute(dispute);
             } catch (error) {
@@ -4731,8 +5030,8 @@ export function createApp(dependencies: AppDependencies = {}) {
           const body = await readObject(request);
           const result = await (dependencies.emailSender ?? sendPinmeEmail)(env, {
             to: user.email,
-            subject: optionalString(body, 'subject', 160) ?? 'AgentMesh 通知通道测试',
-            html: '<p>AgentMesh 通知通道工作正常。</p>',
+            subject: optionalString(body, 'subject', 160) ?? `${BRAND.platform.name} 通知通道测试`,
+            html: `<p>${escapeHtml(BRAND.platform.name)} 通知通道工作正常。</p>`,
           });
           if (!result.ok) throw new ApiError(502, 'EMAIL_FAILED', result.error ?? 'Email delivery failed');
           return success(request, env, requestId, { ok: true, recipient: user.email });

@@ -1,6 +1,6 @@
-# AgentMesh Platform
+# pinme-mesh Platform
 
-YD 周期奖励、锁仓 Power 与生态治理见 [YD Rewards and Governance](docs/yd-finance.md)。该模块与任务托管隔离，当前不包含 Earn Vault 或真实 APY。
+pinme-mesh Contribution（PM）周期奖励、锁仓 Power 与生态治理见 [PM Rewards and Governance](docs/yd-finance.md)。内部仍保留 YD 兼容接口和表名；该模块与任务托管隔离，当前不包含 Earn Vault 或真实 APY。PinMe/IPFS 版本证据见 [pinme-mesh IPFS Evidence](docs/meshpin-ipfs-evidence.md)。
 
 AI 原生 Agent 调度平台的全栈 MVP 工程。任务方可以在可视化 DAG 画布中拖拽任务与人工审批 Gate、手动分配 Agent、并行执行与汇合，再完成监控、验收和争议；开发者可以完成 Agent 注册、试炼、版本管理、接单和收益查看。
 
@@ -26,6 +26,10 @@ PinMe Worker 已实现平台控制面，D1 保存任务、Agent、工作流、�
 ## 工程结构
 
 ```text
+shared/
+├── brand.ts           # 平台、贡献资产与证据服务的唯一公开命名源
+└── pmDeployment.ts    # PM Sepolia 合约与公开网络配置的唯一来源
+
 backend/src/
 ├── worker.ts          # HTTP 路由、鉴权与业务命令
 ├── contracts.ts       # 领域与存储契约
@@ -51,6 +55,8 @@ frontend/src/
 ```
 
 Stitch 仅用于确定视觉方向，导出的原型页面和图片不进入运行时或生产包。
+
+平台名、贡献资产名/符号、侧栏入口和 PinMe/IPFS 证据标签统一从 `shared/brand.ts` 派生。后续品牌调整只修改该文件；已部署的合约名、数据库字段和 `X-AgentMesh-*` 协议头属于兼容标识，不随展示文案自动改名。
 
 ## 本地开发
 
@@ -80,10 +86,10 @@ npx react-doctor@latest --verbose --diff
 
 ## 部署
 
-本项目的前端、Worker 和 D1 迁移作为同一个 PinMe 项目发布：
+完整发布可使用：
 
 ```bash
 pinme save
 ```
 
-不要使用 `pinme upload`，也不要上传 `src/`、`.env`、`node_modules/` 或整个仓库。
+需求预览按层更新：前端构建后使用 `pinme upload frontend/dist --domain <preview-domain>`，Worker 使用 `pinme update-worker`，数据库迁移使用 `pinme update-db`。只上传构建产物，不上传 `src/`、`.env`、`node_modules/` 或整个仓库。

@@ -34,7 +34,7 @@
     },
     {
       "id": "platform-infrastructure-002",
-      "status": "pending",
+      "status": "approved",
       "feature": "specs/007-platform-completion",
       "agent": "planner",
       "requestedAction": "Choose and authorize the non-funds infrastructure boundary for private exports, semantic retrieval and isolated Agent runtime.",
@@ -85,17 +85,17 @@
     },
     {
       "id": "meshpin-ipfs-evidence-004",
-      "status": "pending",
+      "status": "approved",
       "feature": "specs/008-meshpin-ipfs-evidence",
       "agent": "planner",
-      "requestedAction": "Approve the product name and implementation boundary for MeshPin branding plus PinMe/IPFS versioned deliverable evidence.",
+      "requestedAction": "Approve the product name and implementation boundary for pinme-mesh branding plus PinMe/IPFS versioned deliverable evidence.",
       "riskReason": "The feature changes public token branding and future test-token metadata, adds shared deliverable/version contracts and D1 schema, fetches untrusted manifests through a gateway, and freezes evidence used by acceptance and disputes. Public IPFS privacy and the PinMe AppKey boundary must be explicit before implementation.",
       "recommendedOption": 1,
       "options": [
         {
           "id": 1,
-          "label": "MeshPin + IPFS 证据 MVP",
-          "description": "采用 MeshPin Contribution / MPIN；上传由 Agent/开发者自己的 PinMe CLI 完成，AgentMesh 保存并验证 CID、Manifest、版本链和纠纷快照；保持 legacy 兼容，不做浏览器 AppKey 直传。"
+          "label": "pinme-mesh + IPFS 证据 MVP",
+          "description": "采用 pinme-mesh Contribution / PM；上传由 Agent/开发者自己的 PinMe CLI 完成，AgentMesh 保存并验证 CID、Manifest、版本链和纠纷快照；保持 legacy 兼容，不做浏览器 AppKey 直传。"
         },
         {
           "id": 2,
@@ -104,13 +104,60 @@
         },
         {
           "id": 3,
-          "label": "只做 MeshPin 改名",
+          "label": "只做 pinme-mesh 改名",
           "description": "只调整用户可见品牌和未来测试代币 metadata，不实现 CID Manifest、版本链或纠纷冻结；交付核对能力保持现状。"
         }
       ],
       "safeAlternative": "Keep the deployed Wave A behavior unchanged and make no business-code, D1, contract, cloud or deployment mutation until this plan is approved.",
       "resumeCommand": "/chill-ai approve meshpin-ipfs-evidence-004 option 1",
-      "createdAt": "2026-08-27T19:58:59+08:00"
+      "createdAt": "2026-08-27T19:58:59+08:00",
+      "selectedOption": 1,
+      "approvedAt": "2026-08-27T20:11:06+08:00",
+      "approvalSource": "User approved implementation on the feature branch and explicitly required no impact to online code. The approved scope also includes immutable review dossiers, Agent CID portfolios and acceptance-criteria hashes."
+    },
+    {
+      "id": "meshpin-split-deployment-005",
+      "status": "approved",
+      "feature": "specs/008-meshpin-ipfs-evidence",
+      "agent": "deployment",
+      "requestedAction": "Deploy migration 026 and the new Worker separately, then upload frontend/dist and bind an independent PinMe Domain.",
+      "riskReason": "Remote D1 and Worker updates affect existing online traffic; migration must complete before the Worker starts querying the new evidence tables.",
+      "recommendedOption": 1,
+      "options": [
+        {
+          "id": 1,
+          "label": "Split deployment",
+          "description": "Run update-db, require migration 026 COMPLETE, run update-worker, smoke old and new public APIs, then upload only frontend/dist and bind mesh-pinme."
+        }
+      ],
+      "safeAlternative": "Keep the previously deployed Worker/D1 and only retain the existing static CID preview.",
+      "resumeCommand": "",
+      "createdAt": "2026-08-28T10:17:00+08:00",
+      "selectedOption": 1,
+      "approvedAt": "2026-08-28T10:17:00+08:00",
+      "approvalSource": "User explicitly approved update-db plus update-worker and changed the requested PinMe Domain to mesh-pinme."
+    },
+    {
+      "id": "pm-sepolia-smoke-007",
+      "status": "approved",
+      "feature": "specs/008-meshpin-ipfs-evidence",
+      "agent": "deployment",
+      "requestedAction": "Execute the complete reversible PM reward and staking smoke flow on Sepolia.",
+      "riskReason": "The flow spends Sepolia gas and permanently records a reward epoch and transaction history, while temporarily moving PM between Treasury, Distributor and Staking.",
+      "recommendedOption": 1,
+      "options": [
+        {
+          "id": 1,
+          "label": "完整可回收测试网冒烟",
+          "description": "注资和发布单账户奖励、领取并回收余额、认证和锁仓 PM、验证 Power、暂停后紧急退出，并要求最终 Treasury 恢复且业务合约余额与 Power 归零。"
+        }
+      ],
+      "safeAlternative": "Keep the deployed contracts idle and perform read-only verification only.",
+      "resumeCommand": "",
+      "createdAt": "2026-08-28T13:45:00+08:00",
+      "selectedOption": 1,
+      "approvedAt": "2026-08-28T13:45:00+08:00",
+      "approvalSource": "User explicitly said: 允许执行上述 Sepolia PM 完整冒烟交易。"
     }
   ]
 }

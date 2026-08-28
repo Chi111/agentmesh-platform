@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, BarChart3, CheckCircle2, Clock3, Code2, ExternalLink, ShieldCheck, Sparkles, WalletCards } from 'lucide-react';
+import { ArrowLeft, ArrowRight, BarChart3, CheckCircle2, Clock3, Code2, ExternalLink, Fingerprint, ShieldCheck, Sparkles, WalletCards } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { AgentAvatar } from '../components/ui/AgentCard';
@@ -71,6 +71,11 @@ export function AgentDetailPage() {
             <section className="rounded-2xl border border-line p-5"><p className="text-sm font-semibold">运行数据</p><dl className="mt-4 space-y-3 text-xs">{[['累计任务', `${agent.jobs} 单`],['累计成交', `${agent.volume.toLocaleString()} USDC`],['调用协议','HTTP / JSON'],['鉴权模式',agent.authType ?? 'none']].map(([label,value]) => <div className="flex justify-between" key={label}><dt className="text-muted">{label}</dt><dd className="font-mono font-semibold">{value}</dd></div>)}</dl></section>
           </aside>
         </div>
+      </section>
+
+      <section className="panel p-6">
+        <div className="flex items-center justify-between gap-3"><div><p className="eyebrow">CID Portfolio</p><h2 className="mt-2 text-xl font-semibold">PinMe 可验证交付履历</h2><p className="mt-2 text-xs text-muted">只展示已完成 Mission 当前 attempt 中属于该 Agent 的 CID 版本；不会把 legacy URI 伪装成 IPFS 证明。</p></div><span className="mono-chip">{qualityDetail?.cidPortfolio?.length ?? 0} CID</span></div>
+        {qualityDetail?.cidPortfolio?.length ? <div className="mt-5 grid gap-3 md:grid-cols-2">{qualityDetail.cidPortfolio.map((item) => <article className="rounded-xl border border-line p-4" key={item.deliverableId}><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-sm font-semibold">{item.name}</p><p className="mt-1 truncate text-xs text-muted">{item.missionTitle}</p></div><StatusBadge tone={item.verificationStatus === 'verified' ? 'success' : 'warning'}>v{item.versionNo} · {item.verificationStatus}</StatusBadge></div><p className="mt-3 break-all font-mono text-[9px] text-muted">{item.rootCid}</p><div className="mt-3 flex items-center justify-between text-[10px] text-muted"><span className="inline-flex items-center gap-1"><Fingerprint size={12} />{item.visibility === 'encrypted' ? '客户端已加密' : '公开 IPFS'}</span><span>{new Date(item.completedAt).toLocaleDateString('zh-CN')}</span></div></article>)}</div> : <p className="mt-5 rounded-xl border border-dashed border-line p-8 text-center text-xs text-muted">尚无已完成 Mission 的 PinMe CID 交付履历。</p>}
       </section>
 
       <section className="panel p-6">

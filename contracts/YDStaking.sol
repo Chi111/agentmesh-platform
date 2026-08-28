@@ -11,7 +11,7 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {Votes} from "@openzeppelin/contracts/governance/utils/Votes.sol";
 
-/// @notice Non-transferable, verified-account YD locks with delegated Power checkpoints.
+/// @notice Non-transferable, verified-account PM locks with delegated Power checkpoints.
 contract YDStaking is AccessControl, Pausable, ReentrancyGuard, Votes {
     using SafeERC20 for IERC20Metadata;
 
@@ -66,8 +66,9 @@ contract YDStaking is AccessControl, Pausable, ReentrancyGuard, Votes {
         address tokenAddress,
         address admin,
         uint256 accountLockCap,
-        uint256 accountPowerCap
-    ) EIP712("AgentMesh veYD", "1") {
+        uint256 accountPowerCap,
+        string memory powerDomainName
+    ) EIP712(powerDomainName, "1") {
         if (tokenAddress == address(0) || admin == address(0)) revert InvalidAddress();
         if (
             accountLockCap == 0

@@ -673,10 +673,41 @@ test('review route exposes a requester rework path and hides it from administrat
         mimeType: 'application/json', status: 'submitted', createdAt: '2026-08-22T10:00:00.000Z',
       },
       {
+        id: 'DEL-current-v1', missionId: baseMission.id, stageId: 'STAGE-implement', agentId: 'AGENT-ds',
+        attemptNo: 2,
+        name: '当前工程制品首版', uri: 'ipfs://bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm', contentHash: `sha256:${'1'.repeat(64)}`,
+        mimeType: 'application/vnd.agentmesh.manifest+json', status: 'submitted', createdAt: '2026-08-22T11:15:00.000Z',
+        ipfsEvidence: {
+          provider: 'pinme_ipfs', rootCid: 'bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm',
+          manifestPath: '/manifest.json', manifestSha256: `sha256:${'1'.repeat(64)}`,
+          manifest: {
+            schema: 'agentmesh.deliverable-manifest.v1', missionId: baseMission.id, stageId: 'STAGE-implement', attemptNo: 2,
+            agentId: 'AGENT-ds', logicalName: '当前工程制品首版', versionNo: 1, supersedesRootCid: null,
+            acceptanceCriteriaSha256: `sha256:${'a'.repeat(64)}`, createdAt: '2026-08-22T11:15:00.000Z', generator: 'e2e/1',
+            files: [{ path: 'report-old.json', sha256: `sha256:${'b'.repeat(64)}`, mimeType: 'application/json', byteSize: 40 }],
+          },
+          fileCount: 1, totalBytes: 40, visibility: 'public', versionNo: 1, supersedesDeliverableId: null,
+          scopeKey: 'stage:STAGE-implement:attempt:2', verificationStatus: 'verified', lastVerifiedAt: now, lastVerificationError: null,
+        },
+      },
+      {
         id: 'DEL-current-attempt', missionId: baseMission.id, stageId: 'STAGE-implement', agentId: 'AGENT-ds',
         attemptNo: 2,
-        name: '当前版本工程制品', uri: 'ipfs://bafycurrentattempt', contentHash: 'sha256:current-attempt',
-        mimeType: 'application/json', status: 'submitted', createdAt: '2026-08-22T11:30:00.000Z',
+        name: '当前版本工程制品', uri: 'ipfs://bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsy', contentHash: `sha256:${'2'.repeat(64)}`,
+        mimeType: 'application/vnd.agentmesh.manifest+json', status: 'submitted', createdAt: '2026-08-22T11:30:00.000Z',
+        ipfsEvidence: {
+          provider: 'pinme_ipfs', rootCid: 'bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsy',
+          manifestPath: '/manifest.json', manifestSha256: `sha256:${'2'.repeat(64)}`,
+          manifest: {
+            schema: 'agentmesh.deliverable-manifest.v1', missionId: baseMission.id, stageId: 'STAGE-implement', attemptNo: 2,
+            agentId: 'AGENT-ds', logicalName: '当前版本工程制品', versionNo: 2,
+            supersedesRootCid: 'bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm',
+            acceptanceCriteriaSha256: `sha256:${'a'.repeat(64)}`, createdAt: '2026-08-22T11:30:00.000Z', generator: 'e2e/1',
+            files: [{ path: 'report.json', sha256: `sha256:${'c'.repeat(64)}`, mimeType: 'application/json', byteSize: 42 }],
+          },
+          fileCount: 1, totalBytes: 42, visibility: 'public', versionNo: 2, supersedesDeliverableId: 'DEL-current-v1',
+          scopeKey: 'stage:STAGE-implement:attempt:2', verificationStatus: 'declared', lastVerifiedAt: null, lastVerificationError: null,
+        },
       },
       {
         id: 'DEL-mission-old', missionId: baseMission.id, stageId: null, agentId: null,
@@ -704,11 +735,20 @@ test('review route exposes a requester rework path and hides it from administrat
   const reworkLink = page.getByRole('link', { name: '查看执行与请求返工' });
   await expect(reworkLink).toBeVisible();
   await expect(reworkLink).toHaveAttribute('href', `#/missions/${baseMission.id}/execution`);
-  await expect(page.getByText('当前版本工程制品', { exact: true })).toBeVisible();
+  await expect(page.getByText('当前版本工程制品').first()).toBeVisible();
   await expect(page.getByRole('button', { name: '任务级最终交付' })).toBeVisible();
-  await expect(page.getByText('旧版工程制品', { exact: true })).toHaveCount(0);
-  await expect(page.getByText('返工前最终交付', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '旧版工程制品' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '返工前最终交付' })).toHaveCount(0);
   await expect(page.getByText('2 个历史 attempt 或已拒绝制品已保留，仅供审计，不参与当前验收。')).toBeVisible();
+  await page.getByRole('button', { name: '当前版本工程制品 · v2' }).click();
+  await expect(page.getByText('PinMe/IPFS v2')).toBeVisible();
+  await expect(page.getByText('父版本 DEL-current-v1').first()).toBeVisible();
+  await expect(page.getByText('新增文件').locator('..').getByText('+1')).toBeVisible();
+  await expect(page.getByText('删除文件').locator('..').getByText('-1')).toBeVisible();
+  await expect(page.getByText(/pinme export bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsy/)).toBeVisible();
+  await page.getByText('查看 Manifest 文件差异').click();
+  await expect(page.getByText('+ report.json')).toBeVisible();
+  await expect(page.getByText('- report-old.json')).toBeVisible();
   await expect(page.getByRole('button', { name: /确认交付并释放/ })).toBeEnabled();
 
   const admin = { id: requester.id, email: 'admin@example.test', displayName: 'E2E Admin', role: 'admin' };

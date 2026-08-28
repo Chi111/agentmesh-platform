@@ -14,6 +14,7 @@
   "dependencies": {
     "@langchain/langgraph": "^1.4.12",
     "jose": "^6.2.9",
+    "multiformats": "^9.9.0",
     "viem": "^2.55.16",
     "zod": "^3.25.76"
   }

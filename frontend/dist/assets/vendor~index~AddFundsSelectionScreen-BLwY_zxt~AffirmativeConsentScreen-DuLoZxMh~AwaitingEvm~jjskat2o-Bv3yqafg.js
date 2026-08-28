@@ -1,0 +1,1 @@
+import"./vendor~index~AddFundsSelectionScreen-BLwY_zxt~AffirmativeConsentScreen-DuLoZxMh~AwaitingEvm~gosbendv-Do5X2vuw.js";import{c as e,u as t}from"./vendor~index~AddFundsSelectionScreen-BLwY_zxt~AffirmativeConsentScreen-DuLoZxMh~AwaitingEvm~m386cdho-CbBfohz6.js";function n(t,n={}){return e(t,n)}function r(e){return t(e)}export{r as n,n as t};

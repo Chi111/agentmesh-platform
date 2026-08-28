@@ -1,5 +1,6 @@
 import { AlertTriangle, Home, RefreshCw } from 'lucide-react';
 import { Component, type ErrorInfo, type ReactNode } from 'react';
+import { BRAND } from '../../constants/brand';
 
 interface ErrorBoundaryState {
   error: Error | null;
@@ -13,7 +14,7 @@ export class AppErrorBoundary extends Component<{ children: ReactNode }, ErrorBo
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('AgentMesh render failure', error, info.componentStack);
+    console.error(`${BRAND.platform.name} render failure`, error, info.componentStack);
   }
 
   private goToDashboard = () => {

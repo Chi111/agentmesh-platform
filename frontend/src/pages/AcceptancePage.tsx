@@ -1,15 +1,17 @@
-import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, ExternalLink, FileCheck2, FileQuestion, Link2, LoaderCircle, LockKeyhole, MessageSquareText, Scale, ShieldCheck, Wrench } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, Download, ExternalLink, FileCheck2, FileQuestion, Fingerprint, Link2, LoaderCircle, LockKeyhole, MessageSquareText, RefreshCw, Scale, ShieldCheck, UploadCloud, Wrench } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
 import { Modal } from '../components/ui/Modal';
 import { StatusBadge } from '../components/ui/StatusBadge';
+import { BRAND } from '../constants/brand';
 import { useMission } from '../hooks/useMission';
 import { useAppStore } from '../store/useAppStore';
 import { formatPaymentAmount, isWeb3Payment, paymentToken } from '../utils/payments';
 import { artifactBelongsToCurrentAttempt, deliveryReadiness, missionDeliverableBelongsToCurrentVersion } from '../utils/delivery';
 import { missionStatusMeta } from '../utils/missionState';
 import { api } from '../services/api';
+import type { Deliverable, ReviewDossierResponse } from '../types/domain';
 
 function StageFeedbackCard({ missionId, stageId, stageName, agentName }: { missionId: string; stageId: string; stageName: string; agentName: string }) {
   const [deliveryQuality, setDeliveryQuality] = useState(5);
@@ -73,6 +75,19 @@ function deliverableText(value: unknown, depth = 0): string | null {
   return null;
 }
 
+function manifestDiff(current: Deliverable, parent: Deliverable | null) {
+  const currentFiles = new Map(current.ipfsEvidence?.manifest.files.map((file) => [file.path, file]) ?? []);
+  const parentFiles = new Map(parent?.ipfsEvidence?.manifest.files.map((file) => [file.path, file]) ?? []);
+  const added = [...currentFiles.keys()].filter((path) => !parentFiles.has(path)).sort();
+  const removed = [...parentFiles.keys()].filter((path) => !currentFiles.has(path)).sort();
+  const changed = [...currentFiles.keys()].filter((path) => {
+    const before = parentFiles.get(path);
+    const after = currentFiles.get(path);
+    return before && after && (before.sha256 !== after.sha256 || before.byteSize !== after.byteSize || before.mimeType !== after.mimeType);
+  }).sort();
+  return { added, removed, changed };
+}
+
 export function AcceptancePage() {
   const { missionId: routeMissionId = '' } = useParams();
   const mission = useMission();
@@ -93,6 +108,8 @@ export function AcceptancePage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [selectedDeliverableId, setSelectedDeliverableId] = useState('');
+  const [dossier, setDossier] = useState<ReviewDossierResponse | null>(null);
+  const [publicationCid, setPublicationCid] = useState('');
   const usesWeb3 = mission ? isWeb3Payment(mission.paymentMethod) : false;
   const token = mission ? paymentToken(mission.paymentMethod) : 'CREDIT';
 
@@ -115,6 +132,12 @@ export function AcceptancePage() {
   const selectedDeliverable = currentDeliverables.find((item) => item.id === selectedDeliverableId)
     ?? currentDeliverables[currentDeliverables.length - 1]
     ?? null;
+  const parentDeliverable = selectedDeliverable?.ipfsEvidence?.supersedesDeliverableId
+    ? deliverables.find((item) => item.id === selectedDeliverable.ipfsEvidence?.supersedesDeliverableId) ?? null
+    : null;
+  const selectedManifestDiff = selectedDeliverable?.ipfsEvidence
+    ? manifestDiff(selectedDeliverable, parentDeliverable)
+    : null;
   const completedStageOutputs = stages.filter((stage) => stage.status === 'done' && stage.output && Object.keys(stage.output).length > 0);
   const finalStageOutput = completedStageOutputs[completedStageOutputs.length - 1]?.output ?? null;
   const finalStageResult = objectValue(finalStageOutput)?.result;
@@ -181,6 +204,58 @@ export function AcceptancePage() {
     }
   };
 
+  const verifySelectedEvidence = async () => {
+    if (!selectedDeliverable?.ipfsEvidence) return;
+    setBusy(true); setError('');
+    try {
+      await api.verifyDeliverableIpfs(mission.id, selectedDeliverable.id);
+      await loadMissionDetail(mission.id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'IPFS 证据验证失败。'); }
+    finally { setBusy(false); }
+  };
+
+  const copySelectedCid = async () => {
+    if (!selectedDeliverable?.ipfsEvidence) return;
+    try { await navigator.clipboard.writeText(selectedDeliverable.ipfsEvidence.rootCid); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'CID 复制失败。'); }
+  };
+
+  const downloadSelectedManifest = () => {
+    if (!selectedDeliverable?.ipfsEvidence) return;
+    const url = URL.createObjectURL(new Blob([
+      JSON.stringify(selectedDeliverable.ipfsEvidence.manifest, null, 2),
+    ], { type: 'application/json' }));
+    const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `manifest-${selectedDeliverable.id}.json`; anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadAcceptanceDossier = async () => {
+    setBusy(true); setError('');
+    try {
+      const response = await api.getEvidenceDossier(mission.id, 'acceptance', mission.id);
+      setDossier(response);
+      const url = URL.createObjectURL(new Blob([response.canonicalJson], { type: 'application/json' }));
+      const anchor = document.createElement('a');
+      anchor.href = url; anchor.download = `agentmesh-review-${mission.id}.json`; anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '审核档案生成失败。'); }
+    finally { setBusy(false); }
+  };
+
+  const registerDossierCid = async () => {
+    if (!dossier || !publicationCid.trim()) return;
+    setBusy(true); setError('');
+    try {
+      await api.registerEvidencePublication(mission.id, {
+        kind: 'acceptance_dossier', subjectId: mission.id, payloadSha256: dossier.payloadSha256, rootCid: publicationCid.trim(),
+      });
+      setDossier(await api.getEvidenceDossier(mission.id, 'acceptance', mission.id));
+      setPublicationCid('');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '审核档案 CID 登记失败。'); }
+    finally { setBusy(false); }
+  };
+
   return (
     <div className="space-y-5">
       <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -197,7 +272,16 @@ export function AcceptancePage() {
             {selectedDeliverable ? <div className="mesh-grid mt-5 flex min-h-[460px] items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-black/25">{isImage ? <img className="max-h-[520px] w-full object-contain" src={selectedDeliverable.uri} alt={selectedDeliverable.name} /> : isVideo ? <video className="max-h-[520px] w-full" src={selectedDeliverable.uri} controls preload="metadata" /> : <a className="flex max-w-sm flex-col items-center rounded-2xl border border-white/15 bg-white/[0.06] p-8 text-center transition hover:bg-white/10" href={selectedDeliverable.uri} target="_blank" rel="noreferrer"><FileQuestion size={34} className="text-cyan" /><span className="mt-4 text-sm font-semibold">{selectedDeliverable.name}</span><span className="mt-2 text-xs text-white/40">浏览器无法内嵌预览此格式，点击打开交付 URI</span><ExternalLink size={15} className="mt-4" /></a>}</div> : <div className="mesh-grid mt-5 flex min-h-[300px] flex-col items-center justify-center rounded-xl border border-dashed border-warning/30 bg-black/25 px-6 text-center"><FileQuestion size={34} className="text-warning/70" /><p className="mt-4 text-sm font-semibold">当前没有可下载工程制品</p><p className="mt-2 max-w-md text-xs leading-5 text-white/45">Agent 的文字说明和代码片段仅作为执行证据；Implement 节点必须提交带 URI、哈希和类型的真实 artifact 才能进入验收。</p></div>}
             {finalStageOutput && !selectedDeliverable ? <div className="mt-4 max-h-64 overflow-auto rounded-xl border border-white/10 bg-white/[0.04] p-4"><div className="flex items-center gap-2 text-sm font-semibold"><ShieldCheck size={17} className="text-warning" />结构化阶段输出（仅证据，非交付物）</div>{finalDeliverableText ? <div className="mt-4 whitespace-pre-wrap break-words text-xs leading-6 text-white/65">{finalDeliverableText}</div> : <pre className="mt-4 whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-white/60">{JSON.stringify(finalDeliverable, null, 2)}</pre>}</div> : null}
             <div className="mt-4 flex flex-wrap gap-3 font-mono text-[9px] text-white/35">{selectedDeliverable ? <><span>HASH {selectedDeliverable.contentHash}</span><span>STATUS {selectedDeliverable.status.toUpperCase()}</span><span>{selectedDeliverable.createdAt ? `SUBMITTED ${new Date(selectedDeliverable.createdAt).toLocaleString('zh-CN', { hour12: false })}` : null}</span></> : finalStageOutput ? <><span>NO DOWNLOADABLE ARTIFACT</span><span>{completedStageOutputs.length}/{stages.length} STAGE OUTPUTS VALID</span></> : <span>WAITING FOR AGENT OUTPUT</span>}</div>
-            {currentDeliverables.length > 1 ? <div className="mt-4 flex flex-wrap gap-2">{currentDeliverables.map((item) => <button type="button" className={`rounded-lg border px-3 py-2 text-xs transition ${selectedDeliverable?.id === item.id ? 'border-cyan bg-cyan/10 text-white' : 'border-white/10 text-white/45 hover:text-white'}`} onClick={() => setSelectedDeliverableId(item.id)} key={item.id}>{item.name}</button>)}</div> : null}
+            {selectedDeliverable?.ipfsEvidence ? <div className="mt-4 rounded-xl border border-cyan/25 bg-cyan/10 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="flex items-center gap-2 text-sm font-semibold"><Fingerprint size={16} className="text-cyan" />{BRAND.evidence.compactLabel} v{selectedDeliverable.ipfsEvidence.versionNo}</p><p className="mt-2 break-all font-mono text-[9px] text-white/45">CID {selectedDeliverable.ipfsEvidence.rootCid}</p></div><StatusBadge tone={selectedDeliverable.ipfsEvidence.verificationStatus === 'verified' ? 'success' : selectedDeliverable.ipfsEvidence.verificationStatus === 'declared' || selectedDeliverable.ipfsEvidence.verificationStatus === 'unavailable' ? 'warning' : 'danger'}>{selectedDeliverable.ipfsEvidence.verificationStatus}</StatusBadge></div>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-[10px] text-white/50"><span>{selectedDeliverable.ipfsEvidence.fileCount} files · {selectedDeliverable.ipfsEvidence.totalBytes.toLocaleString()} bytes · {selectedDeliverable.ipfsEvidence.visibility}</span><button type="button" className="inline-flex items-center gap-1 font-semibold text-cyan disabled:opacity-50" onClick={() => void verifySelectedEvidence()} disabled={busy}><RefreshCw size={12} />通过固定 Gateway 验证</button></div>
+              <div className="mt-3 flex flex-wrap gap-2"><button type="button" className="rounded-lg border border-white/15 px-3 py-1.5 text-[10px] font-semibold text-white/70" onClick={() => void copySelectedCid()}>复制 CID</button><button type="button" className="rounded-lg border border-white/15 px-3 py-1.5 text-[10px] font-semibold text-white/70" onClick={downloadSelectedManifest}>下载 Manifest</button><a className="rounded-lg border border-white/15 px-3 py-1.5 text-[10px] font-semibold text-white/70" href={selectedDeliverable.uri} target="_blank" rel="noreferrer">打开固定 CID</a></div>
+              <code className="mt-3 block overflow-x-auto rounded-lg bg-black/25 px-3 py-2 text-[10px] text-white/60">pinme export {selectedDeliverable.ipfsEvidence.rootCid}</code>
+              {selectedDeliverable.ipfsEvidence.supersedesDeliverableId ? <p className="mt-3 break-all text-[10px] text-white/45">父版本 {selectedDeliverable.ipfsEvidence.supersedesDeliverableId} · {selectedDeliverable.ipfsEvidence.manifest.supersedesRootCid}</p> : <p className="mt-3 text-[10px] text-white/45">该 scope 的首个版本</p>}
+              {selectedManifestDiff && parentDeliverable ? <div className="mt-3 grid grid-cols-3 gap-2 text-center text-[10px]"><div className="rounded-lg bg-white/5 p-2"><p className="font-mono text-lime">+{selectedManifestDiff.added.length}</p><p className="mt-1 text-white/40">新增文件</p></div><div className="rounded-lg bg-white/5 p-2"><p className="font-mono text-warning">~{selectedManifestDiff.changed.length}</p><p className="mt-1 text-white/40">内容变化</p></div><div className="rounded-lg bg-white/5 p-2"><p className="font-mono text-danger">-{selectedManifestDiff.removed.length}</p><p className="mt-1 text-white/40">删除文件</p></div><details className="col-span-3 text-left"><summary className="cursor-pointer font-semibold text-cyan">查看 Manifest 文件差异</summary><div className="mt-2 space-y-1 font-mono text-[9px] text-white/55">{selectedManifestDiff.added.map((path) => <p key={`add-${path}`}>+ {path}</p>)}{selectedManifestDiff.changed.map((path) => <p key={`change-${path}`}>~ {path}</p>)}{selectedManifestDiff.removed.map((path) => <p key={`remove-${path}`}>- {path}</p>)}{selectedManifestDiff.added.length + selectedManifestDiff.changed.length + selectedManifestDiff.removed.length === 0 ? <p>文件清单没有变化</p> : null}</div></details></div> : null}
+              {selectedDeliverable.ipfsEvidence.lastVerificationError ? <p className="mt-2 text-[10px] text-warning">{selectedDeliverable.ipfsEvidence.lastVerificationError}</p> : null}
+            </div> : <div className="mt-4 rounded-xl border border-warning/20 bg-warning/10 p-3 text-xs text-white/50">Legacy URI 交付：可继续验收，但不具备 PinMe CID 版本与 Gateway Manifest 验证。</div>}
+            {currentDeliverables.length > 1 ? <div className="mt-4 flex flex-wrap gap-2">{currentDeliverables.map((item) => <button type="button" className={`rounded-lg border px-3 py-2 text-xs transition ${selectedDeliverable?.id === item.id ? 'border-cyan bg-cyan/10 text-white' : 'border-white/10 text-white/45 hover:text-white'}`} onClick={() => setSelectedDeliverableId(item.id)} key={item.id}>{item.name}{item.ipfsEvidence ? ` · v${item.ipfsEvidence.versionNo}` : ''}</button>)}</div> : null}
             {historicalDeliverables.length > 0 ? <p className="mt-4 text-xs leading-5 text-white/45">{historicalDeliverables.length} 个历史 attempt 或已拒绝制品已保留，仅供审计，不参与当前验收。</p> : null}
             {readiness.missingArtifactStages.length > 0 ? <div className="mt-4 rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-warning"><p className="font-semibold">缺少真实工程制品，暂不可验收</p><p className="mt-1 text-xs leading-5 text-white/55">以下 Implement 节点尚未提交可下载 artifact：{readiness.missingArtifactStages.map((stage) => stage.name).join('、')}</p></div> : null}
           </div>
@@ -212,6 +296,13 @@ export function AcceptancePage() {
           </aside>
         </div>
       </section>
+
+      <section className="panel p-5 md:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="font-semibold">PinMe 版本证据链</h2><p className="mt-1 text-xs text-muted">CID 不覆盖旧版本；返工后的旧 attempt 仍可审计，但不会参与当前验收。</p></div><StatusBadge tone={deliverables.some((item) => item.ipfsEvidence) ? 'success' : 'neutral'}>{deliverables.filter((item) => item.ipfsEvidence).length} 个 CID 版本</StatusBadge></div>
+        {deliverables.some((item) => item.ipfsEvidence) ? <ol className="mt-5 space-y-3">{[...deliverables].reverse().map((item) => <li className={`rounded-xl border p-4 ${currentDeliverableIds.has(item.id) ? 'border-cyan/30 bg-cyan/[0.04]' : 'border-line bg-canvas/35'}`} key={item.id}><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">{item.name} {item.ipfsEvidence ? <span className="ml-2 font-mono text-cyan">v{item.ipfsEvidence.versionNo}</span> : null}</p><p className="mt-1 text-[10px] text-muted">attempt {item.attemptNo ?? 'final'} · {currentDeliverableIds.has(item.id) ? '当前验收集合' : '历史证据'} · {item.status}</p></div>{item.ipfsEvidence ? <StatusBadge tone={item.ipfsEvidence.verificationStatus === 'verified' ? 'success' : item.ipfsEvidence.verificationStatus === 'declared' || item.ipfsEvidence.verificationStatus === 'unavailable' ? 'warning' : 'danger'}>{item.ipfsEvidence.verificationStatus}</StatusBadge> : <StatusBadge tone="neutral">legacy</StatusBadge>}</div>{item.ipfsEvidence ? <><p className="mt-3 break-all font-mono text-[9px] text-muted">{item.ipfsEvidence.rootCid}</p><p className="mt-1 truncate font-mono text-[9px] text-muted" title={item.ipfsEvidence.manifestSha256}>{item.ipfsEvidence.manifestSha256}</p><p className="mt-2 text-[10px] text-muted">{item.ipfsEvidence.fileCount} files · {item.ipfsEvidence.totalBytes.toLocaleString()} bytes · 父版本 {item.ipfsEvidence.supersedesDeliverableId ?? 'none'}</p></> : <p className="mt-3 truncate font-mono text-[9px] text-muted">{item.uri}</p>}</li>)}</ol> : <p className="mt-5 rounded-xl border border-dashed border-line p-6 text-center text-xs text-muted">当前只有 legacy 交付；后续版本可改用 {BRAND.evidence.compactLabel}，不会破坏旧记录。</p>}
+      </section>
+
+      {mission.status === 'completed' ? <section className="panel p-5 md:p-6"><div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between"><div><h2 className="font-semibold">不可变审核档案</h2><p className="mt-2 max-w-2xl text-xs leading-6 text-muted">档案由验收时冻结的 CID、Manifest hash、工作流版本、验收标准 hash 与事件水位确定性生成。下载后放入独立目录，用你自己的 PinMe 登录态执行上传。</p></div><button type="button" className="btn-secondary shrink-0" disabled={busy} onClick={() => void downloadAcceptanceDossier()}><Download size={16} />生成并下载 JSON</button></div>{dossier ? <div className="mt-5 rounded-xl border border-cyan/25 bg-cyan/[0.05] p-4"><p className="font-mono text-[10px] text-muted">PAYLOAD {dossier.payloadSha256}</p><code className="mt-3 block rounded-lg bg-ink px-3 py-2 text-[10px] text-white">{dossier.publishGuide.command}</code><div className="mt-3 flex flex-col gap-2 sm:flex-row"><input className="field flex-1 font-mono" value={publicationCid} onChange={(event) => setPublicationCid(event.target.value)} placeholder="上传完成后粘贴档案根 CID" /><button type="button" className="btn-primary shrink-0" disabled={busy || !publicationCid.trim()} onClick={() => void registerDossierCid()}><UploadCloud size={15} />登记档案 CID</button></div>{dossier.publications.filter((item) => item.kind === 'acceptance_dossier').map((item) => <p className="mt-3 break-all text-xs text-cyan" key={item.id}>已登记：ipfs://{item.rootCid}</p>)}</div> : null}</section> : null}
 
       <section className="panel p-5 md:p-6">
         <div className="flex items-center justify-between"><div><h2 className="font-semibold">Evidence Chain</h2><p className="mt-1 text-xs text-muted">每个阶段的状态、输出和可追溯执行事件。</p></div><StatusBadge tone={evidenceCount ? 'success' : 'neutral'}>{evidenceCount} 个事件</StatusBadge></div>

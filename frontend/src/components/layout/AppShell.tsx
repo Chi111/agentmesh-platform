@@ -15,6 +15,8 @@ import {
   LogIn,
   LogOut,
   Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   Scale,
   Search,
@@ -28,6 +30,9 @@ import { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type R
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { AuthDialog } from '../../auth/AuthDialog';
 import { useAuth } from '../../auth/AuthProvider';
+import { BrandMark } from '../brand/BrandMark';
+import { BRAND } from '../../constants/brand';
+import { shortWalletAddress } from '../../services/ens';
 import { useAppStore } from '../../store/useAppStore';
 import type { UserRole } from '../../types/domain';
 import { routeForMission } from '../../utils/missionState';
@@ -43,7 +48,7 @@ const requesterNav: NavItem[] = [
   { label: '发布任务', to: '/missions/new', icon: Plus },
   { label: '我的任务', to: '/missions', icon: ListTodo },
   { label: '测试充值', to: '/wallet/test-funds', icon: WalletCards },
-  { label: 'YD Finance', to: '/yd-finance', icon: Coins },
+  { label: BRAND.contribution.navigationLabel, to: '/yd-finance', icon: Coins },
   { label: 'Agent 市场', to: '/agents', icon: Compass },
   { label: '仲裁中心', to: '/arbitration', icon: Scale },
 ];
@@ -54,9 +59,11 @@ const developerNav: NavItem[] = [
   { label: '注册 Agent', to: '/developer/agents/new', icon: Plus },
   { label: '接单记录', to: '/developer/jobs', icon: BriefcaseBusiness },
   { label: '收益中心', to: '/developer/earnings', icon: CircleDollarSign },
-  { label: 'YD Finance', to: '/yd-finance', icon: Coins },
+  { label: BRAND.contribution.navigationLabel, to: '/yd-finance', icon: Coins },
   { label: '仲裁中心', to: '/arbitration', icon: Scale },
 ];
+
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'workspace:sidebar-collapsed';
 
 function isSidebarItemActive(pathname: string, role: UserRole, to: string) {
   const normalizedPathname = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
@@ -67,39 +74,33 @@ function isSidebarItemActive(pathname: string, role: UserRole, to: string) {
   return false;
 }
 
-function MeshMark() {
-  return (
-    <span className="relative flex size-9 items-center justify-center rounded-xl border border-cyan/35 bg-white/5" aria-hidden="true">
-      <span className="absolute left-2 top-4 size-1.5 rounded-full bg-cyan shadow-[0_0_10px_rgba(0,184,217,.8)]" />
-      <span className="absolute right-2 top-2 size-1.5 rounded-full bg-lime" />
-      <span className="absolute bottom-2 right-2 size-1.5 rounded-full bg-cyan" />
-      <span className="h-px w-4 -rotate-[28deg] bg-cyan/70" />
-      <span className="absolute h-px w-4 rotate-[28deg] bg-cyan/70" />
-    </span>
-  );
-}
-
 function Sidebar({
   open,
   interactive,
+  collapsed,
   sidebarRef,
   onClose,
+  onToggleCollapsed,
   onOpenAuth,
 }: {
   open: boolean;
   interactive: boolean;
+  collapsed: boolean;
   sidebarRef: RefObject<HTMLElement>;
   onClose: () => void;
+  onToggleCollapsed: () => void;
   onOpenAuth: () => void;
 }) {
   const storedRole = useAppStore((state) => state.role);
   const syncStatus = useAppStore((state) => state.syncStatus);
   const setRole = useAppStore((state) => state.setRole);
-  const { profile, status, signOut, linkedWalletAddress, walletAddress, provider } = useAuth();
+  const { profile, status, signOut, linkedWalletAddress, walletAddress, ensName, provider } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   const role = location.pathname.startsWith('/developer') ? 'developer' : storedRole;
   const identityWallet = walletAddress ?? linkedWalletAddress;
+  const shortWallet = shortWalletAddress(identityWallet);
+  const identityDisplayName = ensName ?? profile?.displayName;
   const items = role === 'requester' ? requesterNav : developerNav;
   const label = role === 'requester' ? '任务方门户' : '开发者控制台';
   const switchRole = async (nextRole: UserRole) => {
@@ -122,22 +123,26 @@ function Sidebar({
         id="app-sidebar"
         ref={sidebarRef}
         aria-hidden={interactive ? undefined : true}
-        className={`app-sidebar fixed inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[252px] shrink-0 flex-col overflow-hidden bg-ink px-4 py-5 text-white transition-transform duration-200 [@media(max-height:520px)]:py-3 lg:sticky lg:bottom-auto lg:ml-3 lg:my-3 lg:h-[calc(100dvh-1.5rem)] lg:rounded-[24px] lg:border lg:border-white/10 lg:top-3 lg:z-auto lg:translate-x-0 ${open ? 'translate-x-0' : '-translate-x-full'}`}
+        data-collapsed={collapsed ? 'true' : 'false'}
+        className={`app-sidebar fixed inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[252px] shrink-0 flex-col overflow-hidden bg-ink px-4 py-5 text-white transition-[width,padding,transform] duration-200 [@media(max-height:520px)]:py-3 lg:sticky lg:bottom-auto lg:ml-3 lg:my-3 lg:h-[calc(100dvh-1.5rem)] lg:rounded-[24px] lg:border lg:border-white/10 lg:top-3 lg:z-auto lg:translate-x-0 ${collapsed ? 'lg:w-[76px] lg:px-2' : 'lg:w-[252px] lg:px-4'} ${open ? 'translate-x-0' : '-translate-x-full'}`}
       >
-        <div className="flex items-center justify-between px-2">
-          <Link to="/contract" className="flex items-center gap-3" onClick={onClose} aria-label="查看 AgentMesh 合约公开信息" title="合约公开信息">
-            <MeshMark />
-            <span>
-              <strong className="block text-[15px] tracking-tight">AgentMesh</strong>
-              <small className="mt-0.5 block font-mono text-[9px] uppercase tracking-[0.14em] text-white/40">Orchestration Network</small>
+        <div className={`flex px-2 ${collapsed ? 'lg:flex-col lg:items-center lg:gap-2 lg:px-0' : 'items-center justify-between'}`}>
+          <Link to="/" className={`flex items-center gap-3 ${collapsed ? 'lg:justify-center' : ''}`} onClick={onClose} aria-label={`返回 ${BRAND.platform.name} 首页`} title="返回首页">
+            <BrandMark />
+            <span className={collapsed ? 'lg:hidden' : undefined}>
+              <strong className="block text-[15px] tracking-tight">{BRAND.platform.name}</strong>
+              <small className="mt-0.5 block font-mono text-[9px] uppercase tracking-[0.14em] text-white/40">{BRAND.platform.tagline}</small>
             </span>
           </Link>
+          <button type="button" className="hidden size-8 items-center justify-center rounded-lg text-white/45 transition hover:bg-white/10 hover:text-white lg:flex" onClick={onToggleCollapsed} aria-controls="app-sidebar" aria-expanded={!collapsed} aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'} title={collapsed ? '展开侧边栏' : '收起侧边栏'}>
+            {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          </button>
           <button type="button" className="rounded-lg p-2 text-white/55 hover:bg-white/10 lg:hidden" onClick={onClose} aria-label="关闭菜单">
             <X size={18} />
           </button>
         </div>
 
-        <div className="mx-2 mt-7 rounded-xl border border-white/10 bg-white/[0.04] p-3 [@media(max-height:620px)]:hidden">
+        <div className={`mx-2 mt-7 rounded-xl border border-white/10 bg-white/[0.04] p-3 [@media(max-height:620px)]:hidden ${collapsed ? 'lg:hidden' : ''}`}>
           <div className="flex items-center gap-2">
             <span className="size-2 rounded-full bg-lime shadow-[0_0_10px_rgba(183,243,74,.65)]" />
             <span className="text-xs font-semibold">{label}</span>
@@ -153,51 +158,55 @@ function Sidebar({
           <button type="button" aria-pressed={role === 'developer'} className={`rounded-lg px-2 py-2 text-xs font-semibold transition ${role === 'developer' ? 'bg-white text-ink' : 'text-white/50 hover:text-white'}`} onClick={() => void switchRole('developer')}>开发者</button>
         </div>
 
-        <nav className="mt-7 min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain pr-1 [scrollbar-color:rgba(255,255,255,0.16)_transparent] [scrollbar-width:thin] [@media(max-height:620px)]:mt-3" aria-label={label}>
-          <p className="mb-3 px-3 font-mono text-[9px] uppercase tracking-[0.16em] text-white/30">Workspace</p>
+        <nav className={`min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain [scrollbar-color:rgba(255,255,255,0.16)_transparent] [scrollbar-width:thin] [@media(max-height:620px)]:mt-3 ${collapsed ? 'mt-4 lg:pr-0' : 'mt-7 pr-1'}`} aria-label={label}>
+          <p className={`mb-3 px-3 font-mono text-[9px] uppercase tracking-[0.16em] text-white/30 ${collapsed ? 'lg:hidden' : ''}`}>Workspace</p>
           {items.map(({ label: itemLabel, to, icon: Icon }) => {
             const isActive = isSidebarItemActive(location.pathname, role, to);
             return <Link
               key={to}
               to={to}
               aria-current={isActive ? 'page' : undefined}
+              aria-label={collapsed ? itemLabel : undefined}
+              title={collapsed ? itemLabel : undefined}
               onClick={onClose}
-              className={`group relative flex min-h-11 items-center gap-3 rounded-xl border px-3 text-sm transition-all ${isActive ? 'border-white/80 bg-white text-ink shadow-[0_10px_30px_rgba(0,0,0,.2)]' : 'border-transparent text-white/55 hover:border-white/5 hover:bg-white/[0.06] hover:text-white'}`}
+              className={`group relative flex min-h-11 items-center gap-3 rounded-xl border px-3 text-sm transition-all ${collapsed ? 'lg:justify-center lg:px-0' : ''} ${isActive ? 'border-white/80 bg-white text-ink shadow-[0_10px_30px_rgba(0,0,0,.2)]' : 'border-transparent text-white/55 hover:border-white/5 hover:bg-white/[0.06] hover:text-white'}`}
             >
               <Icon size={18} className={isActive ? 'text-cyan' : undefined} aria-hidden="true" />
-              <span className={isActive ? 'font-semibold' : 'font-medium'}>{itemLabel}</span>
-              {isActive ? <span className="ml-auto size-1.5 rounded-full bg-cyan shadow-[0_0_8px_rgba(8,170,196,.55)]" aria-hidden="true" /> : null}
+              <span className={`${isActive ? 'font-semibold' : 'font-medium'} ${collapsed ? 'lg:hidden' : ''}`}>{itemLabel}</span>
+              {isActive ? <span className={`ml-auto size-1.5 rounded-full bg-cyan shadow-[0_0_8px_rgba(8,170,196,.55)] ${collapsed ? 'lg:hidden' : ''}`} aria-hidden="true" /> : null}
             </Link>;
           })}
           {profile?.role === 'admin' ? <NavLink
             to="/admin"
             onClick={onClose}
-            className={({ isActive }: { isActive: boolean }) => `group relative flex min-h-11 items-center gap-3 rounded-lg border border-transparent px-3 text-sm transition-colors ${isActive ? 'bg-white/[0.07] text-white before:absolute before:inset-y-2.5 before:left-0 before:w-0.5 before:rounded-full before:bg-lime' : 'text-white/55 hover:bg-white/[0.05] hover:text-white'}`}
+            aria-label={collapsed ? '平台运营' : undefined}
+            title={collapsed ? '平台运营' : undefined}
+            className={({ isActive }: { isActive: boolean }) => `group relative flex min-h-11 items-center gap-3 rounded-lg border border-transparent px-3 text-sm transition-colors ${collapsed ? 'lg:justify-center lg:px-0' : ''} ${isActive ? 'bg-white/[0.07] text-white before:absolute before:inset-y-2.5 before:left-0 before:w-0.5 before:rounded-full before:bg-lime' : 'text-white/55 hover:bg-white/[0.05] hover:text-white'}`}
           >
             {({ isActive }: { isActive: boolean }) => <>
               <ShieldCheck size={18} className={isActive ? 'text-lime' : undefined} aria-hidden="true" />
-              <span className={isActive ? 'font-semibold' : 'font-medium'}>平台运营</span>
-              {isActive ? <span className="ml-auto size-1.5 rounded-full bg-lime shadow-[0_0_8px_rgba(183,243,74,.55)]" aria-hidden="true" /> : null}
+              <span className={`${isActive ? 'font-semibold' : 'font-medium'} ${collapsed ? 'lg:hidden' : ''}`}>平台运营</span>
+              {isActive ? <span className={`ml-auto size-1.5 rounded-full bg-lime shadow-[0_0_8px_rgba(183,243,74,.55)] ${collapsed ? 'lg:hidden' : ''}`} aria-hidden="true" /> : null}
             </>}
           </NavLink> : null}
         </nav>
 
         <div className="shrink-0 bg-transparent pt-2">
-          <NavLink to="/settings" onClick={onClose} className={({ isActive }: { isActive: boolean }) => `flex min-h-11 items-center gap-3 rounded-xl px-3 text-sm transition ${isActive ? 'bg-white/10 text-white' : 'text-white/45 hover:bg-white/[0.05] hover:text-white'}`}>
+          <NavLink to="/settings" onClick={onClose} aria-label={collapsed ? '设置' : undefined} title={collapsed ? '设置' : undefined} className={({ isActive }: { isActive: boolean }) => `flex min-h-11 items-center gap-3 rounded-xl px-3 text-sm transition ${collapsed ? 'lg:justify-center lg:px-0' : ''} ${isActive ? 'bg-white/10 text-white' : 'text-white/45 hover:bg-white/[0.05] hover:text-white'}`}>
             <Settings size={18} />
-            设置
+            <span className={collapsed ? 'lg:hidden' : undefined}>设置</span>
           </NavLink>
 
-          <div className="mx-2 mt-3 border-t border-white/10 pt-3">
-            <button type="button" className="flex w-full items-center gap-3 rounded-xl p-1 text-left transition hover:bg-white/[0.05]" onClick={profile ? () => void signOut() : onOpenAuth}>
-              <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-cyan/15 font-mono text-xs text-cyan">{profile ? profile.displayName.slice(0, 2).toUpperCase() : <LogIn size={16} />}</span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs font-semibold">{profile?.displayName ?? (status === 'loading' ? '正在恢复会话…' : '连接真实工作区')}</span>
+          <div className={`mt-3 border-t border-white/10 pt-3 ${collapsed ? 'mx-1' : 'mx-2'}`}>
+            <button type="button" className={`flex w-full items-center gap-3 rounded-xl p-1 text-left transition hover:bg-white/[0.05] ${collapsed ? 'lg:justify-center' : ''}`} onClick={profile ? () => void signOut() : onOpenAuth} aria-label={profile ? `退出登录 · ${identityDisplayName}` : '连接真实工作区'} title={collapsed ? profile ? `退出登录 · ${identityDisplayName}` : '连接真实工作区' : undefined}>
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-cyan/15 font-mono text-xs text-cyan">{identityDisplayName ? identityDisplayName.slice(0, 2).toUpperCase() : <LogIn size={16} />}</span>
+              <span className={`min-w-0 flex-1 ${collapsed ? 'lg:hidden' : ''}`}>
+                <span className="block truncate text-xs font-semibold">{identityDisplayName ?? (status === 'loading' ? '正在恢复会话…' : '连接真实工作区')}</span>
                 <span className="block truncate text-[10px] text-white/35 [@media(max-height:420px)]:hidden">
-                  {profile?.email ?? (identityWallet ? `${identityWallet.slice(0, 6)}…${identityWallet.slice(-4)}` : provider === 'privy' ? 'Web2 / Web3 identity' : '尚未登录')}
+                  {ensName ? profile?.email ?? shortWallet : profile?.email ?? shortWallet ?? (provider === 'privy' ? 'Web2 / Web3 identity' : '尚未登录')}
                 </span>
               </span>
-              {profile ? <LogOut size={14} className="text-white/30" /> : null}
+              {profile ? <LogOut size={14} className={`text-white/30 ${collapsed ? 'lg:hidden' : ''}`} /> : null}
             </button>
           </div>
         </div>
@@ -215,7 +224,7 @@ function Topbar({
   menuButtonRef: RefObject<HTMLButtonElement>;
   onOpenMenu: () => void;
 }) {
-  const { profile, provider, linkedWalletAddress, walletAddress, linkWallet } = useAuth();
+  const { profile, provider, linkedWalletAddress, walletAddress, ensName, linkWallet } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const storedRole = useAppStore((state) => state.role);
@@ -232,7 +241,8 @@ function Topbar({
   const searchCloseTimerRef = useRef<number | null>(null);
   const unread = notifications.filter((item) => item.unread).length;
   const identityWallet = walletAddress ?? linkedWalletAddress;
-  const shortWallet = identityWallet ? `${identityWallet.slice(0, 6)}…${identityWallet.slice(-4)}` : null;
+  const shortWallet = shortWalletAddress(identityWallet);
+  const walletLabel = ensName ?? shortWallet;
   const searchResults = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     if (normalized.length < 2) return [];
@@ -377,9 +387,9 @@ function Topbar({
           </div>
 
           <div className="relative">
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-ink transition hover:bg-canvas" onClick={() => setPanel(panel === 'wallet' ? null : 'wallet')} aria-label={profile ? shortWallet ? `身份钱包 ${shortWallet}` : '身份钱包' : '登录后关联钱包'} aria-expanded={panel === 'wallet'}>
+          <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-ink transition hover:bg-canvas" onClick={() => setPanel(panel === 'wallet' ? null : 'wallet')} aria-label={profile ? walletLabel ? `身份钱包 ${walletLabel}` : '身份钱包' : '登录后关联钱包'} aria-expanded={panel === 'wallet'}>
             <WalletCards size={17} />
-            <span className="hidden md:inline">{profile ? shortWallet ?? '身份钱包' : '登录后关联钱包'}</span>
+            <span className="hidden max-w-40 truncate md:inline">{profile ? walletLabel ?? '身份钱包' : '登录后关联钱包'}</span>
           </button>
           {panel === 'wallet' ? (
             <div className="absolute right-0 top-12 w-72 rounded-2xl border border-line bg-white p-4 shadow-float">
@@ -389,8 +399,9 @@ function Topbar({
                   <span className="mono-chip">{provider === 'privy' ? 'PRIVY' : 'PINME'}</span>
                 </div>
                 {identityWallet ? <div className="mt-4 rounded-xl border border-line bg-canvas p-3">
-                  <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted">{walletAddress ? 'Current signer' : 'Linked identity'}</p>
-                  <p className="mt-2 break-all font-mono text-xs font-semibold text-ink">{identityWallet}</p>
+                  <div className="flex items-center justify-between gap-3"><p className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted">{walletAddress ? 'Current signer' : 'Linked identity'}</p>{ensName ? <span className="mono-chip">ENS</span> : null}</div>
+                  {ensName ? <p className="mt-2 truncate text-sm font-semibold text-ink" title={ensName}>{ensName}</p> : null}
+                  <p className={`${ensName ? 'mt-1' : 'mt-2'} break-all font-mono text-[10px] font-semibold text-ink`}>{identityWallet}</p>
                 </div> : <p className="mt-4 text-sm leading-6 text-muted">当前账户使用 Web2 身份。关联钱包后可以用同一账户进行签名登录，无需创建第二套资料。</p>}
                 {provider === 'privy' && profile && !walletAddress ? <button type="button" className="btn-signal mt-4 w-full" onClick={() => void linkWallet()}>{linkedWalletAddress ? '重新连接钱包' : '关联现有钱包'}</button> : null}
                 <p className="mt-4 text-xs leading-5 text-muted">Web2 任务使用充值余额；Web3 任务可选择 Sepolia mUSDC 或 sETH，平台不会保管私钥。</p>
@@ -463,6 +474,13 @@ export function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [desktopSidebar, setDesktopSidebar] = useState(() => window.matchMedia('(min-width: 1024px)').matches);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarRef = useRef<HTMLElement>(null);
 
@@ -486,6 +504,14 @@ export function AppShell() {
     media.addEventListener('change', syncLayout);
     return () => media.removeEventListener('change', syncLayout);
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed));
+    } catch {
+      // The layout still works when storage is unavailable (for example, in a restricted browser context).
+    }
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     if (!mobileOpen) return undefined;
@@ -520,7 +546,7 @@ export function AppShell() {
 
   return (
     <div className="app-shell flex min-h-screen bg-transparent">
-      <Sidebar open={mobileOpen} interactive={desktopSidebar || mobileOpen} sidebarRef={sidebarRef} onClose={closeMobileMenu} onOpenAuth={openAuth} />
+      <Sidebar open={mobileOpen} interactive={desktopSidebar || mobileOpen} collapsed={desktopSidebar && sidebarCollapsed} sidebarRef={sidebarRef} onClose={closeMobileMenu} onToggleCollapsed={() => setSidebarCollapsed((current) => !current)} onOpenAuth={openAuth} />
       <div className={`min-w-0 flex-1 ${isWorkflowWorkspace ? 'flex h-dvh min-h-0 flex-col overflow-hidden' : isExecutionWorkspace ? 'xl:flex xl:h-dvh xl:min-h-0 xl:flex-col xl:overflow-hidden' : ''}`}>
         <Topbar mobileMenuOpen={mobileOpen} menuButtonRef={menuButtonRef} onOpenMenu={openMobileMenu} />
         <main className={isWorkflowWorkspace

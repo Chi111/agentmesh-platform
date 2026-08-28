@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { numberToHex, type Hex } from 'viem';
 import { sepolia } from 'viem/chains';
 import { api, setApiTokenProvider } from '../services/api';
+import { BRAND, isDefaultPlatformUserName } from '../constants/brand';
 import {
   depositEscrow as submitEscrowDeposit,
   freezeEscrow as submitEscrowFreeze,
@@ -32,7 +33,7 @@ function privyIdentity(user: PrivyUser) {
   const email = user.email?.address ?? user.google?.email;
   const displayName = user.google?.name?.trim()
     || email?.split('@')[0]
-    || (walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : 'AgentMesh User');
+    || (walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : BRAND.platform.defaultUserName);
   return { walletAddress, email, displayName };
 }
 
@@ -107,7 +108,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     const nextProfile: UserProfile = {
       ...serverProfile,
       email: serverProfile.email ?? identity?.email,
-      displayName: serverProfile.displayName === 'AgentMesh User' ? identity?.displayName ?? serverProfile.displayName : serverProfile.displayName,
+      displayName: isDefaultPlatformUserName(serverProfile.displayName) ? identity?.displayName ?? BRAND.platform.defaultUserName : serverProfile.displayName,
       walletAddress: serverProfile.walletAddress ?? identity?.walletAddress ?? undefined,
     };
     setProfile(nextProfile);
@@ -154,6 +155,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     provider: 'privy',
     linkedWalletAddress: identity?.walletAddress ?? profile?.walletAddress ?? null,
     walletAddress: connectedWallet?.address ?? null,
+    ensName: null,
     onchainSettlement: chainEnabled,
     ydWalletEnabled: ydWalletConfigured(),
     loginWithEmail: openLogin,
@@ -182,7 +184,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     refundEscrow: async (missionId) => submitEscrowRefund(sendConnectedTransaction, missionId),
     submitYdAction: async (action) => {
       const ydWalletAddress = connectedWallet?.address ?? identity?.walletAddress;
-      if (!ydWalletAddress) throw new Error('请先连接已验证的钱包后再提交 YD 交易。');
+      if (!ydWalletAddress) throw new Error(`请先连接已验证的钱包后再提交 ${BRAND.contribution.symbol} 交易。`);
       return submitYdAction(sendConnectedTransaction, ydWalletAddress, action);
     },
     signOut: async () => {
@@ -209,7 +211,7 @@ export function PrivyAuthController({ onChange }: { onChange: (value: AuthContex
         appearance: {
           theme: 'light',
           accentColor: '#00B8D9',
-          landingHeader: '进入 AgentMesh',
+          landingHeader: `进入 ${BRAND.platform.name}`,
           loginMessage: '使用邮箱或钱包签名进入同一个工作区',
           showWalletLoginFirst: false,
           walletChainType: 'ethereum-only',

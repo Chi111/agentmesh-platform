@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { BRAND } from '../shared/brand';
 
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/agents', (route) => route.fulfill({
@@ -20,13 +21,14 @@ test('anonymous users can only browse the public Agent directory', async ({ page
   expect(pageErrors).toEqual([]);
 });
 
-test('public contract showcase remains useful without authentication or RPC availability', async ({ page }) => {
+test('public homepage remains useful without authentication or RPC availability', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.route('**/ethereum-sepolia-rpc.publicnode.com/**', (route) => route.abort('failed'));
 
-  await page.goto('/#/contract');
+  await page.goto('/#/');
 
   await expect(page.getByRole('heading', { name: '协作有共识， 资金有路径。' })).toBeVisible();
+  await expect(page.locator('header img[src="/pinme-mesh-mark.svg"]')).toBeVisible();
   await expect(page.getByRole('link', { name: '在 Etherscan 验证' })).toHaveAttribute(
     'href',
     'https://sepolia.etherscan.io/address/0xe05a5e46139294402393e5601d771e6c7564a573',
@@ -34,6 +36,29 @@ test('public contract showcase remains useful without authentication or RPC avai
   await expect(page.getByText('实时 RPC 暂时不可用，静态合约档案仍可验证。')).toBeVisible();
   await expect(page.locator('#app-sidebar')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+
+  const scrollChapter = page.locator('.contract-hero__chapter-two');
+  await page.evaluate(() => window.scrollTo(0, window.innerHeight * 1.05));
+  await expect
+    .poll(async () => Number(await scrollChapter.evaluate((element) => getComputedStyle(element).opacity)))
+    .toBeGreaterThan(0.8);
+  await expect(page.getByRole('heading', { name: '一条路径， 从承诺到结算。' })).toBeVisible();
+  await expect
+    .poll(async () => Number(await page.locator('.contract-hero__flow-step').nth(2).evaluate((element) => getComputedStyle(element).opacity)))
+    .toBeGreaterThan(0.8);
+  await expect
+    .poll(async () =>
+      page.locator('.contract-hero').evaluate((element) =>
+        (element as HTMLElement).style.getPropertyValue('--hero-progress'),
+      ),
+    )
+    .not.toBe('0%');
+});
+
+test('legacy contract URL redirects to the public homepage', async ({ page }) => {
+  await page.goto('/#/contract');
+  await expect(page).toHaveURL(/\/#\/$/);
+  await expect(page.getByRole('heading', { name: '协作有共识， 资金有路径。' })).toBeVisible();
 });
 
 test('private workspace routes require authentication instead of local fallback data', async ({ page }) => {
@@ -49,7 +74,7 @@ test('private workspace routes require authentication instead of local fallback 
     await expect(page.getByText('本地演示数据')).toHaveCount(0);
   }
 
-  await page.getByRole('button', { name: '登录 AgentMesh' }).click();
+  await page.getByRole('button', { name: `登录 ${BRAND.platform.name}` }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
 });
 
@@ -57,10 +82,48 @@ test('sidebar exposes one formal workspace status and no data-mode switch', asyn
   await page.goto('/#/agents');
   const sidebar = page.locator('#app-sidebar');
 
+  await expect(sidebar.locator('img[src="/pinme-mesh-mark.svg"]')).toBeVisible();
+  await expect(page.locator('link[rel="icon"]')).toHaveAttribute('href', '/pinme-mesh-mark.svg');
+  await expect(page.locator('link[rel="manifest"]')).toHaveAttribute('href', '/site.webmanifest');
   await expect(sidebar.getByText('PUBLIC DIRECTORY · READ ONLY')).toBeVisible();
   await expect(sidebar.getByRole('button', { name: /连接真实工作区|连接正式工作区/ })).toBeVisible();
   await expect(sidebar.getByRole('button', { name: '演示沙盒' })).toHaveCount(0);
   await expect(sidebar.getByRole('button', { name: '真实工作区', exact: true })).toHaveCount(0);
+});
+
+test('desktop sidebar collapses to an accessible icon rail and remembers the choice', async ({ page }) => {
+  await page.goto('/#/agents');
+  const sidebar = page.locator('#app-sidebar');
+
+  await expect(sidebar).toHaveAttribute('data-collapsed', 'false');
+  await page.getByRole('button', { name: '收起侧边栏' }).click();
+  await expect(sidebar).toHaveAttribute('data-collapsed', 'true');
+  await expect(sidebar).toHaveCSS('width', '76px');
+  await expect(sidebar.getByRole('link', { name: 'Agent 市场' })).toBeVisible();
+  await expect(sidebar.getByText('Agent 市场', { exact: true })).toBeHidden();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(page.viewportSize()?.width);
+
+  await page.reload();
+  await expect(sidebar).toHaveAttribute('data-collapsed', 'true');
+  await expect(sidebar).toHaveCSS('width', '76px');
+  await page.getByRole('button', { name: '展开侧边栏' }).click();
+  await expect(sidebar).toHaveAttribute('data-collapsed', 'false');
+  await expect(sidebar.getByText('Agent 市场', { exact: true })).toBeVisible();
+});
+
+test('verified ENS primary name replaces the current wallet label', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.sessionStorage.setItem('agentmesh:e2e-auth', 'true');
+    window.sessionStorage.setItem('agentmesh:e2e-ens', 'true');
+  });
+  await page.goto('/#/dashboard');
+
+  await expect(page.locator('#app-sidebar').getByText('vitalik.eth', { exact: true })).toBeVisible();
+  const walletButton = page.getByRole('button', { name: '身份钱包 vitalik.eth' });
+  await expect(walletButton).toBeVisible();
+  await walletButton.click();
+  await expect(page.getByText('ENS', { exact: true })).toBeVisible();
+  await expect(page.getByText('0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045', { exact: true })).toBeVisible();
 });
 
 test('mobile navigation remains accessible with the authentication gate', async ({ page }) => {
@@ -298,6 +361,15 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
     id: 'DSP-DAO-E2E', missionId: mission.id, openedBy: 'requester-e2e', reason: '交付物与任务规格存在明显偏差，需要委员会核验并决定是否退款。',
     evidence: [], status: 'reviewing', resolution: null, freezeTxHash: null, resolutionTxHash: null,
     createdAt: '2026-08-23T00:00:00.000Z', resolvedAt: null,
+    evidenceSnapshot: {
+      missionId: mission.id, acceptanceCriteriaSha256: `sha256:${'a'.repeat(64)}`, workflowVersion: 1, schedulerRevision: 2,
+      eventWatermark: 'EVT-DAO-E2E', frozenBy: 'requester-e2e', frozenAt: '2026-08-23T00:00:00.000Z',
+      deliverables: [{
+        deliverableId: 'DEL-DAO-E2E', stageId: 'STAGE-implement', attemptNo: 1, agentId: 'agent-one', name: '冻结工程包',
+        rootCid: 'bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm', manifestSha256: `sha256:${'b'.repeat(64)}`,
+        versionNo: 1, verificationStatus: 'verified', createdAt: '2026-08-22T23:50:00.000Z',
+      }],
+    },
   };
   const proposal = {
     id: 'PROP-DAO-E2E', disputeId: dispute.id, proposerId: profile.id, status: 'active', weightMode: 'one_person_one_vote',
@@ -316,6 +388,13 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
     executionReady: false,
     currentUser: { eligible: true, canVote: true, hasVoted: false, choice: null as string | null },
   };
+  let dossierPublications: Array<Record<string, unknown>> = [];
+  const dossierData = () => ({
+    dossier: { schema: 'agentmesh.review-dossier.v1', kind: 'dispute', subjectId: dispute.id, missionId: mission.id, snapshot: dispute.evidenceSnapshot },
+    canonicalJson: JSON.stringify({ schema: 'agentmesh.review-dossier.v1', kind: 'dispute', subjectId: dispute.id }),
+    payloadSha256: `sha256:${'c'.repeat(64)}`, publications: dossierPublications,
+    publishGuide: { command: `pinme upload ./agentmesh-review-${dispute.id}`, note: '使用自己的 PinMe 登录态上传。' },
+  });
   const token = [
     Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
     Buffer.from(JSON.stringify({ sub: profile.id, email: profile.email, iat: 1_787_200_000, exp: 1_818_736_000 })).toString('base64url'),
@@ -338,6 +417,16 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
     if (path === '/api/disputes') return fulfill([dispute]);
     if (path === `/api/disputes/${dispute.id}/actions`) return fulfill([]);
     if (path === `/api/disputes/${dispute.id}/governance`) return fulfill(governance);
+    if (path === `/api/missions/${mission.id}/evidence/dossier`) return fulfill(dossierData());
+    if (path === `/api/missions/${mission.id}/evidence/publications` && request.method() === 'POST') {
+      const input = request.postDataJSON() as { rootCid: string; payloadSha256: string };
+      const publication = {
+        id: 'EVID-DAO-E2E', missionId: mission.id, kind: 'dispute_dossier', subjectId: dispute.id,
+        payloadSha256: input.payloadSha256, rootCid: input.rootCid, publishedBy: profile.id, createdAt: '2026-08-23T00:06:00.000Z',
+      };
+      dossierPublications = [publication];
+      return fulfill(publication, 201);
+    }
     if (path === `/api/disputes/${dispute.id}/votes` && request.method() === 'POST') {
       const input = request.postDataJSON() as { choice: string; reason: string };
       governance = {
@@ -356,7 +445,7 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
   });
 
   await page.goto('/#/arbitration');
-  await page.getByRole('button', { name: '登录 AgentMesh' }).click();
+  await page.getByRole('button', { name: `登录 ${BRAND.platform.name}` }).click();
   const loginDialog = page.getByRole('dialog').last();
   await loginDialog.getByLabel('邮箱').fill(profile.email);
   await loginDialog.getByLabel('密码').fill('browser-test-password');
@@ -367,6 +456,14 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
   await expect(page.getByRole('heading', { name: '一次上诉' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '不可变轮次历史' })).toBeVisible();
   await expect(page.getByText('one_person_one_vote.v1').first()).toBeVisible();
+  await expect(page.getByRole('heading', { name: '案件冻结证据' })).toBeVisible();
+  await expect(page.getByText(/pinme export bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm/)).toBeVisible();
+  await page.getByRole('button', { name: '下载不可变审核档案' }).click();
+  await expect(page.getByText(`sha256:${'c'.repeat(64)}`)).toBeVisible();
+  const dossierCid = 'bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsy';
+  await page.getByPlaceholder('上传后粘贴审核档案根 CID').fill(dossierCid);
+  await page.getByRole('button', { name: '登记档案 CID' }).click();
+  await expect(page.getByText(`已登记：ipfs://${dossierCid}`)).toBeVisible();
   await page.getByLabel('投票理由').fill('依据任务规格和交付证据，支持争议方退款并终止任务。');
   await page.getByRole('button', { name: /确认投票/ }).click();
   await expect(page.getByText('退款提案通过').first()).toBeVisible();
@@ -436,7 +533,7 @@ test('requester invitations and developer acceptance unlock funding only after e
   });
 
   await page.goto(`/#/missions/${mission.id}/workflow`);
-  await page.getByRole('button', { name: '登录 AgentMesh' }).click();
+  await page.getByRole('button', { name: `登录 ${BRAND.platform.name}` }).click();
   const loginDialog = page.getByRole('dialog').last();
   await loginDialog.getByLabel('邮箱').fill(profile.email);
   await loginDialog.getByLabel('密码').fill('browser-test-password');
@@ -451,8 +548,40 @@ test('requester invitations and developer acceptance unlock funding only after e
   await developerRoleButton.click();
   await expect(developerRoleButton).toHaveAttribute('aria-pressed', 'true');
   await expect(page).toHaveURL(/#\/developer$/);
+
+  await page.goto('/#/developer/agents');
+  const fleetScene = page.getByRole('region', { name: 'Agent 数字孪生指挥舱' });
+  await expect(fleetScene).toBeVisible({ timeout: 15_000 });
+  await expect(fleetScene.getByText('0 执行')).toBeVisible();
+  await expect(fleetScene.getByText('3 待接单')).toBeVisible();
+  await fleetScene.getByRole('button', { name: 'Agent 2，等待接单' }).click();
+  await expect(fleetScene.locator('aside').getByRole('heading', { name: 'Agent 2' })).toBeVisible();
+  await expect(fleetScene.locator('aside').getByText(mission.title)).toBeVisible();
+  await expect(fleetScene.locator('aside').getByText('0%', { exact: true })).toBeVisible();
+  const tourButton = fleetScene.getByRole('button', { name: /演示巡航|停止巡航/ });
+  await tourButton.click();
+  await expect(tourButton).toHaveAttribute('aria-pressed', 'true');
+  await tourButton.click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(fleetScene).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  await page.setViewportSize({ width: 1280, height: 720 });
+
   await page.goto('/#/developer/jobs');
   await expect(page.getByRole('heading', { name: '接单记录' })).toBeVisible();
+  const previousViewport = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const jobStatusBadge = page.locator('table tbody [data-status-badge]').first();
+  await expect(jobStatusBadge).toHaveText('待接单');
+  const badgeLayout = await jobStatusBadge.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return { width: rect.width, height: rect.height, whiteSpace: getComputedStyle(element).whiteSpace };
+  });
+  expect(badgeLayout.whiteSpace).toBe('nowrap');
+  expect(badgeLayout.width).toBeGreaterThan(badgeLayout.height);
+  expect(badgeLayout.height).toBeLessThanOrEqual(32);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  if (previousViewport) await page.setViewportSize(previousViewport);
   for (let remaining = 3; remaining > 0; remaining -= 1) {
     await expect(page.getByText(`${remaining} 个待响应`)).toBeVisible();
     await page.getByRole('button', { name: '接受' }).first().click();

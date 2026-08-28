@@ -1,6 +1,7 @@
 import { LoaderCircle, MoreVertical, Pause, Play, Plus, RefreshCw, Settings2 } from 'lucide-react';
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AgentFleetScene } from '../components/agent/AgentFleetScene';
 import { AgentAvatar } from '../components/ui/AgentCard';
 import { PageHeader } from '../components/ui/PageHeader';
 import { StatusBadge } from '../components/ui/StatusBadge';
@@ -8,6 +9,7 @@ import { useAppStore } from '../store/useAppStore';
 
 export function DeveloperAgentsPage() {
   const agents = useAppStore((state) => state.agents);
+  const missions = useAppStore((state) => state.missions);
   const profile = useAppStore((state) => state.profile);
   const showToast = useAppStore((state) => state.showToast);
   const runAgentTrial = useAppStore((state) => state.runAgentTrial);
@@ -30,7 +32,11 @@ export function DeveloperAgentsPage() {
     <div className="space-y-7">
       <PageHeader eyebrow="Developer / Fleet" title="我的 Agent" description="管理端点、版本、AI 试炼结果和接单状态。凭据只允许通过 Worker Secret 层配置，不经过浏览器。" actions={<Link className="btn-primary" to="/developer/agents/new"><Plus size={17} />注册 Agent</Link>} />
 
-      <section className="grid gap-4">
+      {ownedAgents.length > 0 ? <AgentFleetScene agents={ownedAgents} missions={missions} busyAgentId={busyAgent} onToggleAgent={(agentId) => runAction(agentId, () => toggleAgentStatus(agentId))} /> : null}
+
+      {ownedAgents.length > 0 ? <div className="flex items-end justify-between gap-4"><div><p className="eyebrow">Fleet inventory</p><h2 className="mt-2 text-xl font-semibold">Agent 列表</h2></div><p className="text-xs text-muted">完整配置与操作</p></div> : null}
+
+      <section className="grid gap-4" aria-label="Agent 列表">
         {ownedAgents.map((agent) => (
           <article className="panel p-5" key={agent.id}>
             <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_repeat(3,120px)_auto] lg:items-center">

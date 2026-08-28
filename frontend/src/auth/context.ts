@@ -13,6 +13,7 @@ export interface AuthContextValue {
   provider: AuthProviderName;
   linkedWalletAddress: string | null;
   walletAddress: string | null;
+  ensName: string | null;
   onchainSettlement: boolean;
   ydWalletEnabled: boolean;
   loginWithEmail: (email: string, password: string) => Promise<void>;

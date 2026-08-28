@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { AgentFeedback, AgentMetricEvent, Dispute, EcosystemProposal, GovernancePowerSnapshot, RewardActivity, RewardClaim, RewardEpoch, YdStakingPosition } from './contracts';
+import type { AgentFeedback, AgentMetricEvent, Deliverable, Dispute, EcosystemProposal, GovernancePowerSnapshot, MissionEvidenceSnapshot, RewardActivity, RewardClaim, RewardEpoch, YdStakingPosition } from './contracts';
 import { D1PlatformStore, type D1Database, type D1Statement } from './store';
 
 class SqliteStatement implements D1Statement {
@@ -99,6 +99,32 @@ function migratedDatabase(): SqliteD1 {
   return new SqliteD1(db);
 }
 
+function ipfsDeliverable(
+  id: string,
+  versionNo: number,
+  rootCid: string,
+  supersedesDeliverableId: string | null,
+  supersedesRootCid: string | null,
+): Deliverable {
+  const manifest = {
+    schema: 'agentmesh.deliverable-manifest.v1' as const,
+    missionId: 'TASK-2026-0809', stageId: null, attemptNo: null, agentId: 'analyst', logicalName: `Review package v${versionNo}`,
+    versionNo, supersedesRootCid, acceptanceCriteriaSha256: `sha256:${'a'.repeat(64)}`,
+    createdAt: `2026-08-27T12:0${versionNo}:00.000Z`, generator: 'test/1',
+    files: [{ path: 'report.json', sha256: `sha256:${'b'.repeat(64)}`, mimeType: 'application/json', byteSize: 42 }],
+  };
+  return {
+    id, missionId: manifest.missionId, stageId: null, attemptNo: null, agentId: 'analyst', name: manifest.logicalName,
+    uri: `ipfs://${rootCid}`, contentHash: `sha256:${String(versionNo).repeat(64)}`,
+    mimeType: 'application/vnd.agentmesh.manifest+json', status: 'submitted', createdAt: manifest.createdAt,
+    ipfsEvidence: {
+      provider: 'pinme_ipfs', rootCid, manifestPath: '/manifest.json', manifestSha256: `sha256:${String(versionNo).repeat(64)}`,
+      manifest, fileCount: 1, totalBytes: 42, visibility: 'public', versionNo, supersedesDeliverableId,
+      scopeKey: 'mission:final', verificationStatus: 'declared', lastVerifiedAt: null, lastVerificationError: null,
+    },
+  };
+}
+
 describe('D1PlatformStore concurrency invariants', () => {
   let database: SqliteD1;
   let store: D1PlatformStore;
@@ -106,6 +132,36 @@ describe('D1PlatformStore concurrency invariants', () => {
   beforeEach(() => {
     database = migratedDatabase();
     store = new D1PlatformStore(database);
+  });
+
+  it('persists an append-only CID version chain, acceptance snapshot and public Agent portfolio', async () => {
+    const firstCid = 'bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm';
+    const secondCid = 'bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsy';
+    const thirdCid = 'bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsa';
+    const first = ipfsDeliverable('DEL-IPFS-1', 1, firstCid, null, null);
+    const second = ipfsDeliverable('DEL-IPFS-2', 2, secondCid, first.id, firstCid);
+    const third = ipfsDeliverable('DEL-IPFS-3', 3, thirdCid, second.id, secondCid);
+    await store.addDeliverable(first);
+    await store.addDeliverable(second);
+    await store.addDeliverable(third);
+    await expect(store.addDeliverable(ipfsDeliverable('DEL-IPFS-CONFLICT', 2, secondCid, first.id, firstCid)))
+      .rejects.toThrow('IPFS_VERSION_CONFLICT');
+    expect((await store.listDeliverables(first.missionId)).filter((item) => item.ipfsEvidence).map((item) => item.ipfsEvidence?.versionNo)).toEqual([1, 2, 3]);
+
+    const snapshot: MissionEvidenceSnapshot = {
+      missionId: first.missionId,
+      deliverables: [first, second, third].map((item) => ({
+        deliverableId: item.id, stageId: null, attemptNo: null, agentId: item.agentId, name: item.name,
+        rootCid: item.ipfsEvidence!.rootCid, manifestSha256: item.ipfsEvidence!.manifestSha256,
+        versionNo: item.ipfsEvidence!.versionNo, verificationStatus: item.ipfsEvidence!.verificationStatus,
+        createdAt: item.createdAt,
+      })),
+      acceptanceCriteriaSha256: `sha256:${'a'.repeat(64)}`, workflowVersion: 1, schedulerRevision: 0,
+      eventWatermark: null, frozenBy: 'demo-requester', frozenAt: '2026-08-27T12:03:00.000Z',
+    };
+    expect((await store.acceptMission(first.missionId, 'demo-requester', null, snapshot))?.applied).toBe(true);
+    expect(await store.getAcceptanceEvidenceSnapshot(first.missionId)).toEqual(snapshot);
+    expect((await store.listAgentCidPortfolio('analyst')).map((item) => item.rootCid)).toEqual([thirdCid, secondCid, firstCid]);
   });
 
   it('persists isolated YD reward, claim, staking and Power-governance ledgers atomically', async () => {

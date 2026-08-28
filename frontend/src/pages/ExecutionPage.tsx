@@ -4,11 +4,26 @@ import { Link, useParams } from 'react-router-dom';
 import { WorkflowExecutionGraph } from '../components/workflow/WorkflowExecutionGraph';
 import { Modal } from '../components/ui/Modal';
 import { StatusBadge } from '../components/ui/StatusBadge';
+import { BRAND } from '../constants/brand';
 import { useMission } from '../hooks/useMission';
 import { api } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
 import { artifactBelongsToCurrentAttempt, missionDeliverableBelongsToCurrentVersion } from '../utils/delivery';
 import { formatPaymentAmount } from '../utils/payments';
+import type { IpfsEvidenceContext } from '../types/domain';
+
+function canonicalManifestJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalManifestJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalManifestJson(record[key])}`).join(',')}}`;
+}
+
+async function canonicalManifestSha256(value: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(canonicalManifestJson(value));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return `sha256:${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
 
 export function ExecutionPage() {
   const { missionId: routeMissionId = '' } = useParams();
@@ -38,7 +53,12 @@ export function ExecutionPage() {
   const [pauseOpen, setPauseOpen] = useState(false);
   const [changeOpen, setChangeOpen] = useState(false);
   const [error, setError] = useState('');
-  const [delivery, setDelivery] = useState({ stageId: '', name: '', uri: '', contentHash: '', mimeType: 'application/json' });
+  const [deliveryMode, setDeliveryMode] = useState<'pinme' | 'legacy'>('pinme');
+  const [evidenceContext, setEvidenceContext] = useState<IpfsEvidenceContext | null>(null);
+  const [delivery, setDelivery] = useState({
+    stageId: '', name: '', uri: '', contentHash: '', mimeType: 'application/json',
+    rootCid: '', manifestSha256: '', manifestJson: '', visibility: 'public' as 'public' | 'encrypted',
+  });
   const [pauseReason, setPauseReason] = useState('');
   const [changeRequest, setChangeRequest] = useState({ targetStageIds: [] as string[], reason: '', acceptanceCriteria: '' });
 
@@ -183,13 +203,66 @@ export function ExecutionPage() {
     setBusy(true);
     setError('');
     try {
-      await submitDeliverable(mission.id, { ...delivery, stageId: delivery.stageId || undefined });
+      if (deliveryMode === 'pinme') {
+        const context = await api.getIpfsEvidenceContext(mission.id, delivery.stageId || undefined);
+        const manifest = JSON.parse(delivery.manifestJson) as IpfsEvidenceContext['manifestTemplate'];
+        const computedManifestSha256 = await canonicalManifestSha256(manifest);
+        if (computedManifestSha256 !== delivery.manifestSha256.trim().toLowerCase()) {
+          throw new Error('Manifest 已变化，请重新计算 canonical SHA-256 后再提交。');
+        }
+        await submitDeliverable(mission.id, {
+          stageId: delivery.stageId || undefined,
+          name: delivery.name,
+          ipfsEvidence: {
+            rootCid: delivery.rootCid,
+            manifestSha256: delivery.manifestSha256,
+            manifest,
+            visibility: delivery.visibility,
+            supersedesDeliverableId: context.supersedesDeliverableId,
+          },
+        });
+      } else {
+        await submitDeliverable(mission.id, {
+          stageId: delivery.stageId || undefined, name: delivery.name, uri: delivery.uri,
+          contentHash: delivery.contentHash, mimeType: delivery.mimeType,
+        });
+      }
       setDeliveryOpen(false);
-      setDelivery({ stageId: '', name: '', uri: '', contentHash: '', mimeType: 'application/json' });
+      setEvidenceContext(null);
+      setDelivery({
+        stageId: '', name: '', uri: '', contentHash: '', mimeType: 'application/json',
+        rootCid: '', manifestSha256: '', manifestJson: '', visibility: 'public',
+      });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : '交付物提交失败。');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const loadManifestTemplate = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const context = await api.getIpfsEvidenceContext(mission.id, delivery.stageId || undefined);
+      setEvidenceContext(context);
+      setDelivery((value) => ({
+        ...value,
+        manifestJson: JSON.stringify({ ...context.manifestTemplate, logicalName: value.name }, null, 2),
+      }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Manifest 模板加载失败。');
+    } finally { setBusy(false); }
+  };
+
+  const calculateManifestHash = async () => {
+    setError('');
+    try {
+      const manifest = JSON.parse(delivery.manifestJson) as unknown;
+      const manifestSha256 = await canonicalManifestSha256(manifest);
+      setDelivery((value) => ({ ...value, manifestSha256 }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Manifest JSON 无法计算 SHA-256。');
     }
   };
 
@@ -240,7 +313,7 @@ export function ExecutionPage() {
           <section className="panel p-5"><h2 className="font-semibold">观测指标</h2><div className="mt-4 grid grid-cols-2 gap-3">{[['活跃执行者', activeAgentLabel], ['聚合状态', mission.currentStage], ['任务进度', `${mission.progress}%`], ['证据事件', String(evidenceCount)]].map(([label, value]) => <div className="rounded-xl bg-canvas p-3" key={label}><p className="text-[10px] text-muted">{label}</p><p className="mt-1 truncate font-mono text-sm font-semibold" title={value}>{value}</p></div>)}</div><div className="mt-4 flex items-center justify-between border-t border-line pt-4 text-xs"><span className="text-muted">执行中预算</span><span className="font-mono font-semibold">{formatPaymentAmount(activeBudget, mission.paymentMethod)}</span></div></section>
           <section className="panel p-5"><div className="flex items-center gap-2"><AlertTriangle size={17} className="text-warning" /><h2 className="font-semibold">System Guardrails</h2></div><div className="mt-4 rounded-xl border border-warning/20 bg-warning/[0.07] p-3"><p className="text-sm font-semibold">{realtimeState === 'live' ? '实时事件流已连接' : realtimeState === 'fallback' ? '自动降级轮询' : '正在建立事件流'}</p><p className="mt-1 text-xs text-muted">优先使用 Worker SSE；断线时自动回退 8 秒轮询，并从 D1 事件与阶段状态恢复。</p></div></section>
           <section className="panel p-5"><div className="flex items-center gap-2"><RotateCcw size={17} /><h2 className="font-semibold">运行版本</h2></div><div className="mt-4 grid grid-cols-2 gap-3"><div className="rounded-xl bg-canvas p-3"><p className="text-[10px] text-muted">调度 revision</p><p className="mt-1 font-mono text-sm font-semibold">{mission.schedulerRevision ?? 0}</p></div><div className="rounded-xl bg-canvas p-3"><p className="text-[10px] text-muted">返工版本</p><p className="mt-1 font-mono text-sm font-semibold">{detail?.changeRequests?.[0]?.version ?? 0}</p></div></div>{detail?.changeRequests?.length ? <ol className="mt-3 space-y-2">{detail.changeRequests.slice(0, 3).map((item) => <li className="rounded-xl border border-line p-3 text-xs" key={item.id}><div className="flex items-center justify-between gap-2"><span className="font-semibold">返工 v{item.version}</span><span className="font-mono text-[9px] text-muted">{item.resetStageIds.length} nodes</span></div><p className="mt-1 line-clamp-2 text-muted">{item.reason}</p></li>)}</ol> : <p className="mt-3 text-xs text-muted">尚无版本化返工记录。</p>}</section>
-          <section className="panel p-5"><div className="flex items-center gap-2"><FileCheck2 size={17} /><h2 className="font-semibold">交付与证据</h2></div>{visibleDeliverables.length ? <div className="mt-4 space-y-2">{visibleDeliverables.slice(-3).reverse().map((item) => <a className="flex items-center justify-between gap-3 rounded-xl border border-line p-3 text-xs transition hover:border-cyan/35" href={item.uri} target="_blank" rel="noreferrer" key={item.id}><span className="min-w-0"><span className="block truncate font-semibold">{item.name}</span><span className="mt-1 block truncate font-mono text-[9px] text-muted">{item.mimeType}</span></span><ExternalLink size={14} className="shrink-0 text-muted" /></a>)}</div> : <ul className="mt-4 space-y-3">{['任务包与阶段分配可追溯', 'Agent 回调使用阶段级签名', '交付物保存 URI 与内容哈希'].map((item) => <li className="flex items-center gap-2 text-xs text-muted" key={item}><CheckCircle2 size={14} className="text-lime" />{item}</li>)}</ul>}{role === 'developer' && visibleDeliverables.length ? <button type="button" className="btn-primary mt-5 w-full" onClick={() => void sendForReview()} disabled={busy || !allStagesDone || mission.status !== 'running'}><Send size={16} />{mission.status === 'review' ? '已提交验收' : allStagesDone ? '提交任务方验收' : '等待全部阶段完成'}</button> : <Link className="btn-primary mt-5 w-full" to={`/missions/${mission.id}/acceptance`}>查看交付与验收</Link>}</section>
+          <section className="panel p-5"><div className="flex items-center gap-2"><FileCheck2 size={17} /><h2 className="font-semibold">交付与证据</h2></div>{visibleDeliverables.length ? <div className="mt-4 space-y-2">{visibleDeliverables.slice(-3).reverse().map((item) => <a className="flex items-center justify-between gap-3 rounded-xl border border-line p-3 text-xs transition hover:border-cyan/35" href={item.uri} target="_blank" rel="noreferrer" key={item.id}><span className="min-w-0"><span className="block truncate font-semibold">{item.name}</span><span className="mt-1 block truncate font-mono text-[9px] text-muted">{item.ipfsEvidence ? `${BRAND.evidence.badgeLabel} · V${item.ipfsEvidence.versionNo} · ${item.ipfsEvidence.verificationStatus}` : item.mimeType}</span></span><ExternalLink size={14} className="shrink-0 text-muted" /></a>)}</div> : <ul className="mt-4 space-y-3">{['任务包与阶段分配可追溯', 'Agent 回调使用阶段级签名', `${BRAND.evidence.compactLabel} CID 可形成不可覆盖版本链`].map((item) => <li className="flex items-center gap-2 text-xs text-muted" key={item}><CheckCircle2 size={14} className="text-lime" />{item}</li>)}</ul>}{role === 'developer' && visibleDeliverables.length ? <button type="button" className="btn-primary mt-5 w-full" onClick={() => void sendForReview()} disabled={busy || !allStagesDone || mission.status !== 'running'}><Send size={16} />{mission.status === 'review' ? '已提交验收' : allStagesDone ? '提交任务方验收' : '等待全部阶段完成'}</button> : <Link className="btn-primary mt-5 w-full" to={`/missions/${mission.id}/acceptance`}>查看交付与验收</Link>}</section>
         </aside>
       </div>
 
@@ -260,12 +333,23 @@ export function ExecutionPage() {
         </form>
       </Modal>
 
-      <Modal open={deliveryOpen} onClose={() => setDeliveryOpen(false)} title="提交可验证交付物" description="平台保存可访问 URI、内容哈希和 MIME 类型；文件本体可位于 IPFS、对象存储或你的 HTTPS 服务。">
+      <Modal open={deliveryOpen} onClose={() => setDeliveryOpen(false)} title="提交可验证交付物" description="推荐先用自己的 PinMe 登录态发布到 IPFS，再把 CID 与 Manifest 登记为不可覆盖版本；AppKey 不会进入本页面。">
         <form onSubmit={saveDeliverable} className="space-y-4">
+          <div className="grid grid-cols-2 gap-2 rounded-xl bg-canvas p-1"><button type="button" className={deliveryMode === 'pinme' ? 'rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white' : 'rounded-lg px-3 py-2 text-xs font-semibold text-muted'} onClick={() => setDeliveryMode('pinme')}>PinMe / IPFS</button><button type="button" className={deliveryMode === 'legacy' ? 'rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white' : 'rounded-lg px-3 py-2 text-xs font-semibold text-muted'} onClick={() => setDeliveryMode('legacy')}>Legacy URI</button></div>
           <label><span className="field-label">所属阶段</span><select className="field" value={delivery.stageId} onChange={(event) => setDelivery((value) => ({ ...value, stageId: event.target.value }))}><option value="">任务级最终交付</option>{deliverableStages.map((stage) => <option value={stage.id} key={stage.id}>{stage.name}</option>)}</select></label>
           <label><span className="field-label">交付名称</span><input className="field" required minLength={2} maxLength={180} value={delivery.name} onChange={(event) => setDelivery((value) => ({ ...value, name: event.target.value }))} placeholder="例如：最终视频 / 研究报告 / 数据包" /></label>
-          <label><span className="field-label">可访问 URI</span><input className="field" required minLength={8} value={delivery.uri} onChange={(event) => setDelivery((value) => ({ ...value, uri: event.target.value }))} placeholder="https://… 或 ipfs://…" /></label>
-          <div className="grid gap-4 sm:grid-cols-2"><label><span className="field-label">内容哈希</span><input className="field font-mono" required minLength={8} value={delivery.contentHash} onChange={(event) => setDelivery((value) => ({ ...value, contentHash: event.target.value }))} placeholder="sha256:…" /></label><label><span className="field-label">MIME 类型</span><input className="field font-mono" required minLength={3} value={delivery.mimeType} onChange={(event) => setDelivery((value) => ({ ...value, mimeType: event.target.value }))} placeholder="video/mp4" /></label></div>
+          {deliveryMode === 'pinme' ? <>
+            <div className="rounded-xl border border-cyan/25 bg-cyan/[0.06] p-4 text-xs leading-6 text-muted"><strong className="text-ink">发布步骤：</strong>加载模板并补齐文件清单 → 把 `manifest.json` 放在交付目录根部 → 运行 <code className="mono-chip">pinme upload ./deliverable</code> → 粘贴 CID 与 canonical Manifest SHA-256。公开 IPFS 不可承诺删除；敏感内容必须先在客户端加密。</div>
+            <button type="button" className="btn-secondary w-full" onClick={() => void loadManifestTemplate()} disabled={busy || delivery.name.length < 2}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <RefreshCw size={16} />}加载当前验收标准与版本模板</button>
+            {evidenceContext ? <div className="grid grid-cols-2 gap-3 text-xs"><div className="rounded-xl bg-canvas p-3"><p className="text-muted">下一版本</p><p className="mt-1 font-mono font-semibold">v{evidenceContext.nextVersionNo}</p></div><div className="rounded-xl bg-canvas p-3"><p className="text-muted">验收标准 hash</p><p className="mt-1 truncate font-mono text-[9px]" title={evidenceContext.acceptanceCriteriaSha256}>{evidenceContext.acceptanceCriteriaSha256}</p></div></div> : null}
+            <label><span className="field-label">Manifest JSON</span><textarea className="field min-h-52 resize-y font-mono text-[10px] leading-5" required value={delivery.manifestJson} onChange={(event) => setDelivery((value) => ({ ...value, manifestJson: event.target.value }))} placeholder="先加载模板，再填写 files 数组并发布目录。" /></label>
+            <label><span className="field-label">PinMe 返回的根 CID</span><input className="field font-mono" required minLength={10} value={delivery.rootCid} onChange={(event) => setDelivery((value) => ({ ...value, rootCid: event.target.value }))} placeholder="bafy…" /></label>
+            <label><span className="field-label">Canonical Manifest SHA-256</span><div className="flex flex-col gap-2 sm:flex-row"><input className="field flex-1 font-mono" required minLength={71} value={delivery.manifestSha256} onChange={(event) => setDelivery((value) => ({ ...value, manifestSha256: event.target.value }))} placeholder="sha256:…" /><button type="button" className="btn-secondary shrink-0" disabled={!delivery.manifestJson.trim()} onClick={() => void calculateManifestHash()}>从 Manifest 计算</button></div></label>
+            <fieldset><legend className="field-label">IPFS 可见性</legend><div className="grid grid-cols-2 gap-3">{(['public', 'encrypted'] as const).map((visibility) => <label className="rounded-xl border border-line p-3 text-xs" key={visibility}><input className="mr-2" type="radio" checked={delivery.visibility === visibility} onChange={() => setDelivery((value) => ({ ...value, visibility }))} />{visibility === 'public' ? '公开内容' : '上传前已加密'}</label>)}</div>{delivery.visibility === 'encrypted' ? <p className="mt-2 rounded-lg bg-warning/10 p-3 text-xs leading-5 text-warning">请把 Manifest 模板中的 <code>encryptionKeyFingerprint</code> 填成密钥的 `sha256:` 指纹；只登记指纹，绝不能粘贴密钥或口令。</p> : null}</fieldset>
+          </> : <>
+            <label><span className="field-label">可访问 URI</span><input className="field" required minLength={8} value={delivery.uri} onChange={(event) => setDelivery((value) => ({ ...value, uri: event.target.value }))} placeholder="https://… 或 ipfs://…" /></label>
+            <div className="grid gap-4 sm:grid-cols-2"><label><span className="field-label">内容哈希</span><input className="field font-mono" required minLength={8} value={delivery.contentHash} onChange={(event) => setDelivery((value) => ({ ...value, contentHash: event.target.value }))} placeholder="sha256:…" /></label><label><span className="field-label">MIME 类型</span><input className="field font-mono" required minLength={3} value={delivery.mimeType} onChange={(event) => setDelivery((value) => ({ ...value, mimeType: event.target.value }))} placeholder="video/mp4" /></label></div>
+          </>}
           <div className="flex justify-end gap-3 pt-2"><button type="button" className="btn-secondary" onClick={() => setDeliveryOpen(false)}>取消</button><button type="submit" className="btn-primary" disabled={busy}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <UploadCloud size={16} />}写入交付证据</button></div>
           {error ? <p className="rounded-xl border border-danger/25 bg-danger/10 p-3 text-sm text-danger" role="alert">{error}</p> : null}
         </form>

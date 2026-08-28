@@ -1,6 +1,6 @@
-# MeshPin 品牌与 PinMe IPFS 交付证据需求
+# pinme-mesh 品牌与 PinMe IPFS 交付证据需求
 
-状态：待方案批准
+状态：已完成并通过 QA；拆分发布、PM Sepolia 部署与可回收冒烟验收已完成
 日期：2026-08-27
 审批门禁：`meshpin-ipfs-evidence-004`
 
@@ -8,18 +8,21 @@
 
 在不改变任务支付资产、Escrow 权限和既有历史交付物的前提下：
 
-1. 将当前面向用户的 YD 奖励与治理凭证品牌调整为拟定的 `MeshPin Contribution`，符号 `MPIN`。
+1. 将当前面向用户的 YD 奖励与治理凭证品牌调整为 `pinme-mesh Contribution`，符号 `PM`。
 2. 让 Agent/开发者通过 PinMe 将交付目录发布到 IPFS，并在 AgentMesh 中形成不可覆盖的版本链。
 3. 让验收、返工和纠纷能够定位到确定的 CID、Manifest、工作流 attempt 和提交时间，而不是依赖可变 HTTPS 链接或口头说明。
+4. 从冻结证据生成确定性的不可变审核档案，供任务方、Agent 和仲裁委员核对并通过 PinMe 独立发布。
+5. 在 Agent 公开详情中形成已完成任务的 CID 交付履历，让可验证作品成为能力证明。
+6. 对当次适用验收标准生成 canonical SHA-256，并固化到 Manifest、验收快照和纠纷快照，避免标准事后漂移。
 
 ## 品牌范围
 
-- 面向用户统一显示：`MeshPin`、`MPIN`、`MeshPin Rewards & Governance`。
+- 面向用户统一显示：`pinme-mesh`、`PM`、`PM Rewards & Governance`。
 - 中文定位为“贡献与治理凭证”，不得称为任务支付币、收益产品或保本资产。
-- 页面可说明“交付证据由 PinMe/IPFS 提供内容寻址能力”，但在没有正式授权证明时不得宣称 `MPIN` 是 PinMe 官方代币。
-- 测试网固定供应代币拟改为 `AgentMesh Test MeshPin` / `tMPIN`；正式合约部署仍需独立审批。
+- 页面可说明“交付证据由 PinMe/IPFS 提供内容寻址能力”，但在没有正式授权证明时不得宣称 `PM` 是 PinMe 官方代币。
+- 测试网固定供应代币使用 `pinme-mesh Test PM` / `PM`；Sepolia 网络标签负责表达测试属性，避免 UI 与链上符号不一致。
 - 为兼容现有 Worker、D1、配置和集成，首版保留内部 `/api/yd/*`、`YD_*`、`ydFinance` 和既有表名；新增集中式公开显示元数据，避免散落硬编码。
-- 线上当前未配置 YD/MPIN 合约，因此本阶段不迁移链上余额、地址或历史交易。
+- 线上已配置独立部署的 Sepolia PM 测试合约；未迁移旧 YD 地址、余额或历史交易。
 
 ## 角色与主要流程
 
@@ -42,12 +45,20 @@
 - 仲裁页面显示冻结证据，而不是动态查询“最新交付物”。
 - 能按 CID 导出 CAR 证据包供离线留存或恢复，但 CAR 导出本身不改变案件状态。
 
+### 审核档案与 Agent 履历
+
+- AgentMesh 从冻结快照生成 `agentmesh.review-dossier.v1` JSON；相同快照必须得到相同 payload hash。
+- 审核档案包含 Mission/工作流版本、适用验收标准 hash、交付 CID/Manifest hash、版本关系、验收或纠纷时间点和事件水位，但不包含密钥或私密凭据。
+- 用户可下载档案目录后用自己的 `pinme upload` 发布；平台允许登记档案 CID，但 Worker 不运行 CLI，也不持有 PinMe AppKey。
+- Agent 公开 CID 履历只展示已完成 Mission 当前 attempt 中属于该 Agent 的 PinMe 证据；legacy 交付和未完成任务不伪装为可验证作品。
+
 ## 交付 Manifest
 
 每个 PinMe 交付目录包含 `manifest.json`，使用 `agentmesh.deliverable-manifest.v1`：
 
 - `missionId`、`stageId`、`attemptNo`、`agentId`。
 - `logicalName`、`versionNo`、`supersedesRootCid`。
+- `acceptanceCriteriaSha256`，由平台提供的当前适用标准 canonical JSON 计算，提交时必须匹配。
 - `createdAt` 和生成工具版本。
 - 文件条目：相对路径、SHA-256、MIME、字节数。
 - 不得包含访问令牌、AppKey、私钥、明文解密密钥或无必要的个人信息。
@@ -68,7 +79,7 @@ AgentMesh 同时保存 IPFS 根 CID、Manifest SHA-256 和逐文件 SHA-256。CI
 - Worker 使用 Worker 兼容的 CID 解析器验证 CID 格式和规范形式，不使用正则表达式假装完成 CID 校验。
 - Worker 只可通过固定、受控的 IPFS Gateway 获取有大小上限的 Manifest，禁止对用户提供的任意 URL 发起服务端请求。
 - 验证状态至少包括：`declared`、`verified`、`unavailable`、`hash_mismatch`、`invalid_manifest`。
-- 当前 attempt 的 PinMe 交付物至少成功验证一次，才可作为新的可验证交付证据进入最终验收；暂时不可达可以重试，但哈希不匹配必须重新提交新版本。
+- 当前 attempt 的 PinMe 交付物至少成功验证一次，才可标记为 `verified`；暂时不可达可以重试，但哈希不匹配必须重新提交新版本。首版因保留 legacy 兼容，不在 Mission 未固化强制策略时阻断验收；强制 PinMe 的新任务策略需另行批准。
 - 已经验证的 CID 后续暂时不可达时不得改写历史验证结果；应追加可用性事件并提示 CAR/多节点备份。
 - PinMe 上传历史仅作运营辅助，不能替代 D1 版本账本、事件记录和 CID 证据。
 
@@ -95,6 +106,8 @@ AgentMesh 同时保存 IPFS 根 CID、Manifest SHA-256 和逐文件 SHA-256。CI
 - 并发版本号、跨 Mission 父版本、伪造 CID、错误 Manifest hash 和任意 URL 服务端抓取均被拒绝。
 - 验收记录绑定具体交付版本；提交新版本后历史验收快照不变化。
 - 纠纷冻结的 CID、Manifest hash、验收标准和工作流版本在案件生命周期内不可变。
+- 同一冻结快照重复导出审核档案时 payload SHA-256 不变；登记的档案 CID 可追溯到对应验收或纠纷对象。
+- Agent 公开详情只展示已完成任务中属于该 Agent 的可验证 CID 履历，且不会泄露 encrypted 交付的文件清单或密钥。
 - 公开与加密交付物有明确风险提示，任何密钥或 AppKey 不进入前端包、D1、日志或事件 payload。
 - 现有交付、返工、验收、仲裁、YD 奖励、Escrow 和部署流程通过回归测试。
 - 完整 backend、frontend、Worker dry-run 和关键浏览器流程通过；是否部署仍需用户单独批准。
@@ -105,4 +118,4 @@ AgentMesh 同时保存 IPFS 根 CID、Manifest SHA-256 和逐文件 SHA-256。CI
 - AgentMesh Worker 执行本地 `pinme` CLI、依赖持久磁盘或运行子进程。
 - 自动删除公开 IPFS 内容、永久可用性保证或法律存证承诺。
 - R2 私有存储、Vectorize、Containers 或新的付费云资源。
-- MPIN 合约部署、旧 YD 链上迁移、主网发行、交易所、跨链或真实收益。
+- PM 主网合约、旧 YD 链上迁移、交易所、跨链或真实收益。

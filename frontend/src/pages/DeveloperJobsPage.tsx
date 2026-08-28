@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { PageHeader } from '../components/ui/PageHeader';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { useAppStore } from '../store/useAppStore';
+import { missionStatusMeta } from '../utils/missionState';
 import { formatPaymentAmount, paymentToken } from '../utils/payments';
 
 export function DeveloperJobsPage() {
@@ -44,19 +45,22 @@ export function DeveloperJobsPage() {
       setBusyOfferId('');
     }
   };
-  const rows = missions.map((mission) => ({
-    id: mission.id,
-    agent: mission.team.map((agentId) => agents.find((agent) => agent.id === agentId)?.name ?? agentId).join(' / ') || '待分配',
-    title: mission.title,
-    status: mission.status === 'completed' ? '已结算' : mission.status === 'cancelled' ? '已退款终止' : mission.status === 'review' ? '待验收' : mission.status === 'paused' ? '已暂停' : mission.status === 'running' ? '执行中' : '匹配中',
-    reward: mission.budget,
-    paymentMethod: mission.paymentMethod,
-    progress: mission.progress,
-    time: mission.createdAt,
-  }));
+  const rows = missions.map((mission) => {
+    const status = missionStatusMeta(mission);
+    return {
+      id: mission.id,
+      agent: mission.team.map((agentId) => agents.find((agent) => agent.id === agentId)?.name ?? agentId).join(' / ') || '待分配',
+      title: mission.title,
+      status: mission.status === 'completed' ? { ...status, label: '已结算' } : status,
+      reward: mission.budget,
+      paymentMethod: mission.paymentMethod,
+      progress: mission.progress,
+      time: mission.createdAt,
+    };
+  });
 
   const exportCsv = () => {
-    const lines = [['任务', 'Agent', '标题', '状态', '预算', '进度', '时间'], ...rows.map((row) => [row.id, row.agent, row.title, row.status, String(row.reward), String(row.progress), row.time])];
+    const lines = [['任务', 'Agent', '标题', '状态', '预算', '进度', '时间'], ...rows.map((row) => [row.id, row.agent, row.title, row.status.label, String(row.reward), String(row.progress), row.time])];
     const csv = lines.map((line) => line.map((cell) => `"${cell.split('"').join('""')}"`).join(',')).join('\n');
     const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a');
@@ -80,7 +84,7 @@ export function DeveloperJobsPage() {
         </article>)}</div>
       </section> : null}
       <section className="panel overflow-hidden">
-        <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="border-b border-line bg-canvas/55 text-[10px] uppercase tracking-[0.1em] text-muted"><tr>{['任务','Agent','状态','预算','进度','时间',''].map((item) => <th className="px-5 py-3 font-semibold" key={item}>{item}</th>)}</tr></thead><tbody className="divide-y divide-line">{rows.map((row) => <tr className="hover:bg-canvas/40" key={row.id}><td className="px-5 py-4"><p className="font-mono text-[10px] text-muted">{row.id}</p><p className="mt-1 font-semibold">{row.title}</p></td><td className="px-5 py-4">{row.agent}</td><td className="px-5 py-4"><StatusBadge tone={row.status === '已结算' ? 'success' : row.status === '匹配中' ? 'warning' : 'info'}>{row.status}</StatusBadge></td><td className="px-5 py-4 font-mono font-semibold">{formatPaymentAmount(row.reward, row.paymentMethod)} {paymentToken(row.paymentMethod)}</td><td className="px-5 py-4 font-mono text-xs">{row.progress}%</td><td className="whitespace-nowrap px-5 py-4 text-xs text-muted">{row.time}</td><td className="px-5 py-4"><a href={`#/missions/${row.id}/execution`} className="inline-flex rounded-lg p-2 text-muted hover:bg-canvas hover:text-ink" aria-label={`查看 ${row.id}`}><ExternalLink size={16} /></a></td></tr>)}</tbody></table></div>
+        <div className="overflow-x-auto"><table className="w-full min-w-[880px] text-left text-sm"><thead className="border-b border-line bg-canvas/55 text-[10px] uppercase tracking-[0.1em] text-muted"><tr>{['任务','Agent','状态','预算','进度','时间',''].map((item) => <th className="whitespace-nowrap px-5 py-3 font-semibold" key={item}>{item}</th>)}</tr></thead><tbody className="divide-y divide-line">{rows.map((row) => <tr className="hover:bg-canvas/40" key={row.id}><td className="px-5 py-4"><p className="font-mono text-[10px] text-muted">{row.id}</p><p className="mt-1 font-semibold">{row.title}</p></td><td className="px-5 py-4">{row.agent}</td><td className="whitespace-nowrap px-5 py-4"><StatusBadge tone={row.status.tone}>{row.status.label}</StatusBadge></td><td className="whitespace-nowrap px-5 py-4 font-mono font-semibold">{formatPaymentAmount(row.reward, row.paymentMethod)} {paymentToken(row.paymentMethod)}</td><td className="whitespace-nowrap px-5 py-4 font-mono text-xs">{row.progress}%</td><td className="whitespace-nowrap px-5 py-4 text-xs text-muted">{row.time}</td><td className="px-5 py-4"><a href={`#/missions/${row.id}/execution`} className="inline-flex rounded-lg p-2 text-muted hover:bg-canvas hover:text-ink" aria-label={`查看 ${row.id}`}><ExternalLink size={16} /></a></td></tr>)}</tbody></table></div>
         <div className="flex items-center gap-2 border-t border-line px-5 py-4 text-xs text-muted"><BriefcaseBusiness size={14} />共 {rows.length} 条记录</div>
       </section>
     </div>

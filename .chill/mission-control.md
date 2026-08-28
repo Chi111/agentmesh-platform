@@ -50,14 +50,14 @@ Resume:
 ## Current
 
 Mission Control
-Status: waiting-approval
-Active command: /chill-ai start specs/008-meshpin-ipfs-evidence
+Status: completed
+Active command: /chill-ai finish specs/008-meshpin-ipfs-evidence
 Feature: specs/008-meshpin-ipfs-evidence
-Task: T1
-Agent: planner waiting
-Gate: meshpin-ipfs-evidence-004
-Next safe action: review the MeshPin/MPIN and PinMe IPFS evidence plan; implementation remains paused
-Resume: /chill-ai approve meshpin-ipfs-evidence-004 option 1
+Task: T12 + deployment follow-up
+Agent: implementation completed
+Gate: none
+Next safe action: observe the deployed Sepolia test release; require a new gate for mainnet or extra infrastructure
+Resume: no pending workflow action
 
 Latest Feature:
-MeshPin/MPIN branding and PinMe IPFS deliverable evidence specs are ready on `codex/meshpin-ipfs-evidence`. The recommended plan uses uploader-owned PinMe CLI authentication, canonical CID + Manifest version chains, immutable acceptance/dispute snapshots and legacy compatibility. No implementation or deployment has started. The separate `platform-infrastructure-002` gate remains pending and unapproved.
+pinme-mesh/PM branding and PinMe IPFS deliverable evidence are implemented and split-deployed on `codex/meshpin-ipfs-evidence`. D1, Worker, independent PinMe Domain, PM Sepolia contracts, reversible reward/staking smoke and public-RPC cleanup verification are complete. The separate `platform-infrastructure-002` gate remains pending and unapproved.

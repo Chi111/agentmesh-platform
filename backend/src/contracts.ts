@@ -391,6 +391,106 @@ export interface Deliverable {
   mimeType: string;
   status: 'submitted' | 'accepted' | 'rejected';
   createdAt: string;
+  ipfsEvidence?: DeliverableIpfsEvidence | null;
+}
+
+export type IpfsEvidenceVisibility = 'public' | 'encrypted';
+export type IpfsVerificationStatus = 'declared' | 'verified' | 'unavailable' | 'hash_mismatch' | 'invalid_manifest';
+
+export interface DeliverableManifestFile {
+  path: string;
+  sha256: string;
+  mimeType: string;
+  byteSize: number;
+}
+
+export interface DeliverableManifest {
+  schema: 'agentmesh.deliverable-manifest.v1';
+  missionId: string;
+  stageId: string | null;
+  attemptNo: number | null;
+  agentId: string | null;
+  logicalName: string;
+  versionNo: number;
+  supersedesRootCid: string | null;
+  acceptanceCriteriaSha256: string;
+  encryptionKeyFingerprint?: string | null;
+  createdAt: string;
+  generator: string;
+  files: DeliverableManifestFile[];
+}
+
+export interface DeliverableIpfsEvidence {
+  provider: 'pinme_ipfs';
+  rootCid: string;
+  manifestPath: '/manifest.json';
+  manifestSha256: string;
+  manifest: DeliverableManifest;
+  fileCount: number;
+  totalBytes: number;
+  visibility: IpfsEvidenceVisibility;
+  versionNo: number;
+  supersedesDeliverableId: string | null;
+  scopeKey: string;
+  verificationStatus: IpfsVerificationStatus;
+  lastVerifiedAt: string | null;
+  lastVerificationError: string | null;
+}
+
+export interface FrozenDeliverableEvidence {
+  deliverableId: string;
+  stageId: string | null;
+  attemptNo: number | null;
+  agentId: string | null;
+  name: string;
+  rootCid: string | null;
+  manifestSha256: string | null;
+  versionNo: number | null;
+  verificationStatus: IpfsVerificationStatus | 'legacy';
+  createdAt: string;
+}
+
+export interface MissionEvidenceSnapshot {
+  missionId: string;
+  deliverables: FrozenDeliverableEvidence[];
+  acceptanceCriteriaSha256: string;
+  workflowVersion: number;
+  schedulerRevision: number;
+  eventWatermark: string | null;
+  frozenBy: string;
+  frozenAt: string;
+}
+
+export interface EvidencePublication {
+  id: string;
+  missionId: string;
+  kind: 'acceptance_dossier' | 'dispute_dossier';
+  subjectId: string;
+  payloadSha256: string;
+  rootCid: string;
+  publishedBy: string;
+  createdAt: string;
+}
+
+export interface ReviewDossier {
+  schema: 'agentmesh.review-dossier.v1';
+  kind: 'acceptance' | 'dispute';
+  subjectId: string;
+  missionId: string;
+  snapshot: MissionEvidenceSnapshot;
+}
+
+export interface AgentCidPortfolioItem {
+  missionId: string;
+  missionTitle: string;
+  deliverableId: string;
+  name: string;
+  rootCid: string;
+  manifestSha256: string;
+  versionNo: number;
+  visibility: IpfsEvidenceVisibility;
+  verificationStatus: IpfsVerificationStatus;
+  completedAt: string;
 }
 
 export interface Escrow {
@@ -443,6 +543,7 @@ export interface Dispute {
   resolutionTxHash: string | null;
   createdAt: string;
   resolvedAt: string | null;
+  evidenceSnapshot?: MissionEvidenceSnapshot | null;
 }
 
 export type ArbitrationMemberStatus = 'active' | 'inactive';
@@ -1046,7 +1147,7 @@ export interface PlatformStore {
   listWorkflowCheckpoints(missionId: string, limit?: number): Promise<WorkflowCheckpoint[]>;
   listDirtyMissionControls(limit?: number): Promise<Array<{ missionId: string; schedulerRevision: number }>>;
   markMissionCheckpointClean(missionId: string, schedulerRevision: number, actorId: string | null, reconciledAt: string): Promise<boolean>;
-  acceptMission(id: string, actorId: string, releaseTxHash: string | null): Promise<AcceptanceResult | null>;
+  acceptMission(id: string, actorId: string, releaseTxHash: string | null, evidenceSnapshot?: MissionEvidenceSnapshot): Promise<AcceptanceResult | null>;
   listStages(missionId: string): Promise<WorkflowStage[]>;
   listEdges(missionId: string): Promise<WorkflowEdge[]>;
   recordWorkflowTransition(checkpoint: WorkflowTransitionCheckpoint): Promise<{ applied: boolean; checkpoint: WorkflowTransitionCheckpoint }>;
@@ -1094,6 +1195,17 @@ export interface PlatformStore {
   listEvents(missionId: string): Promise<ExecutionEvent[]>;
   addDeliverable(deliverable: Deliverable): Promise<Deliverable>;
   listDeliverables(missionId: string): Promise<Deliverable[]>;
+  updateDeliverableIpfsVerification(
+    missionId: string,
+    deliverableId: string,
+    status: IpfsVerificationStatus,
+    verifiedAt: string,
+    error: string | null,
+  ): Promise<Deliverable | null>;
+  getAcceptanceEvidenceSnapshot(missionId: string): Promise<MissionEvidenceSnapshot | null>;
+  recordEvidencePublication(publication: EvidencePublication): Promise<EvidencePublication>;
+  listEvidencePublications(missionId: string): Promise<EvidencePublication[]>;
+  listAgentCidPortfolio(agentId: string, limit?: number): Promise<AgentCidPortfolioItem[]>;
 
   getEscrow(missionId: string): Promise<Escrow | null>;
   getWalletAccount(userId: string, limit?: number): Promise<WalletAccount>;

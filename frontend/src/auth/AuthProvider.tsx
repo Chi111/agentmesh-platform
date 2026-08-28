@@ -1,5 +1,6 @@
 import { type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { useEnsName } from '../hooks/useEnsName';
 import { setApiTokenProvider } from '../services/api';
 import type { UserProfile } from '../types/domain';
 import { AuthContext, type AuthContextValue, type AuthProviderName } from './context';
@@ -26,6 +27,7 @@ function initialAuthValue(provider: AuthProviderName): AuthContextValue {
     provider,
     linkedWalletAddress: null,
     walletAddress: null,
+    ensName: null,
     onchainSettlement: false,
     ydWalletEnabled: false,
     loginWithEmail: initializing,
@@ -52,10 +54,16 @@ const e2eProfile: UserProfile = {
 };
 
 function e2eAuthValue(): AuthContextValue {
+  const ensFixture = window.sessionStorage.getItem('agentmesh:e2e-ens') === 'true';
   return {
     ...initialAuthValue('pinme'),
     status: 'authenticated',
     profile: e2eProfile,
+    ...(ensFixture ? {
+      linkedWalletAddress: '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045',
+      walletAddress: '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045',
+      ensName: 'vitalik.eth',
+    } : {}),
     refreshProfile: async () => e2eProfile,
   };
 }
@@ -68,6 +76,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const controllerHost = useRef<HTMLDivElement>(null);
   const [value, setValue] = useState<AuthContextValue>(() => e2eAuth ? e2eAuthValue() : initialAuthValue(provider));
   const handleChange = useCallback((nextValue: AuthContextValue) => setValue(nextValue), []);
+  const resolvedEnsName = useEnsName(value.walletAddress ?? value.linkedWalletAddress);
+  const ensName = value.ensName ?? resolvedEnsName;
 
   useEffect(() => {
     if (e2eAuth) {
@@ -102,7 +112,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [e2eAuth, handleChange]);
 
   return (
-    <AuthContext.Provider value={value}>
+    <AuthContext.Provider value={{ ...value, ensName }}>
       {children}
       <div ref={controllerHost} style={{ display: 'contents' }} />
     </AuthContext.Provider>

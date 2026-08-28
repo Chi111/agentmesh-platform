@@ -55,6 +55,7 @@ export function FirebaseAuthController({ onChange }: { onChange: (value: AuthCon
     provider: 'pinme',
     linkedWalletAddress: null,
     walletAddress: null,
+    ensName: null,
     onchainSettlement: false,
     ydWalletEnabled: false,
     loginWithEmail: async (email, password) => {

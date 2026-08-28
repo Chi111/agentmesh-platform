@@ -3,12 +3,14 @@ import {
   ArrowRight,
   CheckCircle2,
   Clock3,
+  Download,
   FileSearch,
   Gavel,
   History,
   LoaderCircle,
   Scale,
   ShieldCheck,
+  UploadCloud,
   Users,
   Vote,
   type LucideIcon,
@@ -18,10 +20,10 @@ import { Link } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
 import { Modal } from '../components/ui/Modal';
 import { PageHeader } from '../components/ui/PageHeader';
-import { StatusBadge } from '../components/ui/StatusBadge';
+import { StatusBadge, type StatusTone } from '../components/ui/StatusBadge';
 import { api } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
-import type { ArbitrationProposalStatus, DisputeAction, DisputeGovernance, DisputeVoteChoice } from '../types/domain';
+import type { ArbitrationProposalStatus, DisputeAction, DisputeGovernance, DisputeVoteChoice, ReviewDossierResponse } from '../types/domain';
 import { formatPaymentAmount, isWeb3Payment } from '../utils/payments';
 
 const caseStatusMeta = {
@@ -31,13 +33,13 @@ const caseStatusMeta = {
   rejected: { label: '已驳回', tone: 'neutral' as const },
 };
 
-const proposalStatusMeta: Record<ArbitrationProposalStatus, { label: string; description: string; className: string }> = {
-  active: { label: '投票进行中', description: '委员会成员正在对提案表决', className: 'bg-cyan/15 text-cyan' },
-  succeeded: { label: '退款提案通过', description: '等待管理员执行退款裁决', className: 'bg-lime/20 text-ink' },
-  defeated: { label: '争议被驳回', description: '等待管理员执行解冻裁决', className: 'bg-warning/15 text-warning' },
-  inconclusive: { label: '未形成多数', description: '平票或全部弃权，不授权资金操作', className: 'bg-warning/15 text-warning' },
-  quorum_failed: { label: '未达到法定人数', description: '托管继续冻结，等待后续治理处理', className: 'bg-danger/10 text-danger' },
-  executed: { label: '裁决已执行', description: '提案结果已经写入托管结算', className: 'bg-ink text-white' },
+const proposalStatusMeta: Record<ArbitrationProposalStatus, { label: string; description: string; tone: StatusTone }> = {
+  active: { label: '投票进行中', description: '委员会成员正在对提案表决', tone: 'info' },
+  succeeded: { label: '退款提案通过', description: '等待管理员执行退款裁决', tone: 'success' },
+  defeated: { label: '争议被驳回', description: '等待管理员执行解冻裁决', tone: 'warning' },
+  inconclusive: { label: '未形成多数', description: '平票或全部弃权，不授权资金操作', tone: 'warning' },
+  quorum_failed: { label: '未达到法定人数', description: '托管继续冻结，等待后续治理处理', tone: 'danger' },
+  executed: { label: '裁决已执行', description: '提案结果已经写入托管结算', tone: 'neutral' },
 };
 
 const voteOptions: Array<{ choice: DisputeVoteChoice; title: string; detail: string; activeClass: string }> = [
@@ -88,6 +90,8 @@ export function ArbitrationPage() {
   const [rationale, setRationale] = useState('');
   const [weightMode, setWeightMode] = useState<'one_person_one_vote' | 'power'>('one_person_one_vote');
   const [appealReason, setAppealReason] = useState('');
+  const [evidenceDossier, setEvidenceDossier] = useState<ReviewDossierResponse | null>(null);
+  const [publicationCid, setPublicationCid] = useState('');
 
   const selectedCase = disputes.find((item) => item.id === selectedId) ?? disputes[0] ?? null;
   const selectedMission = useMemo(
@@ -115,8 +119,12 @@ export function ArbitrationPage() {
     if (!selectedCase) {
       setGovernance(null);
       setActions([]);
+      setEvidenceDossier(null);
+      setPublicationCid('');
       return () => { cancelled = true; };
     }
+    setEvidenceDossier(null);
+    setPublicationCid('');
     setLoading(true);
     setError('');
     void Promise.all([
@@ -231,6 +239,34 @@ export function ArbitrationPage() {
     }
   };
 
+  const downloadDisputeDossier = async () => {
+    if (!selectedCase) return;
+    setBusy(true); setError('');
+    try {
+      const dossier = await api.getEvidenceDossier(selectedCase.missionId, 'dispute', selectedCase.id);
+      setEvidenceDossier(dossier);
+      const url = URL.createObjectURL(new Blob([dossier.canonicalJson], { type: 'application/json' }));
+      const anchor = document.createElement('a');
+      anchor.href = url; anchor.download = `agentmesh-dispute-${selectedCase.id}.json`; anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '纠纷审核档案生成失败。'); }
+    finally { setBusy(false); }
+  };
+
+  const registerDisputeDossierCid = async () => {
+    if (!selectedCase || !evidenceDossier || !publicationCid.trim()) return;
+    setBusy(true); setError('');
+    try {
+      await api.registerEvidencePublication(selectedCase.missionId, {
+        kind: 'dispute_dossier', subjectId: selectedCase.id,
+        payloadSha256: evidenceDossier.payloadSha256, rootCid: publicationCid.trim(),
+      });
+      setEvidenceDossier(await api.getEvidenceDossier(selectedCase.missionId, 'dispute', selectedCase.id));
+      setPublicationCid('');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '纠纷审核档案 CID 登记失败。'); }
+    finally { setBusy(false); }
+  };
+
   const participated = proposal ? proposal.supportVotes + proposal.opposeVotes + proposal.abstainVotes : 0;
   const proposalMeta = proposal ? proposalStatusMeta[proposal.status] : null;
 
@@ -274,7 +310,7 @@ export function ArbitrationPage() {
           <section className="mesh-grid rounded-2xl bg-ink p-6 text-white sm:p-7">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div><p className="font-mono text-[10px] uppercase tracking-[.15em] text-white/35">Proposal · {proposal?.id ?? 'not-created'}</p><h2 className="mt-3 max-w-2xl text-xl font-semibold sm:text-2xl">{selectedMission?.title ?? selectedCase.missionId}</h2><p className="mt-3 max-w-3xl text-sm leading-6 text-white/50">{selectedCase.reason}</p></div>
-              {proposalMeta ? <span className={`rounded-full px-3 py-1.5 text-xs font-semibold ${proposalMeta.className}`}>{proposalMeta.label}</span> : <span className="rounded-full bg-warning/15 px-3 py-1.5 text-xs font-semibold text-warning">等待创建提案</span>}
+              {proposalMeta ? <StatusBadge tone={proposalMeta.tone} variant="inverted">{proposalMeta.label}</StatusBadge> : <StatusBadge tone="warning" variant="inverted">等待创建提案</StatusBadge>}
             </div>
             <div className="mt-6 grid gap-3 sm:grid-cols-3">
               <div className="rounded-xl border border-white/10 bg-white/5 p-4"><p className="text-[9px] uppercase tracking-wider text-white/30">Frozen value</p><p className="mt-2 font-mono text-base">{selectedMission ? formatPaymentAmount(selectedMission.budget, selectedMission.paymentMethod) : '—'}</p></div>
@@ -309,7 +345,7 @@ export function ArbitrationPage() {
 
             <section className="mt-5 grid gap-5 xl:grid-cols-2">
               <article className="rounded-2xl border border-line p-5"><div className="flex items-center justify-between"><div className="flex items-center gap-2"><Users size={17} /><h3 className="font-semibold">委员会快照</h3></div><span className="font-mono text-[9px] text-muted">POWER SNAPSHOT</span></div><div className="mt-4 grid gap-2 sm:grid-cols-2">{governance?.electorate.map((elector) => { const vote = governance.votes.find((item) => item.voterId === elector.userId); return <div className="rounded-xl bg-canvas p-3" key={elector.userId}><div className="flex items-center justify-between gap-2"><span className="truncate text-xs font-semibold">{elector.displayName}</span><span className={`size-2 rounded-full ${vote ? 'bg-lime' : 'bg-muted/35'}`} /></div><p className="mt-1 font-mono text-[9px] text-muted">票权 {elector.voteWeight} · Power {elector.powerSnapshot}</p></div>; })}</div></article>
-              <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><History size={17} /><h3 className="font-semibold">公开投票记录</h3></div>{governance?.votes.length ? <div className="mt-4 space-y-3">{governance.votes.map((vote) => <div className="rounded-xl border border-line p-3.5" key={vote.id}><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold">{vote.voterDisplayName}</p><span className="rounded-full bg-canvas px-2 py-1 text-[10px] font-semibold">{voteLabel[vote.choice]}</span></div><p className="mt-2 text-xs leading-5 text-muted">{vote.reason}</p><p className="mt-2 font-mono text-[9px] text-muted/70">{formatDate(vote.createdAt)}</p></div>)}</div> : <p className="mt-5 text-xs text-muted">尚无投票记录。</p>}</article>
+              <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><History size={17} /><h3 className="font-semibold">公开投票记录</h3></div>{governance?.votes.length ? <div className="mt-4 space-y-3">{governance.votes.map((vote) => <div className="rounded-xl border border-line p-3.5" key={vote.id}><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold">{vote.voterDisplayName}</p><StatusBadge tone={vote.choice === 'support_refund' ? 'danger' : vote.choice === 'oppose_refund' ? 'success' : 'neutral'}>{voteLabel[vote.choice]}</StatusBadge></div><p className="mt-2 text-xs leading-5 text-muted">{vote.reason}</p><p className="mt-2 font-mono text-[9px] text-muted/70">{formatDate(vote.createdAt)}</p></div>)}</div> : <p className="mt-5 text-xs text-muted">尚无投票记录。</p>}</article>
             </section>
 
             <section className="mt-5 grid gap-5 xl:grid-cols-2">
@@ -319,8 +355,9 @@ export function ArbitrationPage() {
           </>}
 
           <section className="mt-5 grid gap-5 xl:grid-cols-2">
-            <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><FileSearch size={17} /><h3 className="font-semibold">案件证据</h3></div>{selectedCase.evidence.length ? <ul className="mt-4 space-y-2">{selectedCase.evidence.map((item) => <li key={`${item.label}-${item.uri}`}><a className="flex items-center gap-2 text-xs text-muted hover:text-cyan" href={item.uri} target="_blank" rel="noreferrer"><CheckCircle2 size={14} className="text-cyan" />{item.label}</a></li>)}</ul> : <p className="mt-4 text-xs leading-5 text-muted">没有外部附件；可在关联任务中核对规格、执行事件和交付哈希。</p>}<Link className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-cyan" to={`/missions/${selectedCase.missionId}/acceptance`}>查看任务与交付 <ArrowRight size={13} /></Link></article>
+            <article className="rounded-2xl border border-line p-5"><div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><FileSearch size={17} /><h3 className="font-semibold">案件冻结证据</h3></div>{selectedCase.evidenceSnapshot ? <StatusBadge tone="success">SNAPSHOT</StatusBadge> : <StatusBadge tone="neutral">LEGACY</StatusBadge>}</div>{selectedCase.evidenceSnapshot ? <div className="mt-4 rounded-xl border border-cyan/25 bg-cyan/[0.05] p-4"><p className="font-mono text-[9px] text-muted">CRITERIA {selectedCase.evidenceSnapshot.acceptanceCriteriaSha256}</p><p className="mt-2 text-xs text-muted">Workflow v{selectedCase.evidenceSnapshot.workflowVersion} · Scheduler r{selectedCase.evidenceSnapshot.schedulerRevision} · {selectedCase.evidenceSnapshot.deliverables.length} 个冻结交付版本</p><ol className="mt-3 space-y-2">{selectedCase.evidenceSnapshot.deliverables.map((item) => <li className="rounded-lg bg-white p-3" key={item.deliverableId}><div className="flex items-center justify-between gap-2"><span className="truncate text-xs font-semibold">{item.name}</span><span className="font-mono text-[9px] text-cyan">{item.versionNo ? `v${item.versionNo}` : 'legacy'}</span></div><p className="mt-1 truncate font-mono text-[9px] text-muted" title={item.rootCid ?? undefined}>{item.rootCid ?? item.deliverableId}</p></li>)}</ol><button type="button" className="btn-secondary mt-3 w-full" disabled={busy} onClick={() => void downloadDisputeDossier()}><Download size={14} />下载不可变审核档案</button></div> : null}{selectedCase.evidence.length ? <ul className="mt-4 space-y-2">{selectedCase.evidence.map((item) => <li key={`${item.label}-${item.uri}`}><a className="flex items-center gap-2 text-xs text-muted hover:text-cyan" href={item.uri} target="_blank" rel="noreferrer"><CheckCircle2 size={14} className="text-cyan" />{item.label}</a></li>)}</ul> : <p className="mt-4 text-xs leading-5 text-muted">没有外部附件；冻结快照仍保留当时的 CID、Manifest hash、验收标准与工作流版本。</p>}<Link className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-cyan" to={`/missions/${selectedCase.missionId}/acceptance`}>查看任务与交付 <ArrowRight size={13} /></Link></article>
             <article className="rounded-2xl border border-line p-5"><div className="flex items-center gap-2"><History size={17} /><h3 className="font-semibold">执行轨迹</h3></div>{actions.length ? <ol className="mt-4 space-y-4 border-l border-line pl-4">{actions.map((item) => <li className="relative" key={item.id}><span className="absolute -left-[21px] top-1 size-2 rounded-full bg-cyan" /><p className="text-xs font-semibold">{actionLabel(item.action)}</p><p className="mt-1 font-mono text-[9px] text-muted">{item.actorId} · {formatDate(item.createdAt)}</p>{item.note ? <p className="mt-2 text-xs leading-5 text-muted">{item.note}</p> : null}</li>)}</ol> : <p className="mt-4 text-xs text-muted">尚无治理执行记录。</p>}</article>
+            {selectedCase.evidenceSnapshot ? <article className="rounded-2xl border border-line p-5 xl:col-span-2"><div className="flex items-center gap-2"><Download size={17} /><h3 className="font-semibold">PinMe 离线留存与档案登记</h3></div><p className="mt-2 text-xs leading-5 text-muted">用委员自己的 PinMe 登录态导出冻结 CID 的 CAR；平台不接收 AppKey，也不会因为导出而改变案件。</p><div className="mt-4 space-y-2">{[...new Set(selectedCase.evidenceSnapshot.deliverables.flatMap((item) => item.rootCid ? [item.rootCid] : []))].map((cid) => <code className="block overflow-x-auto rounded-lg bg-ink px-3 py-2 text-[10px] text-white" key={cid}>pinme export {cid}</code>)}</div>{evidenceDossier ? <div className="mt-4 rounded-xl border border-cyan/25 bg-cyan/[0.05] p-4"><p className="break-all font-mono text-[9px] text-muted">DOSSIER {evidenceDossier.payloadSha256}</p><code className="mt-3 block rounded-lg bg-ink px-3 py-2 text-[10px] text-white">{evidenceDossier.publishGuide.command}</code><div className="mt-3 flex flex-col gap-2 sm:flex-row"><input className="field flex-1 font-mono" value={publicationCid} onChange={(event) => setPublicationCid(event.target.value)} placeholder="上传后粘贴审核档案根 CID" /><button type="button" className="btn-primary shrink-0" disabled={busy || !publicationCid.trim()} onClick={() => void registerDisputeDossierCid()}><UploadCloud size={14} />登记档案 CID</button></div>{evidenceDossier.publications.filter((item) => item.kind === 'dispute_dossier' && item.subjectId === selectedCase.id).map((item) => <p className="mt-3 break-all text-xs text-cyan" key={item.id}>已登记：ipfs://{item.rootCid}</p>)}</div> : <p className="mt-4 text-xs text-muted">先在“案件冻结证据”中下载不可变审核档案，再登记你上传后的档案 CID。</p>}</article> : null}
           </section>
         </main>
       </div> : <section className="panel py-16 text-center"><Scale className="mx-auto text-cyan" size={25} /><h2 className="mt-5 text-lg font-semibold">当前没有争议提案</h2><p className="mt-2 text-sm text-muted">从任务验收页发起争议后，冻结状态和治理提案会出现在这里。</p></section>}
