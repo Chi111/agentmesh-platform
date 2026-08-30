@@ -1,0 +1,5 @@
+Live product: https://mesh-pinme.pinme.dev/
+UI captures: 2026-08-30, authenticated demo workspace.
+Current frontend CID used on cover: bafybeihuewiymgcgotoncbiya6hove5qtqgvaakb4dapxmsuyinykuiy5u
+Architecture and product claims: docs/prd.md, docs/meshpin-ipfs-evidence.md, backend/src/worker.ts, backend/src/workflowCompiler.ts.
+Current deck narrative and verified demo facts were retained from docs/pinme-mesh-demo-20260829.pptx.

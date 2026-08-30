@@ -5,3 +5,6 @@ main = "src/worker.ts"
 
 [triggers]
 crons = ["*/1 * * * *"]
+
+[vars]
+IPFS_GATEWAY_BASE = "https://ipfs.io"

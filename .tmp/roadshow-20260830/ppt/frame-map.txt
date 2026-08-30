@@ -1,0 +1,9 @@
+Output slide 1 <- source slide 1; replace image im/biho7el8 with current dashboard; update sh/vax03mlw CID; update sh/gb61w72h date.
+Output slide 2 <- source slide 2; update sh/fypcfqdg date.
+Output slide 3 <- source slide 3; update sh/dgfyls3q date.
+Output slide 4 <- source slide 4; update sh/8ju9gjad date.
+Output slide 5 <- source slide 5; replace image im/8j2x8b6t with current Agent market; update sh/pkr6tgjy date.
+Output slide 6 <- source slide 6; replace image im/tob6lc7u with current 3D Agent workplace; update sh/1k3mhozu date.
+Output slide 7 <- source slide 7; update sh/kfaxcvmx date.
+Output slide 8 <- source slide 8; update sh/pwjqho7u date.
+Output slide 9 <- source slide 9; update sh/vi5s3a98 date.

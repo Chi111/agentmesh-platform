@@ -22,6 +22,7 @@ interface Props {
   canApprove: boolean;
   canRework: boolean;
   canRetry: boolean;
+  canRecoverRunning: boolean;
   busy: boolean;
   onApprove: (gateId: string, feedback: string) => Promise<void>;
   onReject: (gateId: string, feedback: string, reworkNodeIds: string[]) => Promise<void>;
@@ -47,7 +48,7 @@ function blockedIds(stages: WorkflowStage[], edges: WorkflowEdge[]): Set<string>
   return blocked;
 }
 
-export function WorkflowExecutionGraph({ stages, edges, agents, events, deliverables, transitions, canApprove, canRework, canRetry: retryAllowed, busy, onApprove, onReject, onRetry }: Props) {
+export function WorkflowExecutionGraph({ stages, edges, agents, events, deliverables, transitions, canApprove, canRework, canRetry: retryAllowed, canRecoverRunning, busy, onApprove, onReject, onRetry }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState('');
   const [reworkIds, setReworkIds] = useState<string[]>([]);
@@ -104,6 +105,8 @@ export function WorkflowExecutionGraph({ stages, edges, agents, events, delivera
     artifactBelongsToCurrentAttempt(selected, deliverable)
   )) : [];
   const selectedInput = selected?.input ?? {};
+  const canRecover = canRecoverRunning && selected?.nodeType === 'task'
+    && selected.status === 'running' && selectedAgent?.official === true;
   const canRetry = retryAllowed && selected?.nodeType === 'task' && selected.status === 'failed';
   const canDecideGate = canApprove && selected?.nodeType === 'approval' && selected.status === 'running';
   const selectNode = (nextId: string | null) => {
@@ -143,6 +146,7 @@ export function WorkflowExecutionGraph({ stages, edges, agents, events, delivera
           <div className="flex flex-wrap items-center justify-end gap-2">
             <span className="font-mono text-[10px] text-white/45">{selected.progress}% · {blocked.has(selected.id) ? 'blocked' : selected.nodeType === 'approval' && selected.status === 'running' ? 'awaiting approval' : selected.status}</span>
             {canRetry ? <button type="button" className="btn-secondary !min-h-9 !px-3 !text-xs" disabled={busy} onClick={() => void onRetry(selected.id)}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <RotateCcw size={14} />}显式重试此节点</button> : null}
+            {canRecover ? <button type="button" className="btn-secondary !min-h-9 !px-3 !text-xs" disabled={busy} onClick={() => void onRetry(selected.id)}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <RotateCcw size={14} />}恢复卡住的官方节点</button> : null}
             {canDecideGate ? <button type="button" className="btn-signal !min-h-9 !px-3 !text-xs" disabled={busy} onClick={() => void onApprove(selected.id, feedback)}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}批准</button> : null}
             {canDecideGate && canRework ? <button type="button" className="inline-flex min-h-9 items-center gap-2 rounded-xl bg-danger px-3 text-xs font-semibold text-white disabled:opacity-40" disabled={busy || !reworkIds.length || feedback.trim().length < 2} onClick={() => void onReject(selected.id, feedback, reworkIds)}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <XCircle size={14} />}驳回并返工</button> : null}
           </div>

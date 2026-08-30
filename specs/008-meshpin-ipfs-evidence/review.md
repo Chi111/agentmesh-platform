@@ -27,6 +27,6 @@
 
 ## 剩余发布风险
 
-- 未配置 `IPFS_GATEWAY_BASE` 时验证会 fail closed 为 `unavailable`，但证据仍可登记和人工审阅。
+- 默认固定 Gateway 或 `IPFS_GATEWAY_BASE` 覆盖地址不可用时，验证会 fail closed 为 `unavailable`，但证据仍可登记和人工审阅。
 - 公开 IPFS 内容不能保证删除或永久可用；敏感交付必须在上传前由客户端加密。
 - PM 已完成公开品牌、Sepolia 测试合约部署和可回收奖励/锁仓冒烟；主网合约部署或既有链上迁移仍需独立审批。

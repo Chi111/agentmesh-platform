@@ -35,11 +35,38 @@ describe('workflow delivery policy', () => {
     }))).toBe(false);
   });
 
+  it('does not treat a deterministic fallback as a client deliverable', () => {
+    expect(hasMeaningfulStageOutput(stage('implement', {
+      source: 'deterministic-fallback',
+      result: { summary: 'Fallback completed', findings: ['Only proves the runtime path'] },
+    }))).toBe(false);
+  });
+
+  it('requires official model output to contain a client-ready deliverable', () => {
+    expect(hasMeaningfulStageOutput(stage('implement', {
+      source: 'pinme-llm',
+      result: { summary: 'Execution metadata only', findings: ['No finished work'] },
+    }))).toBe(false);
+    expect(hasMeaningfulStageOutput(stage('implement', {
+      source: 'pinme-llm',
+      result: { summary: 'Ready', deliverable: '# Client-ready report' },
+    }))).toBe(true);
+  });
+
   it('requires a non-rejected artifact owned by every implement node', () => {
     const implementation = stage('implement', { summary: 'Implemented', verified: true });
     expect(workflowDeliveryReadiness([implementation], []).code).toBe('ARTIFACT_REQUIRED');
     expect(workflowDeliveryReadiness([implementation], [artifact(implementation.id, 'rejected')]).code).toBe('ARTIFACT_REQUIRED');
     expect(workflowDeliveryReadiness([implementation], [artifact(implementation.id)])).toMatchObject({ ready: true, code: 'READY' });
+  });
+
+  it('does not let raw JSON masquerade as a paid client artifact', () => {
+    const implementation = stage('implement', { summary: 'Implemented', verified: true });
+    const rawJson = { ...artifact(implementation.id), name: 'Agent output', mimeType: 'application/json' };
+    expect(workflowDeliveryReadiness([implementation], [rawJson])).toMatchObject({
+      ready: false,
+      code: 'ARTIFACT_REQUIRED',
+    });
   });
 
   it('does not let an artifact from an older attempt satisfy rework delivery', () => {

@@ -78,6 +78,37 @@ function rawCompilation(missionValue: Mission): string {
   });
 }
 
+function fiveStageCompilation(missionValue: Mission): string {
+  const stages = [
+    ['scope', '目标与受众澄清', 'analyze'],
+    ['strategy', '传播策略设计', 'analyze'],
+    ['draft', '广告文案创作', 'implement'],
+    ['verify', '卖点与事实交叉验证', 'review'],
+    ['delivery', '文案定稿与交付', 'review'],
+  ] as const;
+  return JSON.stringify({
+    objective: missionValue.title,
+    acceptanceCriteria: ['文案覆盖目标受众、核心卖点和行动号召。'],
+    risks: [],
+    nodes: stages.map(([id, name, executionMode], index) => ({
+      id,
+      nodeType: 'task',
+      name,
+      purpose: `${name}并保留可复核证据。`,
+      category: missionValue.category,
+      budget: 1,
+      positionX: 80 + index * 360,
+      positionY: 220,
+      input: {
+        executionMode,
+        inputContract: `${name}所需的上游输入和验收标准`,
+        outputContract: `${name}的结构化结果、验证证据和制品引用`,
+      },
+    })),
+    edges: stages.slice(1).map(([id], index) => ({ source: stages[index][0], target: id })),
+  });
+}
+
 function nodesOverlap(left: WorkflowStage, right: WorkflowStage): boolean {
   return left.positionX < right.positionX + WORKFLOW_LAYOUT_NODE_WIDTH
     && left.positionX + WORKFLOW_LAYOUT_NODE_WIDTH > right.positionX
@@ -141,6 +172,35 @@ describe('LangGraph workflow compiler', () => {
     expectNoNodeOverlap(result.compilation.stages);
     expect(prompts[2]).toContain('repair node');
     expect(result.compilation.spec.compiler).toMatchObject({ engine: 'langgraph', repairAttempts: 1 });
+  });
+
+  it('preserves a valid AI-authored node count outside the complexity baseline', async () => {
+    const target = mission({
+      title: '生成一个广告文案',
+      description: '根据产品卖点和目标受众生成广告文案，并完成事实核验、修改和最终交付。',
+      category: '内容生成',
+    });
+    const responses = [
+      JSON.stringify({
+        complexity: 'simple', score: 2, rationale: 'Focused content task.',
+        workstreams: [{ name: '广告文案创作', purpose: '完成文案创作与验证。', category: '内容生成' }],
+        risks: [], requiresApproval: false, approvalReason: '',
+      }),
+      fiveStageCompilation(target),
+    ];
+    const result = await compileWorkflowWithLangGraph(target, async () => ({ content: responses.shift() }));
+
+    expect(result.source).toBe('langgraph-planner');
+    expect(result.metadata.recommendedTaskCount).toEqual({ min: 2, max: 4 });
+    expect(result.metadata.modelCalls).toBe(2);
+    expect(result.metadata.repairAttempts).toBe(0);
+    expect(result.compilation.stages.map((stage) => stage.name)).toEqual([
+      '目标与受众澄清',
+      '传播策略设计',
+      '广告文案创作',
+      '卖点与事实交叉验证',
+      '文案定稿与交付',
+    ]);
   });
 
   it('uses adaptive fallback without a repair call when the model is unavailable', async () => {

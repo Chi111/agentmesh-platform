@@ -1,5 +1,5 @@
 import { AlertTriangle, ArrowLeft, Bot, CheckCircle2, ExternalLink, FileCheck2, LoaderCircle, Pause, Play, RefreshCw, RotateCcw, Send, UploadCloud, Wrench } from 'lucide-react';
-import { type FormEvent, useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { WorkflowExecutionGraph } from '../components/workflow/WorkflowExecutionGraph';
 import { Modal } from '../components/ui/Modal';
@@ -8,7 +8,7 @@ import { BRAND } from '../constants/brand';
 import { useMission } from '../hooks/useMission';
 import { api } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
-import { artifactBelongsToCurrentAttempt, missionDeliverableBelongsToCurrentVersion } from '../utils/delivery';
+import { artifactBelongsToCurrentAttempt, isClientReadyArtifact, missionDeliverableBelongsToCurrentVersion } from '../utils/delivery';
 import { formatPaymentAmount } from '../utils/payments';
 import type { IpfsEvidenceContext } from '../types/domain';
 
@@ -47,6 +47,8 @@ export function ExecutionPage() {
   const submitForReview = useAppStore((state) => state.submitForReview);
   const showToast = useAppStore((state) => state.showToast);
   const [refreshing, setRefreshing] = useState(false);
+  const [autoDispatching, setAutoDispatching] = useState(false);
+  const lastAutoDispatchSignature = useRef('');
   const [realtimeState, setRealtimeState] = useState<'connecting' | 'live' | 'fallback'>('connecting');
   const [busy, setBusy] = useState(false);
   const [deliveryOpen, setDeliveryOpen] = useState(false);
@@ -114,11 +116,23 @@ export function ExecutionPage() {
   const stageById = new Map(stages.map((stage) => [stage.id, stage]));
   const changeRequests = detail?.changeRequests ?? [];
   const visibleDeliverables = deliverables.filter((deliverable) => {
+    if (!isClientReadyArtifact(deliverable)) return false;
     if (!deliverable.stageId) return missionDeliverableBelongsToCurrentVersion(deliverable, changeRequests);
     const stage = stageById.get(deliverable.stageId);
     return stage ? artifactBelongsToCurrentAttempt(stage, deliverable) : false;
   });
-  const hasRunnableStage = stages.some((stage) => stage.nodeType === 'task' && stage.status === 'queued' && edges.filter((edge) => edge.targetStageId === stage.id).every((edge) => stageById.get(edge.sourceStageId)?.status === 'done'));
+  const runnableStages = stages.filter((stage) => stage.nodeType === 'task' && stage.status === 'queued' && edges.filter((edge) => edge.targetStageId === stage.id).every((edge) => stageById.get(edge.sourceStageId)?.status === 'done'));
+  const hasRunnableStage = runnableStages.length > 0;
+  const recoverableOfficialStages = runningTasks.filter((stage) => {
+    const assignedAgent = agents.find((candidate) => candidate.id === stage.agentId);
+    const updatedAt = Date.parse(stage.updatedAt ?? stage.attemptCreatedAt ?? '');
+    return assignedAgent?.official && Number.isFinite(updatedAt) && Date.now() - updatedAt >= 2 * 60_000;
+  });
+  const autoDispatchSignature = hasRunnableStage
+    ? `ready:${runnableStages.map((stage) => `${stage.id}:${stage.attemptNo}`).sort().join(',')}`
+    : recoverableOfficialStages.length
+      ? `recover:${recoverableOfficialStages.map((stage) => `${stage.id}:${stage.attemptNo}`).sort().join(',')}`
+      : '';
   const allStagesDone = stages.length > 0 && stages.every((stage) => stage.status === 'done');
   const deliverableStages = stages.filter((stage) => stage.nodeType === 'task').filter((stage) => {
     const agent = agents.find((item) => item.id === stage.agentId);
@@ -127,10 +141,26 @@ export function ExecutionPage() {
   const changeTargets = stages.filter((stage) => stage.nodeType === 'task' && (stage.status === 'done' || stage.status === 'failed'));
   const isRequester = profile?.role === 'requester' && (!mission?.requesterId || mission.requesterId === profile.id);
   const isAdmin = profile?.role === 'admin';
+  const canRetryFailedNode = (profile?.role === 'requester' || profile?.role === 'admin')
+    && (!mission?.requesterId || mission.requesterId === profile.id);
   const canPause = mission?.status === 'running' && (isRequester || isAdmin);
   const canEscalatePause = isAdmin && mission?.status === 'paused' && mission.pauseMode === 'requester';
   const canResume = mission?.status === 'paused' && ((mission.pauseMode === 'emergency' && isAdmin) || (mission.pauseMode === 'requester' && isRequester));
-  const canRequestChange = isRequester && (mission?.status === 'paused' || mission?.status === 'review') && changeTargets.length > 0;
+  const canRequestChange = (isRequester || isAdmin)
+    && (!mission?.requesterId || mission.requesterId === profile?.id)
+    && (mission?.status === 'paused' || mission?.status === 'review')
+    && changeTargets.length > 0;
+
+  useEffect(() => {
+    if (!mission || role !== 'requester' || mission.status !== 'running' || busy || autoDispatching || !autoDispatchSignature) return;
+    if (lastAutoDispatchSignature.current === autoDispatchSignature) return;
+    lastAutoDispatchSignature.current = autoDispatchSignature;
+    setAutoDispatching(true);
+    setError('');
+    void dispatchMission(mission.id)
+      .catch((reason) => setError(reason instanceof Error ? reason.message : '自动派发失败，可手动重试。'))
+      .finally(() => setAutoDispatching(false));
+  }, [autoDispatchSignature, autoDispatching, busy, dispatchMission, mission, role]);
 
   if (!mission) {
     return <section className="panel py-16 text-center"><p className="text-sm font-semibold">正在加载任务，或任务不存在</p><Link className="btn-secondary mt-5" to="/missions">返回任务列表</Link></section>;
@@ -289,7 +319,7 @@ export function ExecutionPage() {
           {canPause || canEscalatePause ? <button type="button" className="btn-secondary" onClick={() => setPauseOpen(true)} disabled={busy}><Pause size={16} />{canEscalatePause ? '提升为紧急暂停' : isAdmin ? '紧急暂停' : '暂停任务'}</button> : null}
           {canResume ? <button type="button" className="btn-primary" onClick={() => void runResume()} disabled={busy}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <RotateCcw size={16} />}恢复任务</button> : null}
           {canRequestChange ? <button type="button" className="btn-secondary" onClick={() => setChangeOpen(true)} disabled={busy}><Wrench size={16} />请求返工</button> : null}
-          {role === 'requester' ? <button type="button" className="btn-primary" onClick={() => void runDispatch()} disabled={busy || mission.status !== 'running' || !hasRunnableStage}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <Play size={16} />}派发所有就绪节点</button> : <button type="button" className="btn-primary" onClick={() => setDeliveryOpen(true)} disabled={mission.status === 'paused' || mission.status === 'completed' || mission.status === 'cancelled'}><UploadCloud size={16} />提交交付物</button>}
+          {role === 'requester' ? <button type="button" className="btn-primary" onClick={() => void runDispatch()} disabled={busy || autoDispatching || mission.status !== 'running' || (!hasRunnableStage && recoverableOfficialStages.length === 0)}>{busy || autoDispatching ? <LoaderCircle size={16} className="animate-spin" /> : <Play size={16} />}{autoDispatching ? '自动派发中' : recoverableOfficialStages.length && !hasRunnableStage ? '恢复官方 Agent 调度' : '派发所有就绪节点'}</button> : <Link className="btn-primary" to={`/missions/${mission.id}/acceptance`}><UploadCloud size={16} />查看自动交付</Link>}
           <button type="button" className="btn-secondary" onClick={() => void requestAssistance(mission.id)}><Bot size={16} />申请人工协助</button>
         </div>
       </header>
@@ -307,7 +337,7 @@ export function ExecutionPage() {
       </section>
 
       <div className="grid gap-5 xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <WorkflowExecutionGraph stages={stages} edges={edges} agents={agents} events={events} deliverables={visibleDeliverables} transitions={detail?.transitions ?? []} canApprove={(isRequester || isAdmin) && mission.status !== 'paused'} canRework={isRequester && mission.status !== 'paused'} canRetry={isRequester && mission.status !== 'paused'} busy={busy || mission.status === 'paused'} onApprove={(gateId, feedback) => runGateDecision(gateId, 'approved', feedback)} onReject={(gateId, feedback, reworkIds) => runGateDecision(gateId, 'rejected', feedback, reworkIds)} onRetry={runRetryNode} />
+        <WorkflowExecutionGraph stages={stages} edges={edges} agents={agents} events={events} deliverables={visibleDeliverables} transitions={detail?.transitions ?? []} canApprove={(isRequester || isAdmin) && mission.status !== 'paused'} canRework={(isRequester || isAdmin) && mission.status !== 'paused'} canRetry={canRetryFailedNode && mission.status !== 'paused'} canRecoverRunning={isAdmin && (!mission.requesterId || mission.requesterId === profile?.id) && mission.status !== 'paused'} busy={busy || mission.status === 'paused'} onApprove={(gateId, feedback) => runGateDecision(gateId, 'approved', feedback)} onReject={(gateId, feedback, reworkIds) => runGateDecision(gateId, 'rejected', feedback, reworkIds)} onRetry={runRetryNode} />
 
         <aside className="space-y-4 xl:min-h-0 xl:overflow-y-auto xl:overscroll-contain xl:pr-1 xl:[scrollbar-color:rgba(102,112,120,0.32)_transparent] xl:[scrollbar-width:thin]" aria-label="执行观测与交付信息">
           <section className="panel p-5"><h2 className="font-semibold">观测指标</h2><div className="mt-4 grid grid-cols-2 gap-3">{[['活跃执行者', activeAgentLabel], ['聚合状态', mission.currentStage], ['任务进度', `${mission.progress}%`], ['证据事件', String(evidenceCount)]].map(([label, value]) => <div className="rounded-xl bg-canvas p-3" key={label}><p className="text-[10px] text-muted">{label}</p><p className="mt-1 truncate font-mono text-sm font-semibold" title={value}>{value}</p></div>)}</div><div className="mt-4 flex items-center justify-between border-t border-line pt-4 text-xs"><span className="text-muted">执行中预算</span><span className="font-mono font-semibold">{formatPaymentAmount(activeBudget, mission.paymentMethod)}</span></div></section>
@@ -333,13 +363,13 @@ export function ExecutionPage() {
         </form>
       </Modal>
 
-      <Modal open={deliveryOpen} onClose={() => setDeliveryOpen(false)} title="提交可验证交付物" description="推荐先用自己的 PinMe 登录态发布到 IPFS，再把 CID 与 Manifest 登记为不可覆盖版本；AppKey 不会进入本页面。">
+      <Modal open={deliveryOpen} onClose={() => setDeliveryOpen(false)} title="兼容交付登记" description="仅用于迁移旧版 Agent 产物。新版 Agent 应在回调中直接提交 PinMe CID 与 Manifest；平台内置 Agent 会自动生成成品并发布，不需要人工上传。">
         <form onSubmit={saveDeliverable} className="space-y-4">
           <div className="grid grid-cols-2 gap-2 rounded-xl bg-canvas p-1"><button type="button" className={deliveryMode === 'pinme' ? 'rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white' : 'rounded-lg px-3 py-2 text-xs font-semibold text-muted'} onClick={() => setDeliveryMode('pinme')}>PinMe / IPFS</button><button type="button" className={deliveryMode === 'legacy' ? 'rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white' : 'rounded-lg px-3 py-2 text-xs font-semibold text-muted'} onClick={() => setDeliveryMode('legacy')}>Legacy URI</button></div>
           <label><span className="field-label">所属阶段</span><select className="field" value={delivery.stageId} onChange={(event) => setDelivery((value) => ({ ...value, stageId: event.target.value }))}><option value="">任务级最终交付</option>{deliverableStages.map((stage) => <option value={stage.id} key={stage.id}>{stage.name}</option>)}</select></label>
           <label><span className="field-label">交付名称</span><input className="field" required minLength={2} maxLength={180} value={delivery.name} onChange={(event) => setDelivery((value) => ({ ...value, name: event.target.value }))} placeholder="例如：最终视频 / 研究报告 / 数据包" /></label>
           {deliveryMode === 'pinme' ? <>
-            <div className="rounded-xl border border-cyan/25 bg-cyan/[0.06] p-4 text-xs leading-6 text-muted"><strong className="text-ink">发布步骤：</strong>加载模板并补齐文件清单 → 把 `manifest.json` 放在交付目录根部 → 运行 <code className="mono-chip">pinme upload ./deliverable</code> → 粘贴 CID 与 canonical Manifest SHA-256。公开 IPFS 不可承诺删除；敏感内容必须先在客户端加密。</div>
+            <div className="rounded-xl border border-cyan/25 bg-cyan/[0.06] p-4 text-xs leading-6 text-muted"><strong className="text-ink">旧版迁移：</strong>这里只登记已经由外部 Agent 发布完成的 CID 与 Manifest，不是正常客户交付流程。公开 IPFS 不可承诺删除；敏感内容必须先在 Agent 端加密。</div>
             <button type="button" className="btn-secondary w-full" onClick={() => void loadManifestTemplate()} disabled={busy || delivery.name.length < 2}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <RefreshCw size={16} />}加载当前验收标准与版本模板</button>
             {evidenceContext ? <div className="grid grid-cols-2 gap-3 text-xs"><div className="rounded-xl bg-canvas p-3"><p className="text-muted">下一版本</p><p className="mt-1 font-mono font-semibold">v{evidenceContext.nextVersionNo}</p></div><div className="rounded-xl bg-canvas p-3"><p className="text-muted">验收标准 hash</p><p className="mt-1 truncate font-mono text-[9px]" title={evidenceContext.acceptanceCriteriaSha256}>{evidenceContext.acceptanceCriteriaSha256}</p></div></div> : null}
             <label><span className="field-label">Manifest JSON</span><textarea className="field min-h-52 resize-y font-mono text-[10px] leading-5" required value={delivery.manifestJson} onChange={(event) => setDelivery((value) => ({ ...value, manifestJson: event.target.value }))} placeholder="先加载模板，再填写 files 数组并发布目录。" /></label>

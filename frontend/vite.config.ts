@@ -69,12 +69,20 @@ export default defineConfig({
         codeSplitting: {
           groups: [
             {
+              name: "babylon",
+              test: /node_modules[\\/]@babylonjs[\\/]core[\\/]/,
+              entriesAware: false,
+              includeDependenciesRecursively: false,
+              priority: 20,
+            },
+            {
               name: "vendor",
               test: /node_modules[\\/]/,
               entriesAware: true,
-              includeDependenciesRecursively: false,
+              includeDependenciesRecursively: true,
               minSize: 20 * 1024,
               maxSize: 400 * 1024,
+              priority: 10,
             },
           ],
         },

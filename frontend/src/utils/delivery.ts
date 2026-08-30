@@ -15,7 +15,9 @@ function meaningfulOutput(stage: WorkflowStage): boolean {
   if (stage.nodeType === 'approval') return true;
   const output = stage.output;
   if (!output || output.invalidated === true || objectValue(output.error)) return false;
+  if (output.source === 'deterministic-fallback') return false;
   const result = objectValue(output.result) ?? output;
+  if (output.source === 'pinme-llm' && !hasText(result.deliverable)) return false;
   if (result.completionStatus !== undefined && result.completionStatus !== 'succeeded') return false;
   if (!hasText(result.summary)) return false;
   return hasText(result.deliverable)
@@ -31,6 +33,13 @@ export function artifactBelongsToCurrentAttempt(stage: WorkflowStage, deliverabl
     return deliverable.attemptNo === attemptNo;
   }
   return attemptNo === 1;
+}
+
+export function isClientReadyArtifact(deliverable: Deliverable): boolean {
+  const mimeType = deliverable.mimeType.trim().toLowerCase();
+  return Boolean(deliverable.uri.trim())
+    && mimeType !== 'application/json'
+    && mimeType !== 'application/vnd.agentmesh.manifest+json';
 }
 
 export function missionDeliverableBelongsToCurrentVersion(
@@ -54,7 +63,9 @@ export function deliveryReadiness(stages: WorkflowStage[], deliverables: Deliver
     || (stage.input?.executionMode === undefined && taskStages.length >= 3 && index > 0 && index < taskStages.length - 1)
   ));
   const missingArtifactStages = implementStages.filter((stage) => !deliverables.some((deliverable) => (
-    deliverable.status !== 'rejected' && artifactBelongsToCurrentAttempt(stage, deliverable)
+    deliverable.status !== 'rejected'
+    && artifactBelongsToCurrentAttempt(stage, deliverable)
+    && isClientReadyArtifact(deliverable)
   )));
   const invalidOutputStages = stages.filter((stage) => !meaningfulOutput(stage));
   return {

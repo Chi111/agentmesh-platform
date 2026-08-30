@@ -5,7 +5,7 @@
 - Worker 是平台控制面：鉴权、领域规则、Agent 调度、状态机、证据与结算账本。
 - D1 是事实来源；日期以 ISO-8601 `TEXT` 保存，数组和对象序列化为 JSON `TEXT`。
 - 开发者 Agent 的实际计算运行在独立 HTTPS Endpoint。Worker 派发一个可恢复的阶段任务，并接收阶段级签名回调。迁移 `011` 写入的官方测试 Agent 是明确标记的内置运行时例外，用于让测试网开箱即可验证完整任务流程。
-- 交付文件保存在 IPFS 或外部对象存储；D1 仅保存 URI、内容哈希和 MIME 类型。
+- 交付文件保存在 IPFS 或外部对象存储；D1 仅保存 URI、内容哈希、MIME 类型和版本证据。官方 Agent 的 Analyze 结果只作为工作底稿，Implement 节点可发布阶段制品，无出边的终结节点自动把全部阶段汇总为多文件 PinMe 完整成果包；执行 JSON 只保留为证据。
 - Web2 模式下，`wallet_balances`、`wallet_transactions`、`escrows` 和 `ledger_entries` 组成可审计 CREDIT 测试账本。Web3 模式下，Worker 会验证 Sepolia 回执、目标合约、资产类型、确认数、任务键、金额、发送钱包和链上分账承诺，再推进 D1 状态。
 
 ## pinme-mesh Contribution / PM rewards and governance (Phase 1/2)
@@ -33,11 +33,11 @@ Public responses and UI use `pinme-mesh Contribution / PM`. Legacy `/api/yd/*`, 
 
 - `GET /api/missions/:missionId/evidence/context?stageId=...` returns the current acceptance-criteria hash, next version and Manifest template.
 - `POST /api/missions/:missionId/deliverables` accepts optional structured `ipfsEvidence`; legacy URI submissions remain compatible.
-- `POST /api/missions/:missionId/deliverables/:deliverableId/verify` fetches `/ipfs/:cid/manifest.json` only through the fixed `IPFS_GATEWAY_BASE` HTTPS origin.
+- `POST /api/missions/:missionId/deliverables/:deliverableId/verify` fetches `/ipfs/:cid/manifest.json` only through the fixed HTTPS Gateway (`https://ipfs.io` by default, overridable with `IPFS_GATEWAY_BASE`).
 - `GET /api/missions/:missionId/evidence/dossier` exports a deterministic acceptance or dispute review dossier.
-- `POST /api/missions/:missionId/evidence/publications` records the CID obtained after the user uploads that dossier with their own PinMe login.
+- `POST /api/missions/:missionId/evidence/publications` remains a compatibility endpoint for externally archived review dossiers; dossier JSON is not a client deliverable.
 
-The Worker never runs `pinme` and the frontend never accepts a PinMe AppKey. See [pinme-mesh IPFS Evidence](meshpin-ipfs-evidence.md).
+The Worker never runs the Node CLI. `GET/PUT/DELETE /api/me/integrations/pinme` lets an authenticated user inspect, replace or remove their own encrypted AppKey configuration without ever reading the plaintext back. Built-in delivery publishing prefers the task owner's encrypted credential and may fall back to the optional server-only `PINME_UPLOAD_APP_KEY`; it fails closed when neither exists. See [pinme-mesh IPFS Evidence](meshpin-ipfs-evidence.md).
 
 ## Authentication
 
@@ -65,6 +65,7 @@ Privy 的部署配置、回退逻辑和安全边界见 [`authentication.md`](aut
 | --- | --- | --- |
 | `GET` | `/api/bootstrap` | 当前角色的任务、Agent、通知和开发者摘要 |
 | `GET/PUT` | `/api/me/preferences` | 读取或持久化通知、语言和时区偏好 |
+| `GET/PUT/DELETE` | `/api/me/integrations/pinme` | 查询、加密保存或移除当前用户的 PinMe 自动交付 AppKey；响应永不返回明文 |
 | `GET/POST` | `/api/missions` | 查询或创建任务 |
 | `GET` | `/api/wallet` | 查询当前用户 CREDIT 余额、测试充值状态和最近流水 |
 | `POST` | `/api/wallet/test-topup` | 每 24 小时领取固定 100 CREDIT 测试余额 |
@@ -89,6 +90,7 @@ Privy 的部署配置、回退逻辑和安全边界见 [`authentication.md`](aut
 | `POST` | `/api/agents/:id/invoke` | 登录用户直接调用官方 Agent；需要 Bearer ID Token，按用户和 Agent 独立限流 |
 | `POST` | `/api/agents/:id/trial` | 对 Endpoint 发起随机挑战后评分；挑战失败不能激活 |
 | `POST` | `/api/agents/:id/status` | 已通过试炼且信誉达标的 Agent 上线或暂停 |
+| `POST` | `/api/admin/agents/:id/quality/trial-override` | 管理员以 7.5–10 分人工通过 Trial；写入独立审计证据，不伪造 Endpoint 健康记录 |
 | `GET` | `/api/developer/summary` | 接单数、活跃 Agent、成交额与待结算 |
 | `GET` | `/api/developer/ledger?token=CREDIT&limit=50&cursor=…` | 按 CREDIT / mUSDC / sETH 隔离的逐笔账目、状态汇总、12 周趋势和不透明游标；单页最多 100 条 |
 | `GET` | `/api/disputes` | 当前用户可访问的争议 |
@@ -158,7 +160,7 @@ Agent 注册 API 不接受 `apiKey`、`token`、`secret` 或 `credential` 字段
 
 工作流确认会为每个阶段生成绑定当前 `stageId + agentId` 的 24 小时邀请。只有 Agent 所有者能响应；拒绝、未响应过期或重新编排后，任务方必须重新发送当前工作流邀请。在期限内接受后，该承诺持续有效到工作流被替换或托管开始，避免钱包存入期间出现到期竞态。启动守卫在 Worker 和 D1 两层确认每个阶段都存在 `accepted` 邀请，未满足时返回 `409 OFFERS_NOT_ACCEPTED`，且不得产生 Web2 扣款或链上验证副作用。
 
-官方测试 Agent 由平台运行时直接托管，不存在等待人工开发者响应的环节，因此工作流确认时会生成已接受的邀请。派发仍执行同样的阶段占用、运行记录、终态 CAS、履约统计和交付哈希流程；输出优先来自项目级 PinMe LLM，失败时使用带来源标记的确定性降级结果。它们同时通过 `/api/agents/:id/invoke` 暴露 HTTPS 调用契约：GET 可匿名读取文档，POST 必须登录、限制请求体并按用户与 Agent 限流。第三方 Agent 不获得自动接单或该托管调用能力。
+官方测试 Agent 由平台运行时直接托管，不存在等待人工开发者响应的环节，因此工作流确认时会生成已接受的邀请。派发仍执行同样的阶段占用、运行记录、终态 CAS、履约统计和交付哈希流程；输出优先来自项目级 PinMe LLM，无法形成有效结构化结果时节点失败且不会发布降级占位。Analyze 节点不创建客户 artifact；Implement 节点创建阶段制品；终结节点额外获得所有已完成节点的有界 portfolio，并发布 `deliverable.md + acceptance-report.md + artifact-index.md + workstreams/*.md + index.html + manifest.json`。它们同时通过 `/api/agents/:id/invoke` 暴露 HTTPS 调用契约：GET 可匿名读取文档，POST 必须登录、限制请求体并按用户与 Agent 限流。第三方 Agent 不获得自动接单或该托管调用能力。
 
 Agent 市场质量使用独立的只追加事件账本，不再把旧 `trustScore` 或一次试炼分直接当作长期信誉。正式 `agentmesh.trial.v3` 分别验证结构化执行、错误处理、交付物契约，并为工程 Agent 增加 analyze/implement/review/verification 能力场景；每个场景通过 `X-AgentMesh-Agent-Id`、请求体 `agentId` 和独立 challenge 绑定市场身份。响应若泄露 Worker 凭据或 token 模式，Trial 立即失败并写入严重安全事件。每 15 分钟最多抽取 3 个已通过 Trial 的 active Agent 做受限 HEAD 健康检查，401/403 会判定凭据健康失败。阶段失败、无效制品、已验证制品、成功结算、退款/争议和有效反馈均用稳定 idempotency key 写入一次，重复回调、迟到回调和重复验收不会重复计分。
 
@@ -186,7 +188,7 @@ Agent 市场质量使用独立的只追加事件账本，不再把旧 `trustScor
 - `008_concurrency_integrity.sql`：幂等请求体哈希、回调原子应用标记、活跃争议唯一约束、争议创建时托管状态守卫。
 - `009_remove_demo_data.sql`：清理历史版本写入的展示账户、样例任务和关联记录。
 - `010_market_foundation.sql`：阶段接单邀请、Agent 履约事件、验收期限，以及 Web2 余额触发器修正。
-- `011_official_test_agents.sql`：3 个可运行的官方测试 Agent 及其系统所有者；不写入样例任务或用户工作区数据。
+- `011_official_test_agents.sql`：3 个可运行的官方测试 Agent；不写入样例任务或用户工作区数据。
 - `012_escrow_requester_wallet.sql`：记录托管请求方钱包，强化链上验收与争议归属。
 - `013_reconcile_signed_output_reviews.sql`：把已有签名完成输出的历史运行任务修正到待验收状态。
 - `014_reopen_mastra_fallback_deliveries.sql`：重开受 Mastra 降级交付影响的任务，保留审计证据。
@@ -196,6 +198,7 @@ Agent 市场质量使用独立的只追加事件账本，不再把旧 `trustScor
 - `018_dao_arbitration.sql`：仲裁委员会、Power 预留、提案生命周期、成员快照、不可修改投票和执行审计。
 - `019_yd_rewards_governance.sql`：隔离的 YD 周期奖励、Merkle 分配、锁仓 read model、Power 快照和生态治理。
 - `020_agent_market_quality.sql`：Agent 版本、正式 Trial、Endpoint 健康、只追加质量事件、版本化反馈、信誉读模型与快照。
+- `032_assign_official_agents_to_admin.sql`：将 3 个官方 Agent 的链上收款地址统一为管理员钱包 `0x73325bD3e93d9A12e5D2d5219424DaF0e55F856D`，并按该钱包绑定的管理员 Profile UID 迁移 Web2 所有权、CREDIT 收益和 PM 贡献记录。旧地址已写入不可变 `payoutHash` 的在途 Web3 托管不得释放到旧地址，需先原路退款再按新地址重新托管。
 
 部署 Worker 与数据库的联合修改使用：
 

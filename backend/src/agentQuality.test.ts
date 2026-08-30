@@ -70,6 +70,19 @@ describe('agent quality policy', () => {
     expect(recovered.marketplaceStatus).toBe('listed');
   });
 
+  it('moves a remediated quality suspension into degraded observation before full relisting', () => {
+    const events = [
+      event('manual-trial', 'trial_passed', 75),
+      event('verified-health', 'endpoint_healthy', 96.5),
+      event('invalid-artifact', 'artifact_invalid', 0),
+      event('launch-remediation', 'admin_adjustment', 20),
+    ];
+    const stats = calculateAgentQuality(agent, events, '2026-08-23T01:00:00.000Z', 'suspended');
+    expect(stats.reputation).toBeGreaterThanOrEqual(50);
+    expect(stats.reputation).toBeLessThan(75);
+    expect(stats).toMatchObject({ marketplaceStatus: 'degraded', trialPassed: true, endpointHealthy: true });
+  });
+
   it('applies time decay and confidence thresholds from settled work only', () => {
     const oldFailure = event('old-failure', 'mission_refunded', 0, '2026-04-23T00:00:00.000Z');
     const recent = Array.from({ length: 5 }, (_, index) => event(`success-${index}`, 'mission_settled_success', 100, `2026-08-${String(18 + index).padStart(2, '0')}T00:00:00.000Z`));

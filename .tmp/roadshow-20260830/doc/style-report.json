@@ -1,0 +1,170 @@
+{
+  "input": "/Users/mac/workcode/agentmesh-platform/docs/pinme-mesh-architecture-bluepaper-20260830.docx",
+  "fonts_by_char_count": {
+    "Hiragino Sans GB": 9414
+  },
+  "direct_run_formatting_runs": 526,
+  "direct_paragraph_formatting_paragraphs": 435,
+  "heading_like_paragraphs_not_heading_style": [
+    {
+      "para_index": 2,
+      "text": "LIVE  mesh-pinme.pinme.dev   \u00b7   SEPOLIA TESTNET DEMO",
+      "style": "Normal"
+    },
+    {
+      "para_index": 3,
+      "text": "01 / EXECUTIVE THESIS",
+      "style": "Normal"
+    },
+    {
+      "para_index": 4,
+      "text": "\u4e0d\u662f\u8ba9\u6a21\u578b\u591a\u8bf4\uff0c\u800c\u662f\u8ba9\u590d\u6742\u5de5\u4f5c\u771f\u6b63\u5b8c\u6210",
+      "style": "Normal"
+    },
+    {
+      "para_index": 13,
+      "text": "02 / PROBLEM",
+      "style": "Normal"
+    },
+    {
+      "para_index": 14,
+      "text": "\u4f20\u7edf LLM \u4ea4\u4ed8\u5728\u590d\u6742\u4efb\u52a1\u4e0a\u65ad\u5728\u54ea\u91cc",
+      "style": "Normal"
+    },
+    {
+      "para_index": 24,
+      "text": "03 / PRODUCT LOOP",
+      "style": "Normal"
+    },
+    {
+      "para_index": 25,
+      "text": "\u4e00\u6761\u94fe\u8def\uff1a\u4ece\u590d\u6742\u76ee\u6807\u5230\u53ef\u9a8c\u8bc1\u7ed3\u7b97",
+      "style": "Normal"
+    },
+    {
+      "para_index": 30,
+      "text": "04 / REFERENCE ARCHITECTURE",
+      "style": "Normal"
+    },
+    {
+      "para_index": 31,
+      "text": "\u4e94\u5c42\u67b6\u6784\uff0c\u628a\u80fd\u529b\u548c\u4fe1\u4efb\u8fb9\u754c\u5206\u5f00",
+      "style": "Normal"
+    },
+    {
+      "para_index": 36,
+      "text": "05 / LAYER SPECIFICATION",
+      "style": "Normal"
+    },
+    {
+      "para_index": 37,
+      "text": "\u5f53\u524d\u53ef\u8fd0\u884c\u7684\u7cfb\u7edf\u5206\u5c42",
+      "style": "Normal"
+    },
+    {
+      "para_index": 46,
+      "text": "06 / CONTROL PLANE",
+      "style": "Normal"
+    },
+    {
+      "para_index": 47,
+      "text": "\u5de5\u4f5c\u6d41\u7f16\u8bd1\u5668\u4e0e\u5355\u4e00\u72b6\u6001\u673a",
+      "style": "Normal"
+    },
+    {
+      "para_index": 56,
+      "text": "07 / AGENT RUNTIME",
+      "style": "Normal"
+    },
+    {
+      "para_index": 57,
+      "text": "\u5171\u4eab\u667a\u80fd\u5e95\u5ea7\uff0c\u4e13\u4e1a\u89d2\u8272\u8fd0\u884c\u65f6",
+      "style": "Normal"
+    },
+    {
+      "para_index": 64,
+      "text": "08 / VERIFIABLE DELIVERY",
+      "style": "Normal"
+    },
+    {
+      "para_index": 65,
+      "text": "\u5ba2\u6237\u6536\u5230\u6210\u679c\uff0c\u5e73\u53f0\u4fdd\u5b58\u8bc1\u636e",
+      "style": "Normal"
+    },
+    {
+      "para_index": 75,
+      "text": "09 / SECURITY & TRUST",
+      "style": "Normal"
+    },
+    {
+      "para_index": 76,
+      "text": "\u79d8\u5bc6\u3001\u72b6\u6001\u548c\u516c\u5171\u5185\u5bb9\u5404\u5f52\u5176\u4f4d",
+      "style": "Normal"
+    },
+    {
+      "para_index": 85,
+      "text": "10 / SETTLEMENT & GOVERNANCE",
+      "style": "Normal"
+    }
+  ],
+  "examples": {
+    "direct_paragraph_formatting": [
+      {
+        "para_index": 1,
+        "text": "",
+        "style": "Normal"
+      },
+      {
+        "para_index": 2,
+        "text": "LIVE  mesh-pinme.pinme.dev   \u00b7   SEPOLIA TESTNET DEMO",
+        "style": "Normal"
+      },
+      {
+        "para_index": 3,
+        "text": "01 / EXECUTIVE THESIS",
+        "style": "Normal"
+      },
+      {
+        "para_index": 4,
+        "text": "\u4e0d\u662f\u8ba9\u6a21\u578b\u591a\u8bf4\uff0c\u800c\u662f\u8ba9\u590d\u6742\u5de5\u4f5c\u771f\u6b63\u5b8c\u6210",
+        "style": "Normal"
+      },
+      {
+        "para_index": 5,
+        "text": "pinme-mesh \u628a\u76ee\u6807\u3001\u80fd\u529b\u3001\u8fc7\u7a0b\u3001\u6210\u679c\u8bc1\u636e\u4e0e\u7ed3\u7b97\u653e\u8fdb\u540c\u4e00\u6761\u53ef\u5ba1\u8ba1\u94fe\u8def\u3002",
+        "style": "Normal"
+      }
+    ],
+    "direct_run_formatting": [
+      {
+        "para_index": 2,
+        "run_text": "LIVE  ",
+        "style": "Normal"
+      },
+      {
+        "para_index": 2,
+        "run_text": "   \u00b7   SEPOLIA TESTNET DEMO",
+        "style": "Normal"
+      },
+      {
+        "para_index": 3,
+        "run_text": "01 / EXECUTIVE THESIS",
+        "style": "Normal"
+      },
+      {
+        "para_index": 4,
+        "run_text": "\u4e0d\u662f\u8ba9\u6a21\u578b\u591a\u8bf4\uff0c\u800c\u662f\u8ba9\u590d\u6742\u5de5\u4f5c\u771f\u6b63\u5b8c\u6210",
+        "style": "Normal"
+      },
+      {
+        "para_index": 5,
+        "run_text": "pinme-mesh \u628a\u76ee\u6807\u3001\u80fd\u529b\u3001\u8fc7\u7a0b\u3001\u6210\u679c\u8bc1\u636e\u4e0e\u7ed3\u7b97\u653e\u8fdb\u540c\u4e00\u6761\u53ef\u5ba1\u8ba1\u94fe\u8def\u3002",
+        "style": "Normal"
+      }
+    ]
+  },
+  "notes": [
+    "Direct formatting is not always wrong, but it often causes inconsistent output when templates change.",
+    "Heading-like paragraphs not using Heading styles can break TOC and accessibility."
+  ]
+}

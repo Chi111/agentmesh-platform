@@ -29,7 +29,10 @@ CREATE INDEX IF NOT EXISTS idx_workflow_edges_mission_target
   ON workflow_edges(mission_id, target_stage_id);
 
 -- Preserve historical linear execution by connecting each stage to its next
--- greater position. New workflows write explicit edges instead.
+-- greater position. Only backfill an entirely edge-less, still-editable
+-- workflow: PinMe replays this file, and adding "missing" positional edges to
+-- a newer explicit DAG would both change its semantics and trip the escrow
+-- workflow lock after funding.
 INSERT OR IGNORE INTO workflow_edges (id, mission_id, source_stage_id, target_stage_id, created_at)
 SELECT
   'EDGE-MIGRATED-' || lower(hex(randomblob(12))),
@@ -49,8 +52,11 @@ JOIN workflow_stages target
 WHERE NOT EXISTS (
   SELECT 1 FROM workflow_edges existing
   WHERE existing.mission_id = source.mission_id
-    AND existing.source_stage_id = source.id
-    AND existing.target_stage_id = target.id
+)
+AND NOT EXISTS (
+  SELECT 1 FROM escrows
+  WHERE escrows.mission_id = source.mission_id
+    AND escrows.status <> 'pending'
 );
 
 CREATE TABLE IF NOT EXISTS workflow_dispatch_outbox (

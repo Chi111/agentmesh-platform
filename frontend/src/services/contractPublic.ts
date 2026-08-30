@@ -1,6 +1,7 @@
 import {
   createPublicClient,
   defineChain,
+  fallback,
   formatUnits,
   http,
   isAddress,
@@ -35,10 +36,20 @@ const releasedEvent = parseAbiItem(
 const refundedEvent = parseAbiItem(
   'event EscrowRefunded(bytes32 indexed missionKey, address indexed requester, address indexed asset, uint256 amount)',
 );
+const activityEvents = [depositedEvent, frozenEvent, unfrozenEvent, releasedEvent, refundedEvent] as const;
 
 const chainId = Number(import.meta.env.VITE_BASE_CHAIN_ID ?? 11_155_111);
 const chainName = import.meta.env.VITE_BASE_CHAIN_NAME?.trim() || 'Sepolia';
 const rpcUrl = import.meta.env.VITE_BASE_RPC_URL?.trim() || 'https://ethereum-sepolia-rpc.publicnode.com';
+const configuredRpcFallbackUrls = (import.meta.env.VITE_BASE_RPC_FALLBACK_URLS ?? '')
+  .split(',')
+  .map((url) => url.trim())
+  .filter(Boolean);
+const rpcUrls = [...new Set([
+  rpcUrl,
+  ...configuredRpcFallbackUrls,
+  ...(chainId === 11_155_111 ? ['https://11155111.rpc.thirdweb.com'] : []),
+])];
 const rawEscrowAddress = import.meta.env.VITE_ESCROW_CONTRACT_ADDRESS?.trim() || '';
 const rawTokenAddress = (import.meta.env.VITE_MUSDC_ADDRESS ?? import.meta.env.VITE_USDC_ADDRESS)?.trim() || '';
 const deploymentBlock = BigInt(import.meta.env.VITE_ESCROW_DEPLOYMENT_BLOCK ?? 11_541_034);
@@ -50,11 +61,19 @@ const chain = defineChain({
   id: chainId,
   name: chainName,
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-  rpcUrls: { default: { http: [rpcUrl] } },
+  rpcUrls: { default: { http: rpcUrls } },
 });
 
-const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
+const publicClient = createPublicClient({
+  chain,
+  transport: fallback(
+    rpcUrls.map((url) => http(url, { retryCount: 0, timeout: 6_000 })),
+    { retryCount: 0 },
+  ),
+});
 const explorerBaseUrl = chainId === 11_155_111 ? 'https://sepolia.etherscan.io' : 'https://etherscan.io';
+const activityBlockRange = 10_000n;
+const activityReorgLookback = 12n;
 
 export const publicContractConfig = {
   chainId,
@@ -98,12 +117,90 @@ export interface ContractPublicSnapshot {
   totalEscrows: number;
   states: Record<ContractEscrowState, number>;
   recentActivity: ContractActivity[];
+  activityAvailable: boolean;
   syncedAt: string;
 }
+
+interface ActivityCache {
+  blockNumber: bigint;
+  activity: ContractActivity[];
+}
+
+let activityCache: ActivityCache | null = null;
 
 function activityPosition(left: ContractActivity, right: ContractActivity) {
   if (left.blockNumber !== right.blockNumber) return left.blockNumber < right.blockNumber ? -1 : 1;
   return left.logIndex - right.logIndex;
+}
+
+async function readContractActivity(toBlock: bigint): Promise<ContractActivity[]> {
+  if (toBlock < deploymentBlock) return [];
+
+  let fromBlock = deploymentBlock;
+  let retainedActivity: ContractActivity[] = [];
+  if (activityCache && activityCache.blockNumber >= deploymentBlock && activityCache.blockNumber <= toBlock) {
+    fromBlock = activityCache.blockNumber >= deploymentBlock + activityReorgLookback
+      ? activityCache.blockNumber - activityReorgLookback + 1n
+      : deploymentBlock;
+    retainedActivity = activityCache.activity.filter((item) => item.blockNumber < fromBlock);
+  }
+
+  const freshActivity: ContractActivity[] = [];
+  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += activityBlockRange) {
+    const chunkEnd = chunkStart + activityBlockRange - 1n < toBlock
+      ? chunkStart + activityBlockRange - 1n
+      : toBlock;
+    const logs = await publicClient.getLogs({
+      address: escrowAddress!,
+      events: activityEvents,
+      fromBlock: chunkStart,
+      toBlock: chunkEnd,
+      strict: true,
+    });
+
+    freshActivity.push(...logs.map((log): ContractActivity => {
+      const common = {
+        missionKey: log.args.missionKey,
+        blockNumber: log.blockNumber,
+        logIndex: log.logIndex,
+        transactionHash: log.transactionHash,
+      };
+      switch (log.eventName) {
+        case 'EscrowDeposited':
+          return {
+            ...common,
+            kind: 'deposited',
+            actor: log.args.requester,
+            asset: log.args.asset === zeroAddress ? null : log.args.asset,
+            amount: log.args.amount,
+          };
+        case 'EscrowFrozen':
+          return { ...common, kind: 'frozen', actor: log.args.actor, asset: null, amount: null };
+        case 'EscrowUnfrozen':
+          return { ...common, kind: 'unfrozen', actor: log.args.arbiter, asset: null, amount: null };
+        case 'EscrowReleased':
+          return {
+            ...common,
+            kind: 'released',
+            actor: log.args.requester,
+            asset: log.args.asset === zeroAddress ? null : log.args.asset,
+            amount: log.args.amount,
+          };
+        case 'EscrowRefunded':
+          return {
+            ...common,
+            kind: 'refunded',
+            actor: log.args.requester,
+            asset: log.args.asset === zeroAddress ? null : log.args.asset,
+            amount: log.args.amount,
+          };
+      }
+    }));
+  }
+
+  const activity = [...retainedActivity, ...freshActivity].sort(activityPosition);
+  activityCache = { blockNumber: toBlock, activity };
+  return activity;
 }
 
 export async function readContractPublicSnapshot(): Promise<ContractPublicSnapshot> {
@@ -119,69 +216,22 @@ export async function readContractPublicSnapshot(): Promise<ContractPublicSnapsh
     publicClient.getBalance({ address: escrowAddress }),
   ]);
 
-  const [tokenSymbol, tokenDecimals, contractTokenBalance, depositLogs, frozenLogs, unfrozenLogs, releasedLogs, refundedLogs] = await Promise.all([
+  const [tokenSymbol, tokenDecimals, contractTokenBalance, activityResult] = await Promise.all([
     publicClient.readContract({ address: tokenAddress, abi: tokenAbi, functionName: 'symbol' }).catch(() => 'mUSDC'),
     publicClient.readContract({ address: tokenAddress, abi: tokenAbi, functionName: 'decimals' }).catch(() => 6),
     publicClient.readContract({ address: tokenAddress, abi: tokenAbi, functionName: 'balanceOf', args: [escrowAddress] }),
-    publicClient.getLogs({ address: escrowAddress, event: depositedEvent, fromBlock: deploymentBlock, toBlock: blockNumber, strict: true }),
-    publicClient.getLogs({ address: escrowAddress, event: frozenEvent, fromBlock: deploymentBlock, toBlock: blockNumber, strict: true }),
-    publicClient.getLogs({ address: escrowAddress, event: unfrozenEvent, fromBlock: deploymentBlock, toBlock: blockNumber, strict: true }),
-    publicClient.getLogs({ address: escrowAddress, event: releasedEvent, fromBlock: deploymentBlock, toBlock: blockNumber, strict: true }),
-    publicClient.getLogs({ address: escrowAddress, event: refundedEvent, fromBlock: deploymentBlock, toBlock: blockNumber, strict: true }),
+    readContractActivity(blockNumber)
+      .then((activity) => ({ activity, available: true }))
+      .catch((activityError) => {
+        console.warn(
+          '[contract-public] Activity index unavailable; core contract state remains usable.',
+          activityError instanceof Error ? activityError.message : activityError,
+        );
+        return { activity: [] as ContractActivity[], available: false };
+      }),
   ]);
-
-  const deposits: ContractActivity[] = depositLogs.map((log) => ({
-    kind: 'deposited',
-    missionKey: log.args.missionKey,
-    actor: log.args.requester,
-    asset: log.args.asset === zeroAddress ? null : log.args.asset,
-    amount: log.args.amount,
-    blockNumber: log.blockNumber,
-    logIndex: log.logIndex,
-    transactionHash: log.transactionHash,
-  }));
-  const freezes: ContractActivity[] = frozenLogs.map((log) => ({
-    kind: 'frozen',
-    missionKey: log.args.missionKey,
-    actor: log.args.actor,
-    asset: null,
-    amount: null,
-    blockNumber: log.blockNumber,
-    logIndex: log.logIndex,
-    transactionHash: log.transactionHash,
-  }));
-  const unfreezes: ContractActivity[] = unfrozenLogs.map((log) => ({
-    kind: 'unfrozen',
-    missionKey: log.args.missionKey,
-    actor: log.args.arbiter,
-    asset: null,
-    amount: null,
-    blockNumber: log.blockNumber,
-    logIndex: log.logIndex,
-    transactionHash: log.transactionHash,
-  }));
-  const releases: ContractActivity[] = releasedLogs.map((log) => ({
-    kind: 'released',
-    missionKey: log.args.missionKey,
-    actor: log.args.requester,
-    asset: log.args.asset === zeroAddress ? null : log.args.asset,
-    amount: log.args.amount,
-    blockNumber: log.blockNumber,
-    logIndex: log.logIndex,
-    transactionHash: log.transactionHash,
-  }));
-  const refunds: ContractActivity[] = refundedLogs.map((log) => ({
-    kind: 'refunded',
-    missionKey: log.args.missionKey,
-    actor: log.args.requester,
-    asset: log.args.asset === zeroAddress ? null : log.args.asset,
-    amount: log.args.amount,
-    blockNumber: log.blockNumber,
-    logIndex: log.logIndex,
-    transactionHash: log.transactionHash,
-  }));
-
-  const activity = [...deposits, ...freezes, ...unfreezes, ...releases, ...refunds].sort(activityPosition);
+  const activity = activityResult.activity;
+  const deposits = activity.filter((item) => item.kind === 'deposited');
   const stateByMission = new Map<string, ContractEscrowState>();
   for (const item of activity) {
     const state = item.kind === 'deposited' || item.kind === 'unfrozen'
@@ -218,6 +268,7 @@ export async function readContractPublicSnapshot(): Promise<ContractPublicSnapsh
     totalEscrows: deposits.length,
     states,
     recentActivity: [...activity].reverse().slice(0, 8),
+    activityAvailable: activityResult.available,
     syncedAt: new Date().toISOString(),
   };
 }

@@ -63,6 +63,7 @@ import type {
   RewardEpochComputeResult,
   StageOffer,
   UserContext,
+  UserPinmeCredentialRecord,
   UserPreferences,
   WalletAccount,
   WalletTransaction,
@@ -1061,8 +1062,13 @@ export class D1PlatformStore implements PlatformStore {
     const normalizedEmail = identity.email?.trim().toLocaleLowerCase() || null;
     const normalizedWallet = identity.walletAddress?.trim().toLocaleLowerCase() || null;
     const linked = await this.db.prepare(
-      'SELECT profile_id FROM auth_identities WHERE provider = ? AND subject = ?',
+      'SELECT profile_id, wallet_address FROM auth_identities WHERE provider = ? AND subject = ?',
     ).bind(identity.provider, identity.subject).first<Row>();
+    const previousIdentityWallet = text(linked?.wallet_address).trim().toLocaleLowerCase() || null;
+    const replaceWithVerifiedWallet = Boolean(identity.walletAddressAuthoritative && normalizedWallet);
+    const clearPreviousIdentityWallet = Boolean(
+      identity.walletAddressAuthoritative && !normalizedWallet && previousIdentityWallet,
+    );
 
     const [byEmail, byWallet] = await Promise.all([
       normalizedEmail
@@ -1089,9 +1095,22 @@ export class D1PlatformStore implements PlatformStore {
         ON CONFLICT(id) DO UPDATE SET
           email = COALESCE(profiles.email, excluded.email),
           display_name = CASE WHEN profiles.display_name IN (${defaultUserNamePlaceholders}) AND excluded.display_name <> '' THEN excluded.display_name ELSE profiles.display_name END,
-          wallet_address = COALESCE(profiles.wallet_address, excluded.wallet_address),
+          wallet_address = CASE
+            WHEN ? = 1 THEN excluded.wallet_address
+            WHEN ? = 1 AND lower(COALESCE(profiles.wallet_address, '')) = ? THEN NULL
+            ELSE COALESCE(profiles.wallet_address, excluded.wallet_address)
+          END,
           updated_at = datetime('now')
-      `).bind(profileId, normalizedEmail, identity.displayName, normalizedWallet, ...BRAND.platform.defaultUserNames).run();
+      `).bind(
+        profileId,
+        normalizedEmail,
+        identity.displayName,
+        normalizedWallet,
+        ...BRAND.platform.defaultUserNames,
+        replaceWithVerifiedWallet ? 1 : 0,
+        clearPreviousIdentityWallet ? 1 : 0,
+        previousIdentityWallet,
+      ).run();
     } catch (error) {
       const raced = normalizedWallet
         ? await this.db.prepare('SELECT id FROM profiles WHERE lower(wallet_address) = ? LIMIT 1').bind(normalizedWallet).first<Row>()
@@ -1108,9 +1127,16 @@ export class D1PlatformStore implements PlatformStore {
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(provider, subject) DO UPDATE SET
         email = COALESCE(excluded.email, auth_identities.email),
-        wallet_address = COALESCE(excluded.wallet_address, auth_identities.wallet_address),
+        wallet_address = CASE WHEN ? = 1 THEN excluded.wallet_address ELSE COALESCE(excluded.wallet_address, auth_identities.wallet_address) END,
         last_seen_at = datetime('now')
-    `).bind(identity.provider, identity.subject, profileId, normalizedEmail, normalizedWallet).run();
+    `).bind(
+      identity.provider,
+      identity.subject,
+      profileId,
+      normalizedEmail,
+      normalizedWallet,
+      identity.walletAddressAuthoritative ? 1 : 0,
+    ).run();
 
     const profile = await this.getProfile(profileId);
     if (!profile) throw new Error('Profile could not be created');
@@ -1184,13 +1210,14 @@ export class D1PlatformStore implements PlatformStore {
     return agent;
   }
 
-  async updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs = 1800): Promise<Agent | null> {
+  async updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs: number | null = 1800): Promise<Agent | null> {
     const updatedAt = new Date().toISOString();
+    const normalizedResponseTimeMs = responseTimeMs === null ? null : Math.max(1, Math.round(responseTimeMs));
     const results = await this.db.batch([
       this.db.prepare(`
-        UPDATE agents SET trust_score = ?, status = ?, response_time_ms = ?, updated_at = ?
+        UPDATE agents SET trust_score = ?, status = ?, response_time_ms = COALESCE(?, response_time_ms), updated_at = ?
         WHERE id = ?
-      `).bind(score, status, Math.max(1, Math.round(responseTimeMs)), updatedAt, id),
+      `).bind(score, status, normalizedResponseTimeMs, updatedAt, id),
       refreshAgentPerformance(this.db, id, updatedAt),
     ]);
     return this.getAgent(id);
@@ -2476,7 +2503,7 @@ export class D1PlatformStore implements PlatformStore {
   async listPendingDispatches(limit: number, now: string): Promise<DispatchOutboxItem[]> {
     await this.db.prepare(`
       UPDATE workflow_dispatch_outbox SET status = 'pending', next_attempt_at = ?, updated_at = ?
-      WHERE status = 'processing' AND julianday(updated_at) <= julianday(?, '-2 minutes')
+      WHERE status = 'processing' AND julianday(updated_at) <= julianday(?, '-5 minutes')
         AND NOT EXISTS (
           SELECT 1 FROM mission_runtime_controls c
           WHERE c.mission_id = workflow_dispatch_outbox.mission_id AND c.paused_at IS NOT NULL
@@ -3797,6 +3824,45 @@ export class D1PlatformStore implements PlatformStore {
       preferences.updatedAt,
     ).run();
     return this.getUserPreferences(userId);
+  }
+
+  async getUserPinmeCredential(userId: string): Promise<UserPinmeCredentialRecord | null> {
+    const row = await this.db.prepare(`
+      SELECT user_id, address_hint, ciphertext, iv, updated_at
+      FROM user_pinme_credentials
+      WHERE user_id = ?
+    `).bind(userId).first<Row>();
+    return row ? {
+      userId: text(row.user_id),
+      addressHint: text(row.address_hint),
+      ciphertext: text(row.ciphertext),
+      iv: text(row.iv),
+      updatedAt: text(row.updated_at),
+    } : null;
+  }
+
+  async saveUserPinmeCredential(credential: UserPinmeCredentialRecord): Promise<UserPinmeCredentialRecord> {
+    await this.db.prepare(`
+      INSERT INTO user_pinme_credentials (user_id, address_hint, ciphertext, iv, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        address_hint = excluded.address_hint,
+        ciphertext = excluded.ciphertext,
+        iv = excluded.iv,
+        updated_at = excluded.updated_at
+    `).bind(
+      credential.userId,
+      credential.addressHint,
+      credential.ciphertext,
+      credential.iv,
+      credential.updatedAt,
+    ).run();
+    return credential;
+  }
+
+  async deleteUserPinmeCredential(userId: string): Promise<boolean> {
+    const result = await this.db.prepare('DELETE FROM user_pinme_credentials WHERE user_id = ?').bind(userId).run();
+    return result.meta.changes > 0;
   }
 
   async listAdminUsers(limit: number): Promise<AdminUser[]> {

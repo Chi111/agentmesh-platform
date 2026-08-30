@@ -1,0 +1,11 @@
+No intentional structural deviation from the source deck.
+
+Evidence substitutions
+- Slide 1 uses the live 2026-08-30 task-party dashboard.
+- Slide 5 uses the live 2026-08-30 Agent market with Evidence Scout, Strategy Analyst, and Delivery Writer.
+- Slide 6 uses a system-level capture of the live WebGL 3D workplace because DOM/browser screenshot capture returned a black canvas.
+
+Known inherited layout condition
+- The source cover contains a decorative ellipse that intentionally bleeds beyond the slide canvas. If a boundary checker reports it, compare with the source before treating it as a defect.
+- Final `slides_test.py` reports only slide 1; the unchanged source deck reports the same slide 1 overflow. Visual inspection confirms it is the inherited decorative background ellipse, not clipped content.
+- Template-plan validation and final template-fidelity validation both pass with zero issues.

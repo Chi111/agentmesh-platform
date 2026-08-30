@@ -62,6 +62,7 @@ import type {
   RewardEpochComputeResult,
   StageOffer,
   UserContext,
+  UserPinmeCredentialRecord,
   UserPreferences,
   WalletAccount,
   WalletTransaction,
@@ -146,6 +147,7 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly governanceExecutionQueue = new Map<string, GovernanceExecutionItem>();
   readonly notifications = new Map<string, Notification[]>();
   readonly preferences = new Map<string, UserPreferences>();
+  readonly userPinmeCredentials = new Map<string, UserPinmeCredentialRecord>();
   readonly adminActions: AdminAction[] = [];
   readonly ledgerEntries: LedgerEntry[] = [];
   readonly ledgerExportJobs = new Map<string, LedgerExportJob & {
@@ -166,6 +168,7 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly testTopupClaims = new Map<string, string>();
   readonly idempotency = new Map<string, { method: string; path: string; requestHash: string; result: IdempotentResult | null }>();
   readonly identities = new Map<string, string>();
+  readonly identityWallets = new Map<string, string>();
   readonly rateLimits = new Map<string, { windowStart: number; count: number }>();
   readonly agentDispatches = new Map<string, AgentDispatch & {
     attemptNo: number;
@@ -224,6 +227,7 @@ export class MemoryPlatformStore implements PlatformStore {
     const identityKey = `${identity.provider}:${identity.subject}`;
     const normalizedEmail = identity.email?.toLocaleLowerCase();
     const normalizedWallet = identity.walletAddress?.toLocaleLowerCase();
+    const previousIdentityWallet = this.identityWallets.get(identityKey);
     const emailProfile = normalizedEmail
       ? [...this.profiles.values()].find((profile) => profile.email?.toLocaleLowerCase() === normalizedEmail)
       : undefined;
@@ -236,13 +240,24 @@ export class MemoryPlatformStore implements PlatformStore {
     this.identities.set(identityKey, profileId);
     const existing = this.profiles.get(profileId);
     if (existing) {
+      const synchronizedWallet = identity.walletAddressAuthoritative
+        ? normalizedWallet ?? (
+          previousIdentityWallet && existing.walletAddress?.toLocaleLowerCase() === previousIdentityWallet
+            ? undefined
+            : existing.walletAddress
+        )
+        : existing.walletAddress ?? normalizedWallet;
       const updated = {
         ...existing,
         email: existing.email ?? normalizedEmail,
-        walletAddress: existing.walletAddress ?? normalizedWallet,
+        walletAddress: synchronizedWallet,
         displayName: isDefaultPlatformUserName(existing.displayName) ? identity.displayName : existing.displayName,
       };
       this.profiles.set(profileId, updated);
+      if (identity.walletAddressAuthoritative) {
+        if (normalizedWallet) this.identityWallets.set(identityKey, normalizedWallet);
+        else this.identityWallets.delete(identityKey);
+      }
       return copy(updated);
     }
     const profile: UserContext = {
@@ -253,6 +268,7 @@ export class MemoryPlatformStore implements PlatformStore {
       role: 'requester',
     };
     this.profiles.set(profileId, profile);
+    if (identity.walletAddressAuthoritative && normalizedWallet) this.identityWallets.set(identityKey, normalizedWallet);
     return copy(profile);
   }
 
@@ -293,13 +309,19 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(agent);
   }
 
-  async updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs = 1800): Promise<Agent | null> {
+  async updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs: number | null = 1800): Promise<Agent | null> {
     const agent = this.agents.get(id);
     if (!agent) return null;
     const outcomes = [...this.agentPerformance.values()].filter((item) => item.agentId === id);
     const completed = outcomes.filter((item) => item.outcome === 'done').length;
     const prior = Math.max(0.8, Math.min(0.99, score / 10));
-    const updated = { ...agent, trustScore: score, successRate: Number((100 * ((prior * 5 + completed) / (5 + outcomes.length))).toFixed(1)), status, responseTime: `${(Math.max(1, responseTimeMs) / 1000).toFixed(1)}s` };
+    const updated = {
+      ...agent,
+      trustScore: score,
+      successRate: Number((100 * ((prior * 5 + completed) / (5 + outcomes.length))).toFixed(1)),
+      status,
+      responseTime: responseTimeMs === null ? agent.responseTime : `${(Math.max(1, responseTimeMs) / 1000).toFixed(1)}s`,
+    };
     this.agents.set(id, updated);
     return copy(updated);
   }
@@ -1118,7 +1140,7 @@ export class MemoryPlatformStore implements PlatformStore {
 
   async listPendingDispatches(limit: number, now: string): Promise<DispatchOutboxItem[]> {
     for (const [id, item] of this.dispatchOutbox) {
-      if (item.status === 'processing' && !this.missionControls.get(item.missionId)?.pausedAt && Date.parse(item.updatedAt) <= Date.parse(now) - 2 * 60 * 1_000) {
+      if (item.status === 'processing' && !this.missionControls.get(item.missionId)?.pausedAt && Date.parse(item.updatedAt) <= Date.parse(now) - 5 * 60 * 1_000) {
         this.dispatchOutbox.set(id, { ...item, status: 'pending', nextAttemptAt: now, updatedAt: now });
       }
     }
@@ -1866,6 +1888,20 @@ export class MemoryPlatformStore implements PlatformStore {
   async updateUserPreferences(userId: string, preferences: UserPreferences): Promise<UserPreferences> {
     this.preferences.set(userId, copy(preferences));
     return copy(preferences);
+  }
+
+  async getUserPinmeCredential(userId: string): Promise<UserPinmeCredentialRecord | null> {
+    const credential = this.userPinmeCredentials.get(userId);
+    return credential ? copy(credential) : null;
+  }
+
+  async saveUserPinmeCredential(credential: UserPinmeCredentialRecord): Promise<UserPinmeCredentialRecord> {
+    this.userPinmeCredentials.set(credential.userId, copy(credential));
+    return copy(credential);
+  }
+
+  async deleteUserPinmeCredential(userId: string): Promise<boolean> {
+    return this.userPinmeCredentials.delete(userId);
   }
 
   async listAdminUsers(limit: number): Promise<AdminUser[]> {

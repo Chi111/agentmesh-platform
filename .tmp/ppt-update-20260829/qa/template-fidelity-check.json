@@ -1,0 +1,13 @@
+{
+  "status": "pass",
+  "checkedAt": "2026-08-29T15:00:42.253Z",
+  "workspace": "/Users/mac/workcode/agentmesh-platform/.tmp/ppt-update-20260829",
+  "finalPptx": "/Users/mac/workcode/agentmesh-platform/docs/pinme-mesh-demo-20260829.pptx",
+  "starterPptx": "/Users/mac/workcode/agentmesh-platform/.tmp/ppt-update-20260829/template-starter.pptx",
+  "mapPath": "/Users/mac/workcode/agentmesh-platform/.tmp/ppt-update-20260829/template-frame-map.json",
+  "starterLayoutDir": "/Users/mac/workcode/agentmesh-platform/.tmp/ppt-update-20260829/template-starter-inspect/layouts",
+  "finalLayoutDir": "/Users/mac/workcode/agentmesh-platform/.tmp/ppt-update-20260829/final-inspect/layouts",
+  "editDir": "/Users/mac/workcode/agentmesh-platform/.tmp/ppt-update-20260829",
+  "issueCount": 0,
+  "issues": []
+}

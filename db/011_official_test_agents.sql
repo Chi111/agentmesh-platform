@@ -15,7 +15,7 @@ VALUES
     '["研究","证据","核验"]', 'agentmesh://builtin/research', 'none',
     '{"type":"object","required":["task"],"properties":{"task":{"type":"object"},"context":{"type":"object"}}}',
     '{"type":"object","required":["summary","findings","risks"],"properties":{"summary":{"type":"string"},"findings":{"type":"array"},"risks":{"type":"array"}}}',
-    12, '0x2200000000000000000000000000000000000a11', 'active', 'v1.0.0',
+    12, '0x73325bd3e93d9a12e5d2d5219424daf0e55f856d', 'active', 'v1.0.0',
     9.1, 91, 1200, 0, 0, 'AgentMesh Official', 1
   ),
   (
@@ -24,7 +24,7 @@ VALUES
     '["分析","策略","决策"]', 'agentmesh://builtin/analysis', 'none',
     '{"type":"object","required":["task"],"properties":{"task":{"type":"object"},"upstream":{"type":"object"}}}',
     '{"type":"object","required":["assessment","options","recommendation"],"properties":{"assessment":{"type":"string"},"options":{"type":"array"},"recommendation":{"type":"object"}}}',
-    16, '0x2200000000000000000000000000000000000a12', 'active', 'v1.0.0',
+    16, '0x73325bd3e93d9a12e5d2d5219424daf0e55f856d', 'active', 'v1.0.0',
     9.0, 90, 1500, 0, 0, 'AgentMesh Official', 1
   ),
   (
@@ -33,7 +33,7 @@ VALUES
     '["写作","整合","交付"]', 'agentmesh://builtin/writing', 'none',
     '{"type":"object","required":["task"],"properties":{"task":{"type":"object"},"materials":{"type":"object"}}}',
     '{"type":"object","required":["title","executiveSummary","deliverable"],"properties":{"title":{"type":"string"},"executiveSummary":{"type":"string"},"deliverable":{"type":"object"}}}',
-    10, '0x2200000000000000000000000000000000000a13', 'active', 'v1.0.0',
+    10, '0x73325bd3e93d9a12e5d2d5219424daf0e55f856d', 'active', 'v1.0.0',
     8.9, 89, 1100, 0, 0, 'AgentMesh Official', 1
   )
 ON CONFLICT(id) DO UPDATE SET

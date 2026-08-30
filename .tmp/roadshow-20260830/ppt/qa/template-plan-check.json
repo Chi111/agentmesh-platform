@@ -1,0 +1,10 @@
+{
+  "status": "pass",
+  "checkedAt": "2026-08-30T03:29:55.614Z",
+  "workspace": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt",
+  "mapPath": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt/template-frame-map.json",
+  "inspectPath": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt/template-inspect/template-inspect.ndjson",
+  "sourceSlideCount": 9,
+  "issueCount": 0,
+  "issues": []
+}

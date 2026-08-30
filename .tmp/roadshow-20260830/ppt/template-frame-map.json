@@ -1,0 +1,90 @@
+{
+  "outputSlides": [
+    {
+      "outputSlide": 1,
+      "sourceSlide": 1,
+      "narrativeRole": "brand opening proof",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "im/biho7el8", "action": "replace", "purpose": "current dashboard screenshot" },
+        { "sourceElementId": "sh/vax03mlw", "action": "rewrite", "purpose": "current frontend CID" },
+        { "sourceElementId": "sh/gb61w72h", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 2,
+      "sourceSlide": 2,
+      "narrativeRole": "product thesis",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "sh/fypcfqdg", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 3,
+      "sourceSlide": 3,
+      "narrativeRole": "end-to-end workflow proof",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "sh/dgfyls3q", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 4,
+      "sourceSlide": 4,
+      "narrativeRole": "technology architecture",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "sh/8ju9gjad", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 5,
+      "sourceSlide": 5,
+      "narrativeRole": "Agent market proof",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "im/8j2x8b6t", "action": "replace", "purpose": "current Agent market screenshot" },
+        { "sourceElementId": "sh/pkr6tgjy", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 6,
+      "sourceSlide": 6,
+      "narrativeRole": "3D digital twin proof",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "im/tob6lc7u", "action": "replace", "purpose": "current 3D workplace screenshot" },
+        { "sourceElementId": "sh/1k3mhozu", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 7,
+      "sourceSlide": 7,
+      "narrativeRole": "verifiable delivery evidence",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "sh/kfaxcvmx", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 8,
+      "sourceSlide": 8,
+      "narrativeRole": "Web3 contribution separation",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "sh/pwjqho7u", "action": "rewrite", "purpose": "material date" }
+      ]
+    },
+    {
+      "outputSlide": 9,
+      "sourceSlide": 9,
+      "narrativeRole": "demo close and release proof",
+      "reuseMode": "duplicate-slide",
+      "editTargets": [
+        { "sourceElementId": "sh/vi5s3a98", "action": "rewrite", "purpose": "material date" }
+      ]
+    }
+  ],
+  "omittedSourceSlides": []
+}

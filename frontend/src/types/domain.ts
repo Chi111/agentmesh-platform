@@ -207,6 +207,8 @@ export interface WorkflowStage {
   output?: Record<string, unknown> | null;
   attemptNo: number;
   attemptCreatedAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface MissionChangeRequest {
@@ -554,6 +556,12 @@ export interface UserPreferences {
   locale: 'zh-CN' | 'en-US';
   timeZone: string;
   updatedAt: string;
+}
+
+export interface PinmeIntegrationStatus {
+  configured: boolean;
+  addressHint: string | null;
+  updatedAt: string | null;
 }
 
 export interface MissionDetail {

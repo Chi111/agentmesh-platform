@@ -1,0 +1,86 @@
+{
+  "outputSlides": [
+    {
+      "outputSlide": 1,
+      "sourceSlide": 1,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "brand cover with current deployment proof",
+      "editTargets": [
+        {"shapeId":"sh/vax03mlw","action":"rewrite"},
+        {"shapeId":"sh/gb61w72h","action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 2,
+      "sourceSlide": 2,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "preserve-only product thesis",
+      "editTargets": [
+        {"shapeId":"sh/fypcfqdg","action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 3,
+      "sourceSlide": 3,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "verified end-to-end workflow evidence",
+      "editTargets": [
+        {"shapeIds":["sh/d0jax03i","sh/298ryl4v","sh/m5cra54z","sh/n6ls3alk","sh/v6l4jq94","sh/a5c3ql8z","sh/e10f2twf","sh/f29gbyx0","sh/sfix03y9","sh/tgry9ofu","sh/z2d07mh4","sh/y14jehgj","sh/ax4zax0n","sh/hwzihwzi","sh/32l0j2dw","sh/cruhwrud","sh/1wnitwvu","sh/v29cfu18","sh/mxgb250r","sh/90rudkji","sh/3qxwfilo","sh/or6x8329","sh/dgfyls3q"],"action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 4,
+      "sourceSlide": 4,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "architecture and security-boundary analysis",
+      "editTargets": [
+        {"shapeIds":["sh/i1sni5wv","sh/wf61krul","sh/jixkf6tw","sh/tkzi1wry","sh/9k3qpory","sh/8ju9gjad"],"action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 5,
+      "sourceSlide": 5,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "preserve-only agent market proof",
+      "editTargets": [
+        {"shapeId":"sh/pkr6tgjy","action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 6,
+      "sourceSlide": 6,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "preserve-only 3D product proof",
+      "editTargets": [
+        {"shapeId":"sh/1k3mhozu","action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 7,
+      "sourceSlide": 7,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "automatic IPFS delivery proof",
+      "editTargets": [
+        {"shapeIds":["sh/xwvqlwv2","sh/zmlkne1w","sh/by1kje1k","sh/qxsja90f","sh/dk32lojq","sh/rqhkrulg","sh/srqlkz21","sh/tsj2t43m","sh/2hs3q9k3","sh/3i1kzelo","sh/dcn6p8nq","sh/lgn6tsn2","sh/ydwnyd4b","sh/9k76xsny","sh/g7uxkfm5","sh/h83yt03a","sh/f6lgralk","sh/8jaxgvmt","sh/6hsfel4n","sh/7i1gnql8","sh/kfaxcvmx"],"action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 8,
+      "sourceSlide": 8,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "preserve-only web3 contribution map",
+      "editTargets": [
+        {"shapeId":"sh/pwjqho7u","action":"rewrite"}
+      ]
+    },
+    {
+      "outputSlide": 9,
+      "sourceSlide": 9,
+      "reuseMode": "duplicate-slide",
+      "narrativeRole": "demo route and release-readiness summary",
+      "editTargets": [
+        {"shapeIds":["sh/8rytoveh","sh/y1cz2x83","sh/lo3ixcru","sh/mpcj6x8f","sh/9sni1crq","sh/2tszud8v","sh/6xof29on","sh/t0fyxo7e","sh/i94fypor","sh/5cfet472","sh/258fatov","sh/kb2d4vmd","sh/za9cvq5s","sh/8f2d8vmp","sh/54jqt4by","sh/i1s7ips7","sh/vyhonutw","sh/8bqpcfa5","sh/0365ovq9","sh/dgvmtgri","sh/3ad4n69g","sh/hkna50ry","sh/uhwru58n","sh/vi5s3a98"],"action":"rewrite"}
+      ]
+    }
+  ]
+}

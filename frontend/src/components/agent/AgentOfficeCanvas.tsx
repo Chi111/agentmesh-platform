@@ -1,6 +1,8 @@
 import { Canvas, type ThreeEvent, useFrame, useThree } from '@react-three/fiber';
-import { type RefObject, useEffect, useMemo, useRef, useState } from 'react';
-import { Group, MathUtils, Mesh, OrthographicCamera, QuadraticBezierCurve3, Vector3 } from 'three';
+import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { Group, MathUtils, Mesh, OrthographicCamera, QuadraticBezierCurve3, TOUCH, Vector3 } from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { NounEmployeeModel, type NounEmployeeAnimation } from './NounEmployeeModel';
 
 export type AgentOfficeState = 'executing' | 'assigned' | 'ready' | 'trial' | 'paused' | 'attention';
 
@@ -16,6 +18,7 @@ interface AgentOfficeCanvasProps {
   actors: AgentOfficeActor[];
   selectedId: string;
   onSelect: (agentId: string) => void;
+  onClearSelection?: () => void;
 }
 
 const STATE_COLORS: Record<AgentOfficeState, string> = {
@@ -47,12 +50,6 @@ const SCENE_PALETTE = {
   repair: '#D94F4F',
 } as const;
 
-const ACTOR_PALETTES: Record<AgentOfficeActor['accent'], { shell: string; body: string; limb: string; trait: string; noggle: string }> = {
-  cyan: { shell: '#39D7E7', body: '#08AAC4', limb: '#0C6678', trait: '#B7F34A', noggle: '#101318' },
-  lime: { shell: '#B7F34A', body: '#7BAE35', limb: '#476B25', trait: '#39D7E7', noggle: '#101318' },
-  amber: { shell: '#E2AC48', body: '#D99A2B', limb: '#8A5F18', trait: '#39D7E7', noggle: '#101318' },
-};
-
 const WORKSTATION_PALETTES = [
   { mat: '#8BD6DE', desk: '#15252D', chair: '#B7F34A' },
   { mat: '#A8C3C5', desk: '#08AAC4', chair: '#C4F35A' },
@@ -66,10 +63,183 @@ const DESK_POSITIONS: Array<[number, number]> = [
   [-5.8, 1.35], [-3.25, 1.35],
 ];
 
-const LOUNGE_POSITIONS: Array<[number, number]> = [[4.85, 3.45], [6.3, 2.72], [5.72, 4.25]];
-const TASK_POSITIONS: Array<[number, number]> = [[0.78, -0.15], [3.08, 0.05], [1.24, 1.55]];
-const TRIAL_POSITIONS: Array<[number, number]> = [[3.92, -3.68], [5.18, -3.48], [4.55, -2.72]];
-const REPAIR_POSITIONS: Array<[number, number]> = [[6.75, -0.62], [6.08, 0.08]];
+const LOUNGE_POSITIONS: Array<[number, number]> = [
+  [3.45, 1], [3.55, 3.05], [7.35, 2.7], [5.15, 0.45],
+  [7.6, 0.75], [3.65, 4.55], [6.95, 4.45], [1.85, 3.65],
+];
+const TRIAL_POSITIONS: Array<[number, number]> = [
+  [2.75, -3.55], [4.55, -1.65], [6.35, -3.55], [2.55, -1.85],
+  [6.55, -1.8], [2.35, -4.65], [6.25, -4.45], [7.85, -3.15],
+];
+const REPAIR_POSITIONS: Array<[number, number]> = [
+  [5.3, 1.25], [7.5, 1.05], [4.55, -0.2], [8.5, -0.25],
+  [5.15, -1.8], [7.65, -1.75], [5.1, 2.7], [7.2, 2.75],
+];
+
+// The Nouns heads are wider than their bodies, so collision clearance follows the widest silhouette.
+const AGENT_COLLISION_RADIUS = 0.9;
+const AGENT_MIN_DISTANCE = AGENT_COLLISION_RADIUS * 2 + 0.12;
+const COLLISION_SOLVER_PASSES = 3;
+const WORLD_RADIUS_X = 8.75;
+const WORLD_RADIUS_Z = 5;
+
+interface ActorPlacement {
+  position: [number, number, number];
+  rotation: number;
+}
+
+interface CollisionPoint {
+  x: number;
+  z: number;
+}
+
+interface CollisionBox {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  ownerIndex?: number;
+  allowsOwnerOccupancy?: boolean;
+}
+
+interface RegisteredActor {
+  group: Group;
+  index: number;
+  state: AgentOfficeState;
+}
+
+function footprint(
+  centerX: number,
+  centerZ: number,
+  width: number,
+  depth: number,
+  metadata: Pick<CollisionBox, 'ownerIndex' | 'allowsOwnerOccupancy'> = {},
+): CollisionBox {
+  return {
+    minX: centerX - width / 2,
+    maxX: centerX + width / 2,
+    minZ: centerZ - depth / 2,
+    maxZ: centerZ + depth / 2,
+    ...metadata,
+  };
+}
+
+const STATIC_COLLIDERS: CollisionBox[] = [
+  // Workstations: desktops contain their legs, screens and lamps in plan view.
+  // A chair remains solid for everyone except its assigned employee while working.
+  ...DESK_POSITIONS.flatMap(([x, z], index) => [
+    footprint(x, z, 2.08, 0.96),
+    footprint(x + 0.03, z + 0.86, 0.72, 0.34, { ownerIndex: index, allowsOwnerOccupancy: true }),
+  ]),
+  // Room walls; wall-mounted displays inherit the back-wall footprint.
+  footprint(-9.05, -0.2, 0.2, 10.4),
+  footprint(0, -5.55, 18.2, 0.2),
+  // Task board, including its supports.
+  footprint(1.98, -0.52, 2.95, 0.62),
+  // Lounge couch, coffee table and sculpture.
+  footprint(5.35, 3.73, 3.4, 1.3),
+  footprint(5, 2.13, 1.7, 1.7),
+  footprint(7.4, 3.97, 0.84, 1.05),
+  // Training pedestal and repair workbench.
+  footprint(4.55, -3.5, 1.56, 1.56),
+  footprint(6.7, -0.2, 2.3, 1.4),
+  // Freestanding sculpture beside the work floor.
+  footprint(1.1, 4.65, 0.76, 0.9),
+];
+
+const WANDER_ROUTES: ReadonlyArray<ReadonlyArray<readonly [number, number]>> = [
+  [
+    [3.25, 0.8], [2.55, 1.65], [2.35, 3.1], [2.55, 4.25], [2.2, 2.15],
+  ],
+  [
+    [6.85, 1.55], [7.5, 1.5], [7.9, 1.9], [7.65, 2.4], [6.85, 2.3],
+  ],
+  [
+    [2.35, -1.75], [2.6, -2.45], [2.45, -3.55], [1.8, -4.35], [1.1, -3.1], [1.55, -2],
+  ],
+];
+
+function actorSeed(actorId: string) {
+  let seed = 2166136261;
+  for (let index = 0; index < actorId.length; index += 1) {
+    seed ^= actorId.charCodeAt(index);
+    seed = Math.imul(seed, 16777619);
+  }
+  return seed >>> 0;
+}
+
+function nextRandom(seedRef: MutableRefObject<number>) {
+  seedRef.current = (Math.imul(seedRef.current, 1664525) + 1013904223) >>> 0;
+  return seedRef.current / 4294967296;
+}
+
+function nearestWanderRoute(position: readonly [number, number, number]) {
+  let nearestRouteIndex = 0;
+  let nearestWaypointIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  WANDER_ROUTES.forEach((route, routeIndex) => route.forEach((waypoint, waypointIndex) => {
+    const distance = Math.hypot(position[0] - waypoint[0], position[2] - waypoint[1]);
+    if (distance >= nearestDistance) return;
+    nearestDistance = distance;
+    nearestRouteIndex = routeIndex;
+    nearestWaypointIndex = waypointIndex;
+  }));
+  return { route: WANDER_ROUTES[nearestRouteIndex], waypointIndex: nearestWaypointIndex };
+}
+
+function constrainToRoom(point: CollisionPoint) {
+  const normalized = point.x * point.x / (WORLD_RADIUS_X * WORLD_RADIUS_X)
+    + point.z * point.z / (WORLD_RADIUS_Z * WORLD_RADIUS_Z);
+  if (normalized <= 1) return;
+  const scale = 1 / Math.sqrt(normalized);
+  point.x *= scale;
+  point.z *= scale;
+}
+
+function pushOutsideFurniture(point: CollisionPoint, actor?: { index: number; state: AgentOfficeState }) {
+  for (const collider of STATIC_COLLIDERS) {
+    const ownerIsWorking = actor
+      && collider.allowsOwnerOccupancy
+      && collider.ownerIndex === actor.index
+      && (actor.state === 'executing' || actor.state === 'assigned');
+    if (ownerIsWorking) continue;
+    const minX = collider.minX - AGENT_COLLISION_RADIUS;
+    const maxX = collider.maxX + AGENT_COLLISION_RADIUS;
+    const minZ = collider.minZ - AGENT_COLLISION_RADIUS;
+    const maxZ = collider.maxZ + AGENT_COLLISION_RADIUS;
+    if (point.x <= minX || point.x >= maxX || point.z <= minZ || point.z >= maxZ) continue;
+
+    const exits = [
+      { axis: 'x' as const, value: minX - 0.02, distance: point.x - minX },
+      { axis: 'x' as const, value: maxX + 0.02, distance: maxX - point.x },
+      { axis: 'z' as const, value: minZ - 0.02, distance: point.z - minZ },
+      { axis: 'z' as const, value: maxZ + 0.02, distance: maxZ - point.z },
+    ];
+    const nearestExit = exits.reduce((nearest, exit) => exit.distance < nearest.distance ? exit : nearest);
+    point[nearestExit.axis] = nearestExit.value;
+  }
+  constrainToRoom(point);
+}
+
+function separatePoints(first: CollisionPoint, second: CollisionPoint, seed: number, firstWeight = 0.5) {
+  let dx = first.x - second.x;
+  let dz = first.z - second.z;
+  let distance = Math.hypot(dx, dz);
+  if (distance >= AGENT_MIN_DISTANCE) return;
+  if (distance < 0.001) {
+    const angle = seed * 2.399963;
+    dx = Math.cos(angle);
+    dz = Math.sin(angle);
+    distance = 1;
+  }
+  const overlap = AGENT_MIN_DISTANCE - distance + 0.01;
+  const nx = dx / distance;
+  const nz = dz / distance;
+  first.x += nx * overlap * firstWeight;
+  first.z += nz * overlap * firstWeight;
+  second.x -= nx * overlap * (1 - firstWeight);
+  second.z -= nz * overlap * (1 - firstWeight);
+}
 
 function supportsWebGL() {
   if (typeof document === 'undefined') return false;
@@ -92,33 +262,65 @@ function useReducedMotion() {
   return reduced;
 }
 
-function CameraRig({ focusPosition, tourEnabled }: { focusPosition: [number, number, number]; tourEnabled: boolean }) {
-  const { camera, size } = useThree();
-  const lookAtRef = useRef(new Vector3());
-  const desiredPositionRef = useRef(new Vector3());
+function CameraRig({ focusPosition }: { focusPosition: [number, number, number] }) {
+  const { camera, gl, size } = useThree();
+  const controlsRef = useRef<OrbitControls | null>(null);
+  const previousBaseZoomRef = useRef(0);
   const desiredLookAtRef = useRef(new Vector3());
   const focusVector = useMemo(() => new Vector3(focusPosition[0], focusPosition[1], focusPosition[2]), [focusPosition[0], focusPosition[1], focusPosition[2]]);
-  const baseZoom = size.width < 520 ? 23 : size.width < 900 ? 35 : 43;
+  const baseZoom = size.width < 520 ? (size.height > size.width * 1.35 ? 30 : 23) : size.width < 900 ? 35 : 43;
 
   useEffect(() => {
     const orthographic = camera as OrthographicCamera;
-    orthographic.zoom = baseZoom;
     orthographic.position.set(12.8, 14.6, 15.8);
     orthographic.lookAt(0, 0.1, 0);
     orthographic.updateProjectionMatrix();
+
+    const controls = new OrbitControls(orthographic, gl.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.enableRotate = true;
+    controls.rotateSpeed = 0.48;
+    controls.enableZoom = true;
+    controls.zoomSpeed = 0.55;
+    controls.enablePan = false;
+    controls.minPolarAngle = MathUtils.degToRad(32);
+    controls.maxPolarAngle = MathUtils.degToRad(72);
+    controls.touches.ONE = TOUCH.ROTATE;
+    controls.touches.TWO = TOUCH.DOLLY_PAN;
+    controls.target.set(0, 0.16, 0);
+    controls.update();
+    controlsRef.current = controls;
+
+    return () => {
+      controls.dispose();
+      controlsRef.current = null;
+    };
+  }, [camera, gl]);
+
+  useEffect(() => {
+    const orthographic = camera as OrthographicCamera;
+    const controls = controlsRef.current;
+    const previousBaseZoom = previousBaseZoomRef.current;
+    const relativeZoom = previousBaseZoom > 0 ? orthographic.zoom / previousBaseZoom : 1;
+    orthographic.zoom = baseZoom * MathUtils.clamp(relativeZoom, 0.8, 1.2);
+    orthographic.updateProjectionMatrix();
+    if (controls) {
+      controls.minZoom = baseZoom * 0.8;
+      controls.maxZoom = baseZoom * 1.2;
+      controls.update();
+    }
+    previousBaseZoomRef.current = baseZoom;
   }, [baseZoom, camera]);
 
   useFrame((_state, delta) => {
-    const orthographic = camera as OrthographicCamera;
-    const focusWeight = size.width < 520 ? 0.07 : tourEnabled ? 0.22 : 0.14;
-    desiredPositionRef.current.set(12.8 + focusVector.x * focusWeight, 14.6, 15.8 + focusVector.z * focusWeight);
+    const controls = controlsRef.current;
+    if (!controls) return;
+    const focusWeight = size.width < 520 ? 0.07 : 0.14;
     desiredLookAtRef.current.set(focusVector.x * focusWeight, 0.16, focusVector.z * focusWeight);
-    const smoothing = 1 - Math.exp(-delta * (tourEnabled ? 1.8 : 3.2));
-    orthographic.position.lerp(desiredPositionRef.current, smoothing);
-    lookAtRef.current.lerp(desiredLookAtRef.current, smoothing);
-    orthographic.lookAt(lookAtRef.current);
-    orthographic.zoom = MathUtils.lerp(orthographic.zoom, baseZoom + (tourEnabled && size.width >= 520 ? 1.4 : 0), smoothing);
-    orthographic.updateProjectionMatrix();
+    const smoothing = 1 - Math.exp(-delta * 3.2);
+    controls.target.lerp(desiredLookAtRef.current, smoothing);
+    controls.update();
   });
   return null;
 }
@@ -204,11 +406,12 @@ function Workstation({ position, actor, selected, index, onSelect }: {
   onSelect?: () => void;
 }) {
   const color = actor ? STATE_COLORS[actor.state] : '#687078';
+  const personalColor = actor ? ACCENT_COLORS[actor.accent] : null;
   const palette = WORKSTATION_PALETTES[index % WORKSTATION_PALETTES.length];
   return <group position={[position[0], 0, position[1]]} onClick={actor ? (event) => { event.stopPropagation(); onSelect?.(); } : undefined}>
     <mesh receiveShadow position={[0, 0.035, 0.2]}>
       <boxGeometry args={[2.22, 0.04, 1.62]} />
-      <meshStandardMaterial color={selected ? '#C4F35A' : palette.mat} roughness={0.92} metalness={0} />
+      <meshStandardMaterial color={selected ? '#C4F35A' : personalColor ?? palette.mat} roughness={0.92} metalness={0} />
     </mesh>
     <mesh castShadow receiveShadow position={[0, 0.76, 0]}>
       <boxGeometry args={[2.08, 0.15, 0.96]} />
@@ -218,6 +421,12 @@ function Workstation({ position, actor, selected, index, onSelect }: {
       <boxGeometry args={[0.11, 0.72, 0.68]} />
       <meshStandardMaterial color={SCENE_PALETTE.outline} roughness={0.88} metalness={0} />
     </mesh>)}
+    {actor ? <group position={[-0.72, 0.89, 0.34]}>
+      {[0, 0.16, 0.32].map((x, pixelIndex) => <mesh castShadow key={x} position={[x, 0, 0]}>
+        <boxGeometry args={[0.12, 0.09, 0.08]} />
+        <meshStandardMaterial color={pixelIndex === 1 ? color : personalColor ?? color} roughness={0.88} metalness={0} />
+      </mesh>)}
+    </group> : null}
     <mesh castShadow position={[-0.18, 1.22, -0.25]}>
       <boxGeometry args={[1.08, 0.68, 0.1]} />
       <meshStandardMaterial color={SCENE_PALETTE.outline} roughness={0.86} metalness={0} />
@@ -400,213 +609,184 @@ function AmbientParticles({ reducedMotion }: { reducedMotion: boolean }) {
   </group>;
 }
 
-function positionForActor(actor: AgentOfficeActor, index: number): { position: [number, number, number]; rotation: number; sitting: boolean } {
+function lookAtRotation(position: CollisionPoint, targetX: number, targetZ: number) {
+  return Math.atan2(targetX - position.x, targetZ - position.z);
+}
+
+function basePlacementForActor(actor: AgentOfficeActor, index: number, zoneIndex: number): ActorPlacement {
   const desk = DESK_POSITIONS[index % DESK_POSITIONS.length];
-  if (actor.state === 'executing') return { position: [desk[0], 0.08, desk[1] + 0.78], rotation: Math.PI, sitting: true };
+  if (actor.state === 'executing') return { position: [desk[0], 0.08, desk[1] + 1.42], rotation: Math.PI };
   if (actor.state === 'assigned') {
-    const target = TASK_POSITIONS[index % TASK_POSITIONS.length];
-    return { position: [target[0], 0.08, target[1]], rotation: Math.atan2(1.98 - target[0], -0.52 - target[1]), sitting: false };
+    const position: [number, number, number] = [desk[0] + 0.45, 0.08, desk[1] + 1.42];
+    return { position, rotation: Math.atan2(desk[0] - position[0], desk[1] - position[2]) };
   }
   if (actor.state === 'trial') {
-    const target = TRIAL_POSITIONS[index % TRIAL_POSITIONS.length];
-    return { position: [target[0], 0.08, target[1]], rotation: Math.atan2(4.55 - target[0], -3.5 - target[1]), sitting: false };
+    const target = TRIAL_POSITIONS[zoneIndex % TRIAL_POSITIONS.length];
+    return { position: [target[0], 0.08, target[1]], rotation: Math.atan2(4.55 - target[0], -3.5 - target[1]) };
   }
   if (actor.state === 'attention') {
-    const target = REPAIR_POSITIONS[index % REPAIR_POSITIONS.length];
-    return { position: [target[0], 0.08, target[1]], rotation: 1.1, sitting: false };
+    const target = REPAIR_POSITIONS[zoneIndex % REPAIR_POSITIONS.length];
+    return { position: [target[0], 0.08, target[1]], rotation: Math.atan2(6.7 - target[0], -0.2 - target[1]) };
   }
-  const target = LOUNGE_POSITIONS[index % LOUNGE_POSITIONS.length];
-  return { position: [target[0], actor.state === 'paused' ? 0.18 : 0.08, target[1]], rotation: -1.7, sitting: actor.state === 'paused' };
+  const target = LOUNGE_POSITIONS[zoneIndex % LOUNGE_POSITIONS.length];
+  return { position: [target[0], 0.08, target[1]], rotation: Math.atan2(5.2 - target[0], 3.05 - target[1]) };
 }
 
-function NoggleFrame({ x, frame, lens }: { x: number; frame: string; lens: string }) {
-  return <group position={[x, 0.69, 0.235]}>
-    <mesh position={[0, 0, -0.012]}><boxGeometry args={[0.24, 0.18, 0.04]} /><meshStandardMaterial color={lens} roughness={0.92} metalness={0} /></mesh>
-    {[[0, 0.095, 0.27, 0.055], [0, -0.095, 0.27, 0.055], [-0.135, 0, 0.055, 0.23], [0.135, 0, 0.055, 0.23]].map(([barX, barY, width, height], index) => <mesh key={index} position={[barX, barY, 0.02]}>
-      <boxGeometry args={[width, height, 0.075]} />
-      <meshStandardMaterial color={frame} roughness={0.86} metalness={0} />
-    </mesh>)}
-    <mesh position={[0.04, 0.035, 0.038]}><boxGeometry args={[0.06, 0.05, 0.02]} /><meshBasicMaterial color="#F1F3EE" /></mesh>
-  </group>;
+function buildActorPlacements(actors: AgentOfficeActor[]): ActorPlacement[] {
+  const zoneCounts = { lounge: 0, trial: 0, repair: 0 };
+  const placements = actors.map((actor, index) => {
+    const zone = actor.state === 'trial' ? 'trial' : actor.state === 'attention' ? 'repair' : 'lounge';
+    const zoneIndex = actor.state === 'executing' || actor.state === 'assigned' ? index : zoneCounts[zone]++;
+    return basePlacementForActor(actor, index, zoneIndex);
+  });
+  const points = placements.map((placement) => ({ x: placement.position[0], z: placement.position[2] }));
+
+  for (let iteration = 0; iteration < 24; iteration += 1) {
+    points.forEach((point, index) => pushOutsideFurniture(point, { index, state: actors[index].state }));
+    for (let firstIndex = 0; firstIndex < points.length; firstIndex += 1) {
+      for (let secondIndex = firstIndex + 1; secondIndex < points.length; secondIndex += 1) {
+        const firstAnchored = actors[firstIndex].state === 'executing' || actors[firstIndex].state === 'assigned';
+        const secondAnchored = actors[secondIndex].state === 'executing' || actors[secondIndex].state === 'assigned';
+        const firstWeight = firstAnchored && !secondAnchored ? 0 : !firstAnchored && secondAnchored ? 1 : 0.5;
+        separatePoints(points[firstIndex], points[secondIndex], firstIndex * 17 + secondIndex + 1, firstWeight);
+      }
+    }
+    points.forEach((point, index) => {
+      pushOutsideFurniture(point, { index, state: actors[index].state });
+      constrainToRoom(point);
+    });
+  }
+
+  return placements.map((placement, index) => {
+    const point = points[index];
+    const actor = actors[index];
+    const rotation = actor.state === 'executing' || actor.state === 'assigned'
+      ? placement.rotation
+      : actor.state === 'trial'
+        ? lookAtRotation(point, 4.55, -3.5)
+        : actor.state === 'attention'
+          ? lookAtRotation(point, 6.7, -0.2)
+          : lookAtRotation(point, 5.2, 3.05);
+    return { position: [point.x, placement.position[1], point.z], rotation };
+  });
 }
 
-const HEAD_SHAPES = [
-  [
-    { x: -0.04, y: 0.93, width: 0.48 },
-    { x: 0, y: 0.79, width: 0.68 },
-    { x: 0, y: 0.65, width: 0.72 },
-    { x: 0.05, y: 0.51, width: 0.56 },
-  ],
-  [
-    { x: 0, y: 0.98, width: 0.34 },
-    { x: -0.03, y: 0.85, width: 0.54 },
-    { x: 0.03, y: 0.71, width: 0.72 },
-    { x: 0, y: 0.57, width: 0.68 },
-    { x: 0.06, y: 0.44, width: 0.46 },
-  ],
-  [
-    { x: -0.08, y: 0.92, width: 0.56 },
-    { x: 0, y: 0.78, width: 0.82 },
-    { x: 0.02, y: 0.64, width: 0.82 },
-    { x: 0.1, y: 0.5, width: 0.58 },
-  ],
-  [
-    { x: 0.08, y: 0.94, width: 0.44 },
-    { x: -0.04, y: 0.8, width: 0.68 },
-    { x: 0.04, y: 0.66, width: 0.76 },
-    { x: -0.08, y: 0.52, width: 0.54 },
-  ],
-] as const;
-
-function PixelHeadShell({ index, color }: { index: number; color: string }) {
-  const rows = HEAD_SHAPES[index % HEAD_SHAPES.length];
-  return <group>
-    {rows.map((row, rowIndex) => <mesh castShadow key={rowIndex} position={[row.x, row.y, 0]}>
-      <boxGeometry args={[row.width, 0.155, 0.38]} />
-      <meshStandardMaterial color={color} roughness={0.92} metalness={0} />
-    </mesh>)}
-  </group>;
-}
-
-function VoxelHeadTrait({ index, color }: { index: number; color: string }) {
-  const trait = index % 4;
-  if (trait === 0) return <group>
-    <mesh castShadow position={[-0.04, 1.04, -0.01]}><boxGeometry args={[0.52, 0.14, 0.4]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} /></mesh>
-    <mesh castShadow position={[0.2, 0.98, 0.08]}><boxGeometry args={[0.32, 0.1, 0.28]} /><meshStandardMaterial color="#39D7E7" roughness={0.9} metalness={0} /></mesh>
-  </group>;
-  if (trait === 1) return <group>
-    {[-0.2, 0, 0.2].map((x, blockIndex) => <mesh castShadow key={x} position={[x, 1.08 + (blockIndex === 1 ? 0.08 : 0), 0]}>
-      <boxGeometry args={[0.15, blockIndex === 1 ? 0.3 : 0.22, 0.3]} /><meshStandardMaterial color={blockIndex === 1 ? '#C4F35A' : color} roughness={0.9} metalness={0} />
-    </mesh>)}
-    <mesh castShadow position={[0, 1.01, 0]}><boxGeometry args={[0.56, 0.1, 0.3]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} /></mesh>
-  </group>;
-  if (trait === 2) return <group>
-    <mesh castShadow position={[-0.06, 1.1, 0]}><boxGeometry args={[0.08, 0.3, 0.16]} /><meshStandardMaterial color={SCENE_PALETTE.outline} roughness={0.9} metalness={0} /></mesh>
-    <mesh castShadow position={[-0.06, 1.28, 0]}><boxGeometry args={[0.19, 0.19, 0.24]} /><meshStandardMaterial color={color} roughness={0.88} metalness={0} /></mesh>
-  </group>;
-  return <group>
-    {[[-0.2, 1.05, 0], [0, 1.14, 0], [0.2, 1.05, 0]].map((position, blockIndex) => <mesh castShadow key={blockIndex} position={position as [number, number, number]} rotation={[0, 0, blockIndex === 1 ? 0 : blockIndex === 0 ? -0.22 : 0.22]}>
-      <boxGeometry args={[0.18, blockIndex === 1 ? 0.3 : 0.24, 0.28]} /><meshStandardMaterial color={blockIndex === 1 ? '#39D7E7' : color} roughness={0.9} metalness={0} />
-    </mesh>)}
-  </group>;
-}
-
-function NounTorso({ body, shell, trait, stateColor }: { body: string; shell: string; trait: string; stateColor: string }) {
-  return <group>
-    <mesh castShadow position={[0, 0.08, 0]} scale={[1, 1.05, 0.78]}>
-      <capsuleGeometry args={[0.27, 0.18, 5, 8]} />
-      <meshStandardMaterial color={body} roughness={0.9} metalness={0} flatShading />
-    </mesh>
-    <mesh castShadow position={[0, 0.3, 0]} scale={[1.15, 0.48, 0.82]}>
-      <sphereGeometry args={[0.28, 8, 6]} />
-      <meshStandardMaterial color={body} roughness={0.9} metalness={0} flatShading />
-    </mesh>
-    {[[-0.12, 0.17, stateColor], [0.02, 0.17, shell], [-0.12, 0.03, shell], [0.02, 0.03, trait]].map(([x, y, color], pixelIndex) => <mesh key={pixelIndex} position={[Number(x), Number(y), 0.245]}>
-      <boxGeometry args={[0.1, 0.1, 0.035]} />
-      <meshStandardMaterial color={String(color)} roughness={0.9} metalness={0} />
-    </mesh>)}
-  </group>;
-}
-
-function JointedArm({ side, color, shell, armRef }: { side: -1 | 1; color: string; shell: string; armRef: RefObject<Group> }) {
-  return <group ref={armRef} position={[side * 0.34, 0.25, 0]}>
-    <mesh castShadow position={[0, -0.11, 0]}><capsuleGeometry args={[0.075, 0.13, 4, 7]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} flatShading /></mesh>
-    <group position={[0, -0.24, 0.015]} rotation={[0, 0, side * -0.5]}>
-      <mesh castShadow position={[0, -0.1, 0]}><capsuleGeometry args={[0.07, 0.11, 4, 7]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} flatShading /></mesh>
-      <mesh castShadow position={[0, -0.23, 0.025]}><sphereGeometry args={[0.1, 8, 6]} /><meshStandardMaterial color={shell} roughness={0.88} metalness={0} flatShading /></mesh>
-    </group>
-  </group>;
-}
-
-function NounLeg({ side, sitting, color, shoe }: { side: -1 | 1; sitting: boolean; color: string; shoe: string }) {
-  return <group position={[side * 0.13, -0.17, 0]} rotation={[sitting ? -0.92 : 0, 0, side * 0.04]}>
-    <mesh castShadow position={[0, -0.12, 0]}><capsuleGeometry args={[0.085, 0.13, 4, 7]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} flatShading /></mesh>
-    <mesh castShadow position={[side * 0.025, -0.31, 0.075]} scale={[1.35, 0.68, 1.65]}><sphereGeometry args={[0.13, 8, 6]} /><meshStandardMaterial color={shoe} roughness={0.88} metalness={0} flatShading /></mesh>
-  </group>;
-}
-
-function AgentStateProp({ state, color }: { state: AgentOfficeState; color: string }) {
-  if (state === 'assigned') return <group position={[0.38, 0.09, 0.3]} rotation={[0.08, -0.18, -0.08]}>
-    <mesh castShadow><boxGeometry args={[0.24, 0.32, 0.055]} /><meshStandardMaterial color="#F1F3EE" roughness={0.92} metalness={0} /></mesh>
-    {[0.08, -0.02, -0.12].map((y, index) => <mesh key={y} position={[index === 2 ? -0.02 : 0.02, y, 0.034]}><boxGeometry args={[index === 2 ? 0.12 : 0.16, 0.035, 0.02]} /><meshBasicMaterial color={index === 0 ? color : '#101318'} /></mesh>)}
-  </group>;
-  if (state === 'ready' || state === 'paused') return <group position={[0.38, 0.02, 0.29]}>
-    <mesh castShadow><boxGeometry args={[0.16, 0.19, 0.16]} /><meshStandardMaterial color="#F1F3EE" roughness={0.92} metalness={0} /></mesh>
-    <mesh position={[0.11, 0, 0]}><boxGeometry args={[0.07, 0.1, 0.08]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} /></mesh>
-    <mesh position={[0, 0.1, 0.085]}><boxGeometry args={[0.1, 0.035, 0.025]} /><meshBasicMaterial color={color} /></mesh>
-  </group>;
-  if (state === 'trial') return <group position={[0, 0.13, 0.31]} rotation={[0, 0, Math.PI / 4]}>
-    <mesh castShadow><boxGeometry args={[0.24, 0.24, 0.07]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} /></mesh>
-    <mesh position={[0, 0, 0.045]}><boxGeometry args={[0.1, 0.1, 0.025]} /><meshBasicMaterial color="#101318" /></mesh>
-  </group>;
-  if (state === 'attention') return <group position={[0.38, 0.03, 0.29]} rotation={[0, 0, -0.45]}>
-    <mesh><boxGeometry args={[0.07, 0.44, 0.08]} /><meshStandardMaterial color="#687078" roughness={0.9} metalness={0} /></mesh>
-    <mesh position={[0, 0.22, 0]}><boxGeometry args={[0.22, 0.1, 0.09]} /><meshStandardMaterial color={color} roughness={0.9} metalness={0} /></mesh>
-  </group>;
-  return null;
-}
-
-function AgentEmployee({ actor, index, selected, reducedMotion, onSelect }: {
+function AgentEmployee({ actor, index, placement, selected, reducedMotion, collisionRegistry, onSelect }: {
   actor: AgentOfficeActor;
   index: number;
+  placement: ActorPlacement;
   selected: boolean;
   reducedMotion: boolean;
+  collisionRegistry: MutableRefObject<Map<string, RegisteredActor>>;
   onSelect: () => void;
 }) {
   const rootRef = useRef<Group>(null);
-  const bodyRef = useRef<Group>(null);
-  const headRef = useRef<Group>(null);
-  const leftArmRef = useRef<Group>(null);
-  const rightArmRef = useRef<Group>(null);
-  const target = useMemo(() => positionForActor(actor, index), [actor, index]);
-  const targetVector = useMemo(() => new Vector3(...target.position), [target.position]);
-  const actorPalette = ACTOR_PALETTES[actor.accent];
+  const targetVector = useMemo(() => new Vector3(...placement.position), [placement.position]);
+  const wanderSetup = useMemo(() => nearestWanderRoute(placement.position), [placement.position]);
+  const initialPositionRef = useRef<[number, number, number]>(placement.position);
   const stateColor = STATE_COLORS[actor.state];
+  const walkingRef = useRef(false);
+  const [walking, setWalking] = useState(false);
+  const randomSeedRef = useRef(actorSeed(actor.id));
+  const wanderRouteRef = useRef(wanderSetup.route);
+  const wanderIndexRef = useRef(wanderSetup.waypointIndex);
+  const wanderDirectionRef = useRef((actorSeed(actor.id) & 1) === 0 ? 1 : -1);
+  const wanderTargetRef = useRef(new Vector3(...placement.position));
+  const nextWanderAtRef = useRef(0);
+  const wanderPausedRef = useRef(true);
+  const wanderingRef = useRef(false);
+  const animation: NounEmployeeAnimation = walking ? 'walk' : 'idle';
+
+  useEffect(() => {
+    const seed = actorSeed(actor.id);
+    randomSeedRef.current = seed;
+    wanderRouteRef.current = wanderSetup.route;
+    wanderIndexRef.current = wanderSetup.waypointIndex;
+    wanderDirectionRef.current = (seed & 1) === 0 ? 1 : -1;
+    wanderTargetRef.current.copy(targetVector);
+    nextWanderAtRef.current = 0;
+    wanderPausedRef.current = true;
+    wanderingRef.current = false;
+  }, [actor.id, targetVector, wanderSetup.route, wanderSetup.waypointIndex]);
+
+  useEffect(() => {
+    const group = rootRef.current;
+    if (!group) return undefined;
+    collisionRegistry.current.set(actor.id, { group, index, state: actor.state });
+    return () => { collisionRegistry.current.delete(actor.id); };
+  }, [actor.id, actor.state, collisionRegistry, index]);
 
   useEffect(() => () => { document.body.style.cursor = ''; }, []);
 
   useFrame(({ clock }, delta) => {
     const root = rootRef.current;
-    const body = bodyRef.current;
-    if (!root || !body) return;
-    const speed = reducedMotion ? 1 : 1 - Math.exp(-delta * 4.6);
-    root.position.lerp(targetVector, speed);
-    root.rotation.y = MathUtils.lerp(root.rotation.y, target.rotation, speed);
-    const time = clock.elapsedTime + index * 0.71;
-    const activeMotion = reducedMotion ? 0 : actor.state === 'executing' ? Math.sin(time * 7) * 0.025 : Math.sin(time * 2.2) * 0.028;
-    body.position.y = (target.sitting ? 0.72 : 0.86) + activeMotion;
-    body.rotation.z = actor.state === 'paused' ? -0.1 : Math.sin(time * 1.5) * (reducedMotion ? 0 : 0.022);
-    if (headRef.current) {
-      headRef.current.rotation.y = reducedMotion ? 0 : Math.sin(time * 0.82) * 0.11;
-      headRef.current.rotation.z = reducedMotion ? 0 : Math.sin(time * 1.2) * 0.025;
+    if (!root) return;
+    const shouldWander = actor.state !== 'executing' && actor.state !== 'assigned' && !reducedMotion;
+
+    if (shouldWander && !wanderingRef.current) {
+      const nearest = nearestWanderRoute([root.position.x, root.position.y, root.position.z]);
+      wanderRouteRef.current = nearest.route;
+      wanderIndexRef.current = nearest.waypointIndex;
+      wanderTargetRef.current.copy(root.position);
+      nextWanderAtRef.current = clock.elapsedTime + 0.6 + nextRandom(randomSeedRef) * 0.8;
+      wanderPausedRef.current = true;
+      wanderingRef.current = true;
+    } else if (!shouldWander && wanderingRef.current) {
+      wanderingRef.current = false;
+      wanderPausedRef.current = true;
     }
-    if (leftArmRef.current && rightArmRef.current) {
-      const gesture = reducedMotion ? 0 : Math.sin(time * (actor.state === 'executing' ? 8 : 2.4));
-      let leftPose = -0.08;
-      let rightPose = 0.08;
-      if (actor.state === 'executing') {
-        leftPose = -0.48 + gesture * 0.08;
-        rightPose = 0.48 - gesture * 0.08;
-      } else if (actor.state === 'assigned') {
-        leftPose = -0.18;
-        rightPose = 0.62 + gesture * 0.08;
-      } else if (actor.state === 'ready') {
-        leftPose = -0.12;
-        rightPose = 2.38 + gesture * 0.16;
-      } else if (actor.state === 'trial') {
-        leftPose = -2.25 - gesture * 0.08;
-        rightPose = 2.25 + gesture * 0.08;
-      } else if (actor.state === 'attention') {
-        leftPose = -0.28;
-        rightPose = 1.02 + gesture * 0.1;
+
+    if (shouldWander && wanderPausedRef.current && clock.elapsedTime >= nextWanderAtRef.current) {
+      const route = wanderRouteRef.current;
+      let nextIndex = wanderIndexRef.current + wanderDirectionRef.current;
+      if (nextIndex < 0 || nextIndex >= route.length) {
+        wanderDirectionRef.current *= -1;
+        nextIndex = wanderIndexRef.current + wanderDirectionRef.current;
       }
-      const poseSmoothing = 1 - Math.exp(-delta * 6);
-      leftArmRef.current.rotation.z = MathUtils.lerp(leftArmRef.current.rotation.z, leftPose, poseSmoothing);
-      rightArmRef.current.rotation.z = MathUtils.lerp(rightArmRef.current.rotation.z, rightPose, poseSmoothing);
-      const typing = actor.state === 'executing' ? gesture * 0.18 : 0;
-      leftArmRef.current.rotation.x = typing;
-      rightArmRef.current.rotation.x = -typing;
+      wanderIndexRef.current = MathUtils.clamp(nextIndex, 0, route.length - 1);
+      const waypoint = route[wanderIndexRef.current];
+      wanderTargetRef.current.set(waypoint[0], placement.position[1], waypoint[1]);
+      wanderPausedRef.current = false;
     }
+
+    const destination = shouldWander ? wanderTargetRef.current : targetVector;
+    let distanceToTarget = root.position.distanceTo(destination);
+    if (shouldWander && !wanderPausedRef.current && distanceToTarget <= 0.1) {
+      wanderPausedRef.current = true;
+      wanderTargetRef.current.copy(root.position);
+      nextWanderAtRef.current = clock.elapsedTime + 1.4 + nextRandom(randomSeedRef) * 1.4;
+      distanceToTarget = 0;
+    }
+
+    const isWalking = !reducedMotion && distanceToTarget > 0.08
+      && (!shouldWander || !wanderPausedRef.current);
+    if (isWalking !== walkingRef.current) {
+      walkingRef.current = isWalking;
+      setWalking(isWalking);
+    }
+    const directionX = destination.x - root.position.x;
+    const directionZ = destination.z - root.position.z;
+    if (reducedMotion) root.position.copy(targetVector);
+    else if (isWalking) {
+      const step = delta * (shouldWander ? 0.68 : 1.7);
+      root.position.lerp(destination, Math.min(1, step / distanceToTarget));
+    }
+    for (let pass = 0; pass < COLLISION_SOLVER_PASSES; pass += 1) {
+      pushOutsideFurniture(root.position, { index, state: actor.state });
+      for (const registered of collisionRegistry.current.values()) {
+        if (registered.index >= index || registered.group === root) continue;
+        separatePoints(root.position, registered.group.position, index * 17 + registered.index + pass + 1);
+        pushOutsideFurniture(root.position, { index, state: actor.state });
+        pushOutsideFurniture(registered.group.position, { index: registered.index, state: registered.state });
+      }
+    }
+    const desiredRotation = isWalking
+      ? Math.atan2(directionX, directionZ)
+      : shouldWander
+        ? root.rotation.y
+        : placement.rotation;
+    const turnSmoothing = reducedMotion ? 1 : 1 - Math.exp(-delta * 7.5);
+    root.rotation.y = MathUtils.lerp(root.rotation.y, desiredRotation, turnSmoothing);
   });
 
   const handlePointer = (event: ThreeEvent<PointerEvent>, active: boolean) => {
@@ -614,38 +794,24 @@ function AgentEmployee({ actor, index, selected, reducedMotion, onSelect }: {
     document.body.style.cursor = active ? 'pointer' : '';
   };
 
-  return <group ref={rootRef} position={target.position} rotation={[0, target.rotation, 0]} onClick={(event) => { event.stopPropagation(); onSelect(); }} onPointerOver={(event) => handlePointer(event, true)} onPointerOut={(event) => handlePointer(event, false)}>
-    {selected ? <VoxelRing radius={0.72} color={stateColor} y={0.07} segments={12} /> : null}
-    <group ref={bodyRef} position={[0, target.sitting ? 0.72 : 0.86, 0]}>
-      <group ref={headRef}>
-        <PixelHeadShell index={index} color={actorPalette.shell} />
-        <VoxelHeadTrait index={index} color={actorPalette.trait} />
-        <NoggleFrame x={-0.155} frame={actorPalette.noggle} lens="#15252D" />
-        <NoggleFrame x={0.155} frame={actorPalette.noggle} lens="#15252D" />
-        <mesh position={[0, 0.69, 0.278]}><boxGeometry args={[0.09, 0.055, 0.08]} /><meshStandardMaterial color={actorPalette.noggle} roughness={0.86} metalness={0} /></mesh>
-      </group>
-      <NounTorso body={actorPalette.body} shell={actorPalette.shell} trait={actorPalette.trait} stateColor={stateColor} />
-      <JointedArm side={-1} color={actorPalette.limb} shell={actorPalette.shell} armRef={leftArmRef} />
-      <JointedArm side={1} color={actorPalette.limb} shell={actorPalette.shell} armRef={rightArmRef} />
-      <NounLeg side={-1} sitting={target.sitting} color={actorPalette.limb} shoe={SCENE_PALETTE.outline} />
-      <NounLeg side={1} sitting={target.sitting} color={actorPalette.limb} shoe={SCENE_PALETTE.outline} />
-      <AgentStateProp state={actor.state} color={stateColor} />
+  return <group ref={rootRef} position={initialPositionRef.current} rotation={[0, placement.rotation, 0]} onClick={(event) => { event.stopPropagation(); onSelect(); }} onPointerOver={(event) => handlePointer(event, true)} onPointerOut={(event) => handlePointer(event, false)}>
+    {selected ? <VoxelRing radius={0.68} color={stateColor} y={0.07} segments={12} /> : null}
+    <NounEmployeeModel accent={actor.accent} animation={animation} index={index} reducedMotion={reducedMotion} />
+    <group position={[0, 2.05, 0]}>
+      <mesh castShadow rotation={[0, Math.PI / 4, Math.PI / 4]}>
+        <octahedronGeometry args={[selected ? 0.16 : 0.11, 0]} />
+        <meshStandardMaterial color={stateColor} emissive={stateColor} emissiveIntensity={selected ? 0.3 : 0.12} roughness={0.72} metalness={0} />
+      </mesh>
     </group>
-    <mesh position={[0, 2.16, 0]} rotation={[0, Math.PI / 4, 0]}><boxGeometry args={[0.17, 0.17, 0.17]} /><meshStandardMaterial color={stateColor} roughness={0.86} metalness={0} /></mesh>
   </group>;
 }
 
-function OfficeWorld({ actors, selectedId, reducedMotion, onSelect }: AgentOfficeCanvasProps & { reducedMotion: boolean }) {
-  const worldRef = useRef<Group>(null);
-  useFrame(({ pointer }, delta) => {
-    if (!worldRef.current || reducedMotion) return;
-    worldRef.current.rotation.y = MathUtils.lerp(worldRef.current.rotation.y, pointer.x * 0.035, 1 - Math.exp(-delta * 3));
-    worldRef.current.rotation.x = MathUtils.lerp(worldRef.current.rotation.x, -pointer.y * 0.012, 1 - Math.exp(-delta * 3));
-  });
+function OfficeWorld({ actors, placements, selectedId, reducedMotion, onSelect }: AgentOfficeCanvasProps & { placements: ActorPlacement[]; reducedMotion: boolean }) {
   const deskCount = Math.max(6, actors.length);
+  const collisionRegistry = useRef<Map<string, RegisteredActor>>(new Map());
   const activeLinks = actors.flatMap((actor, index) => {
     if (actor.state === 'ready' || actor.state === 'paused') return [];
-    const actorPosition = positionForActor(actor, index).position;
+    const actorPosition = placements[index].position;
     const taskCore: [number, number, number] = [1.98, 2.08, -0.52];
     const desk = DESK_POSITIONS[index % DESK_POSITIONS.length];
     const endpoint: [number, number, number] = actor.state === 'assigned'
@@ -657,7 +823,7 @@ function OfficeWorld({ actors, selectedId, reducedMotion, onSelect }: AgentOffic
           : [actorPosition[0], 1.72, actorPosition[2]];
     return [{ actor, index, from: endpoint, target: taskCore }];
   });
-  return <group ref={worldRef}>
+  return <group>
     <AmbientParticles reducedMotion={reducedMotion} />
     <RoomShell />
     {DESK_POSITIONS.slice(0, deskCount).map((position, index) => <Workstation key={`${position[0]}-${position[1]}`} position={position} index={index} actor={actors[index]} selected={actors[index]?.id === selectedId} onSelect={actors[index] ? () => onSelect(actors[index].id) : undefined} />)}
@@ -667,7 +833,7 @@ function OfficeWorld({ actors, selectedId, reducedMotion, onSelect }: AgentOffic
     <RepairBay />
     <NetworkPulse reducedMotion={reducedMotion} />
     {activeLinks.map(({ actor, index, from, target }) => <DataLink key={actor.id} from={from} to={target} color={STATE_COLORS[actor.state]} index={index} reducedMotion={reducedMotion} />)}
-    {actors.map((actor, index) => <AgentEmployee key={actor.id} actor={actor} index={index} selected={actor.id === selectedId} reducedMotion={reducedMotion} onSelect={() => onSelect(actor.id)} />)}
+    {actors.map((actor, index) => <AgentEmployee key={actor.id} actor={actor} index={index} placement={placements[index]} selected={actor.id === selectedId} reducedMotion={reducedMotion} collisionRegistry={collisionRegistry} onSelect={() => onSelect(actor.id)} />)}
   </group>;
 }
 
@@ -688,24 +854,9 @@ function OfficeFallback({ actors, selectedId, onSelect }: AgentOfficeCanvasProps
 export function AgentOfficeCanvas(props: AgentOfficeCanvasProps) {
   const reducedMotion = useReducedMotion();
   const [webglAvailable] = useState(supportsWebGL);
-  const [tourEnabled, setTourEnabled] = useState(false);
-  const selectedIndex = Math.max(0, props.actors.findIndex((actor) => actor.id === props.selectedId));
-  const selectedActor = props.actors[selectedIndex] ?? props.actors[0];
-  const focusPosition = selectedActor ? positionForActor(selectedActor, selectedIndex).position : [0, 0, 0] as [number, number, number];
-
-  useEffect(() => {
-    if (!tourEnabled || props.actors.length < 2) return;
-    const timer = window.setInterval(() => {
-      const currentIndex = props.actors.findIndex((actor) => actor.id === props.selectedId);
-      const nextActor = props.actors[(Math.max(0, currentIndex) + 1) % props.actors.length];
-      if (nextActor) props.onSelect(nextActor.id);
-    }, 4200);
-    return () => window.clearInterval(timer);
-  }, [props.actors, props.onSelect, props.selectedId, tourEnabled]);
-
-  useEffect(() => {
-    if (reducedMotion) setTourEnabled(false);
-  }, [reducedMotion]);
+  const placements = useMemo(() => buildActorPlacements(props.actors), [props.actors]);
+  const selectedIndex = props.actors.findIndex((actor) => actor.id === props.selectedId);
+  const focusPosition = selectedIndex >= 0 ? placements[selectedIndex].position : [0, 0, 0] as [number, number, number];
 
   if (!webglAvailable) return <OfficeFallback {...props} />;
 
@@ -713,6 +864,7 @@ export function AgentOfficeCanvas(props: AgentOfficeCanvasProps) {
     <Canvas
       orthographic
       shadows
+      onPointerMissed={() => props.onClearSelection?.()}
       dpr={[1, 1.5]}
       camera={{ position: [12.8, 14.6, 15.8], zoom: 43, near: 0.1, far: 80 }}
       gl={{ antialias: true, alpha: false, powerPreference: 'high-performance' }}
@@ -722,23 +874,13 @@ export function AgentOfficeCanvas(props: AgentOfficeCanvasProps) {
       <ambientLight intensity={1.7} />
       <hemisphereLight args={['#F5FFFA', '#93B5B0', 2.1]} />
       <directionalLight castShadow position={[7, 14, 10]} intensity={3.3} color="#F8FFFC" shadow-mapSize-width={1024} shadow-mapSize-height={1024} shadow-camera-near={1} shadow-camera-far={38} shadow-camera-left={-12} shadow-camera-right={12} shadow-camera-top={12} shadow-camera-bottom={-12} />
-      <CameraRig focusPosition={focusPosition} tourEnabled={tourEnabled} />
-      <OfficeWorld {...props} reducedMotion={reducedMotion} />
+      <CameraRig focusPosition={focusPosition} />
+      <OfficeWorld {...props} placements={placements} reducedMotion={reducedMotion} />
     </Canvas>
     <div className="agent-office-hud" aria-hidden="true">
       <span>PINME-MESH / NOUNISH OPS</span>
       <strong><i />SYNCHRONIZED · {props.actors.length} DIGITAL WORKERS</strong>
     </div>
-    {selectedActor ? <div className="agent-office-command">
-      <div className="agent-office-focus">
-        <span>FOCUS / DIGITAL TWIN</span>
-        <strong>{selectedActor.name}</strong>
-        <small>{selectedActor.statusLabel}</small>
-      </div>
-      <button type="button" aria-pressed={tourEnabled} disabled={reducedMotion} title={reducedMotion ? '系统已开启减少动态效果' : undefined} onClick={() => setTourEnabled((enabled) => !enabled)}>
-        <i />{tourEnabled ? '停止巡航' : '演示巡航'}
-      </button>
-    </div> : null}
     <div className="agent-office-legend" aria-hidden="true">
       <span data-zone="work">工位</span>
       <span data-zone="task">任务台</span>

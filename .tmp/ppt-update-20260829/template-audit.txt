@@ -1,0 +1,16 @@
+Template audit: docs/pinme-mesh-demo.pptx
+Inspected: 2026-08-29
+Canvas: 16:9, 1280 × 720
+Theme: Office theme; Arial / Arial Unicode MS; alternating white and dark slides; cyan and lime accents.
+
+Slide 1 — Cover. Dark brand slide with live domain and current CID. Reuse unchanged composition; update deployment evidence and date.
+Slide 2 — Product thesis. White five-stage product arc and three differentiation cards. Preserve content and layout; update footer date only.
+Slide 3 — End-to-end loop. White ten-node snake flow. Reuse all inherited cards to show the verified 6-step / 3-role-agent execution and automatic delivery flow.
+Slide 4 — Architecture. White four-layer architecture plus three boundary cards. Reuse all inherited elements; make the shared PinMe LLM / specialized role-runtime boundary explicit.
+Slide 5 — Agent market. Dark screenshot-led capability slide. Preserve content and layout; update footer date only.
+Slide 6 — 3D digital twin. Dark screenshot-led product-highlight slide. Preserve content and layout; update footer date only.
+Slide 7 — Verifiable delivery. White three-stage evidence chain plus four operational facts. Reuse all inherited elements to show the verified multi-file mission package and encrypted AppKey flow.
+Slide 8 — Web3 and contribution. White PM/escrow/ENS diagram. Preserve content and layout; update footer date only.
+Slide 9 — Demo. White six-step demo route, release checklist, next steps, and caveat. Reuse all inherited elements to reflect current smoke-test evidence.
+
+Decision: preserve every slide, master, layout, theme, image, shape, and decorative primitive. No new primitive is needed. All edits map to inherited textboxes.

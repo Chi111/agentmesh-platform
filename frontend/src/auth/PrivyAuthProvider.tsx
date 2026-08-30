@@ -26,10 +26,26 @@ import { submitYdAction, ydWalletConfigured } from '../services/ydFinance';
 import { privyAppId, privyClientId, privyLoginMethods } from './config';
 import { type AuthContextValue, type AuthStatus, readableAuthError } from './context';
 
+type PrivyLinkedWallet = Extract<PrivyUser['linkedAccounts'][number], { type: 'wallet' }>;
+
+function isEmbeddedPrivyWallet(wallet: { walletClientType?: string; connectorType?: string }) {
+  const walletClientType = wallet.walletClientType?.toLocaleLowerCase();
+  const connectorType = wallet.connectorType?.toLocaleLowerCase();
+  return walletClientType === 'privy'
+    || walletClientType === 'privy-v2'
+    || connectorType === 'embedded';
+}
+
 function privyIdentity(user: PrivyUser) {
-  const walletAddress = user.wallet?.address
-    ?? user.linkedAccounts.find((account) => account.type === 'wallet')?.address
-    ?? null;
+  const primaryWallet = user.wallet?.chainType === 'ethereum' && !isEmbeddedPrivyWallet(user.wallet)
+    ? user.wallet
+    : null;
+  const linkedWallet = user.linkedAccounts.find((account): account is PrivyLinkedWallet => (
+    account.type === 'wallet'
+    && account.chainType === 'ethereum'
+    && !isEmbeddedPrivyWallet(account)
+  ));
+  const walletAddress = primaryWallet?.address ?? linkedWallet?.address ?? null;
   const email = user.email?.address ?? user.google?.email;
   const displayName = user.google?.name?.trim()
     || email?.split('@')[0]
@@ -61,7 +77,10 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
   const connectedWallet = useMemo(() => {
     const verifiedAddress = identity?.walletAddress?.toLocaleLowerCase();
     if (!walletsReady || !verifiedAddress) return null;
-    return wallets.find((wallet) => wallet.address.toLocaleLowerCase() === verifiedAddress) ?? null;
+    return wallets.find((wallet) => (
+      !isEmbeddedPrivyWallet(wallet)
+      && wallet.address.toLocaleLowerCase() === verifiedAddress
+    )) ?? null;
   }, [identity?.walletAddress, wallets, walletsReady]);
   const chainEnabled = onchainSettlementConfigured();
 
@@ -109,7 +128,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
       ...serverProfile,
       email: serverProfile.email ?? identity?.email,
       displayName: isDefaultPlatformUserName(serverProfile.displayName) ? identity?.displayName ?? BRAND.platform.defaultUserName : serverProfile.displayName,
-      walletAddress: serverProfile.walletAddress ?? identity?.walletAddress ?? undefined,
+      walletAddress: identity?.walletAddress ?? undefined,
     };
     setProfile(nextProfile);
     return nextProfile;
@@ -153,7 +172,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     profile,
     error,
     provider: 'privy',
-    linkedWalletAddress: identity?.walletAddress ?? profile?.walletAddress ?? null,
+    linkedWalletAddress: identity?.walletAddress ?? null,
     walletAddress: connectedWallet?.address ?? null,
     ensName: null,
     onchainSettlement: chainEnabled,
@@ -174,7 +193,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
       openLinkWallet({ walletChainType: 'ethereum-only' });
     },
     depositEscrow: async (missionId, amount, paymentMethod, recipients) => {
-      const settlementWalletAddress = connectedWallet?.address ?? identity?.walletAddress;
+      const settlementWalletAddress = connectedWallet?.address;
       if (!settlementWalletAddress) throw new Error('请先连接已验证的钱包后再提交链上托管。');
       return submitEscrowDeposit(sendConnectedTransaction, settlementWalletAddress, missionId, amount, paymentMethod, recipients);
     },
@@ -183,7 +202,7 @@ function PrivySession({ onChange }: { onChange: (value: AuthContextValue) => voi
     unfreezeEscrow: async (missionId) => submitEscrowUnfreeze(sendConnectedTransaction, missionId),
     refundEscrow: async (missionId) => submitEscrowRefund(sendConnectedTransaction, missionId),
     submitYdAction: async (action) => {
-      const ydWalletAddress = connectedWallet?.address ?? identity?.walletAddress;
+      const ydWalletAddress = connectedWallet?.address;
       if (!ydWalletAddress) throw new Error(`请先连接已验证的钱包后再提交 ${BRAND.contribution.symbol} 交易。`);
       return submitYdAction(sendConnectedTransaction, ydWalletAddress, action);
     },
@@ -212,12 +231,12 @@ export function PrivyAuthController({ onChange }: { onChange: (value: AuthContex
           theme: 'light',
           accentColor: '#00B8D9',
           landingHeader: `进入 ${BRAND.platform.name}`,
-          loginMessage: '使用邮箱或钱包签名进入同一个工作区',
+          loginMessage: 'Google/邮箱用于 Web2；外部钱包仅用于 Web3 签名与支付',
           showWalletLoginFirst: false,
           walletChainType: 'ethereum-only',
           walletList: ['metamask', 'coinbase_wallet', 'rainbow', 'base_account', 'wallet_connect'],
         },
-        embeddedWallets: { ethereum: { createOnLogin: 'users-without-wallets' } },
+        embeddedWallets: { ethereum: { createOnLogin: 'off' } },
         defaultChain: sepolia,
         supportedChains: [sepolia],
       }}

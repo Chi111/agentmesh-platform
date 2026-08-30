@@ -72,7 +72,10 @@ function lifecycleStatus(
     && validPayout
     && recentOutcomes.length >= 3
     && recentOutcomes.slice(0, 3).every((event) => event.type === 'mission_settled_success');
-  if (previous === 'suspended' && !recoveryReady) return 'suspended';
+  if (previous === 'suspended') {
+    if (!trialPassed || !endpointHealthy || !validPayout) return 'suspended';
+    return recoveryReady ? 'listed' : 'degraded';
+  }
   if (!trialPassed) return previous === 'listed' || previous === 'degraded' ? 'degraded' : previous === 'registered' || previous === 'verifying' ? previous : 'trial';
   if (!endpointHealthy || !validPayout) return previous === 'listed' || previous === 'degraded' ? 'degraded' : 'trial';
   if (previous === 'listed' && reputation >= 65) return 'listed';

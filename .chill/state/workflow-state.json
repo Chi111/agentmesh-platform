@@ -2,18 +2,18 @@
   "version": 1,
   "status": "completed",
   "route": "dynamic",
-  "reason": "pinme-mesh/PM branding and PinMe/IPFS evidence v1 are implemented and split-deployed. Sepolia PM contracts plus the reversible reward, claim, lock, Power and emergency-withdraw smoke are verified clean through an independent public RPC.",
-  "activeCommand": "/chill-ai finish specs/008-meshpin-ipfs-evidence",
-  "currentStage": "completed",
-  "currentFeature": "specs/008-meshpin-ipfs-evidence",
-  "currentTaskId": "T12",
+  "reason": "The reviewed complex mission package must be split-deployed to the existing PinMe production preview and validated from the beginning through the real UI with Computer Use.",
+  "activeCommand": "/chill-ai finish",
+  "currentStage": "finish",
+  "currentFeature": "specs/009-complex-mission-delivery",
+  "currentTaskId": "DEPLOY-1",
   "lastSafeCheckpoint": {
     "stage": "deployment",
-    "completedAt": "2026-08-28T13:55:45+08:00",
-    "summary": "PM Sepolia epoch 1787896008 settled exactly; Treasury again owns the full 100,000,000 PM supply and Distributor/Staking balances, commitments, lock and Power are zero."
+    "completedAt": "2026-08-29T21:49:00+08:00",
+    "summary": "Markdown delivery rendering and the responsive internal scroll container were split-deployed to mesh-pinme. Database, Worker, new frontend CID, both domains, live CSS and CORS/preflight were verified."
   },
   "nextSafeCommand": "",
   "blockedGateId": null,
-  "autoRun": false,
-  "updatedAt": "2026-08-28T13:55:45+08:00"
+  "autoRun": true,
+  "updatedAt": "2026-08-29T21:49:00+08:00"
 }

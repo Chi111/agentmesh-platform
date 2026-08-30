@@ -148,6 +148,7 @@ export default function App() {
         <Route path="/yd-finance" element={protectedPage(<YdFinancePage />)} />
         <Route path="/admin" element={protectedPage(<AdminPage />)} />
         <Route path="/developer" element={protectedPage(<DeveloperDashboardPage />)} />
+        <Route path="/developer/fleet" element={<Navigate to="/developer/agents" replace />} />
         <Route path="/developer/agents" element={protectedPage(<DeveloperAgentsPage />)} />
         <Route path="/developer/agents/new" element={protectedPage(<RegisterAgentPage />)} />
         <Route path="/developer/jobs" element={protectedPage(<DeveloperJobsPage />)} />

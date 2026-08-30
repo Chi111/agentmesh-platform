@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { encodeAbiParameters } from 'viem';
 import { BRAND } from '../shared/brand';
 
 test.beforeEach(async ({ page }) => {
@@ -23,11 +24,59 @@ test('anonymous users can only browse the public Agent directory', async ({ page
 
 test('public homepage remains useful without authentication or RPC availability', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.addInitScript(() => window.localStorage.setItem('agentmesh:public-locale', 'zh-CN'));
   await page.route('**/ethereum-sepolia-rpc.publicnode.com/**', (route) => route.abort('failed'));
+  await page.route('**/11155111.rpc.thirdweb.com/**', (route) => route.abort('failed'));
 
   await page.goto('/#/');
 
   await expect(page.getByRole('heading', { name: '协作有共识， 资金有路径。' })).toBeVisible();
+  await expect(page.locator('link[rel="modulepreload"][href*="babylon"]')).toHaveCount(0);
+  const babylonScene = page.locator('.contract-babylon');
+  await expect(babylonScene).toHaveAttribute('data-ready', 'true', { timeout: 15_000 });
+  await expect(babylonScene).toHaveAttribute('data-source', 'https://mesh3d.gallery/experiment/scifi-tunnel');
+  await expect(babylonScene).toHaveAttribute('data-effects', 'curved-flight neon-frames camera-roll heavy-bloom');
+  await expect(babylonScene).toHaveAttribute('data-geometry', 'mesh3d-scifi-hollow-frame-tunnel');
+  await expect(babylonScene).toHaveAttribute('data-frames', '234');
+  await expect(babylonScene).toHaveAttribute('data-quality', 'full');
+  await expect(babylonScene.locator('canvas')).toBeVisible();
+  expect(await babylonScene.locator('canvas').evaluate((canvas) => ({
+    width: (canvas as HTMLCanvasElement).width,
+    height: (canvas as HTMLCanvasElement).height,
+  }))).toEqual({ width: 390, height: 844 });
+  await expect.poll(async () => {
+    const renderMs = Number(await babylonScene.getAttribute('data-render-ms'));
+    return Number.isFinite(renderMs) && renderMs > 0;
+  }).toBe(true);
+  await expect.poll(async () => Number(await babylonScene.getAttribute('data-scene-opacity'))).toBeCloseTo(0.24, 2);
+  const pretextField = page.locator('.contract-pretext');
+  await expect(pretextField).toHaveAttribute('data-ready', 'true');
+  await expect(pretextField).toHaveAttribute('data-quality', /^(high|economy)$/);
+  await expect(page.locator('.contract-hero')).toHaveAttribute('data-pretext-ready', 'true');
+  await expect(pretextField.locator('canvas')).toBeVisible();
+  expect(Number(await pretextField.getAttribute('data-glyphs'))).toBeGreaterThan(60);
+  await expect(page.locator('.contract-hero__headline-source')).toHaveCSS('opacity', '0');
+  await expect(page.locator('.contract-hero__description-source')).toHaveCSS('opacity', '0');
+  await expect(page.locator('.protocol-stage__node, .babylon-stage-ui__status')).toHaveCount(0);
+  await expect(page.locator('.contract-liquid-glass')).toHaveCount(5);
+  const languagePicker = page.locator('.contract-language-picker');
+  const languageSelect = page.getByLabel('选择语言');
+  await expect(languagePicker).toHaveCSS('backdrop-filter', /blur\(8px\)/);
+  await languageSelect.focus();
+  await expect(languageSelect).toHaveCSS('box-shadow', 'none');
+  await expect(languagePicker).toHaveCSS('outline-style', 'none');
+  await expect(languagePicker).toHaveCSS('border-color', 'rgba(213, 252, 250, 0.16)');
+  expect(await languagePicker.evaluate((element) => getComputedStyle(element).boxShadow))
+    .not.toContain('0px 0px 0px 1px');
+  await expect(page.locator('.contract-liquid-card')).toHaveCount(3);
+  await expect(page.locator('.contract-liquid-panel')).toHaveCount(2);
+  await expect(page.locator('.contract-glass-metric')).toHaveCount(4);
+  await expect(page.locator('.contract-live-stat')).toHaveCount(4);
+  await expect(page.locator('.contract-feature-glass')).toHaveCount(3);
+  await expect(page.locator('.contract-cta-glass')).toHaveCSS('backdrop-filter', /blur\(6px\)/);
+  await expect
+    .poll(async () => Number(await pretextField.getAttribute('data-render-ms') ?? Number.POSITIVE_INFINITY))
+    .toBeLessThan(6);
   await expect(page.locator('header img[src="/pinme-mesh-mark.svg"]')).toBeVisible();
   await expect(page.getByRole('link', { name: '在 Etherscan 验证' })).toHaveAttribute(
     'href',
@@ -38,7 +87,17 @@ test('public homepage remains useful without authentication or RPC availability'
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
 
   const scrollChapter = page.locator('.contract-hero__chapter-two');
+  await page.evaluate(() => window.scrollTo(0, window.innerHeight * 0.44));
+  await expect
+    .poll(async () => Number(await babylonScene.getAttribute('data-scene-opacity')))
+    .toBeGreaterThan(0.85);
+  await expect
+    .poll(async () => Number(await pretextField.getAttribute('data-scroll-fade')))
+    .toBeLessThan(0.1);
   await page.evaluate(() => window.scrollTo(0, window.innerHeight * 1.05));
+  await expect
+    .poll(async () => Number(await babylonScene.getAttribute('data-scene-opacity')))
+    .toBeLessThan(0.12);
   await expect
     .poll(async () => Number(await scrollChapter.evaluate((element) => getComputedStyle(element).opacity)))
     .toBeGreaterThan(0.8);
@@ -55,7 +114,113 @@ test('public homepage remains useful without authentication or RPC availability'
     .not.toBe('0%');
 });
 
+test('public homepage keeps core contract state when the primary RPC and event index fail', async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem('agentmesh:public-locale', 'zh-CN'));
+  let primaryRequests = 0;
+  let fallbackRequests = 0;
+  let activityRequests = 0;
+
+  await page.route('**/ethereum-sepolia-rpc.publicnode.com/**', (route) => {
+    primaryRequests += 1;
+    return route.abort('failed');
+  });
+  await page.route('**/11155111.rpc.thirdweb.com/**', async (route) => {
+    if (route.request().method() === 'OPTIONS') {
+      await route.fulfill({
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Headers': 'content-type',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+      return;
+    }
+
+    fallbackRequests += 1;
+    type RpcRequest = { id: number | string | null; method: string; params?: unknown[] };
+    const payload = route.request().postDataJSON() as RpcRequest | RpcRequest[];
+    const requests = Array.isArray(payload) ? payload : [payload];
+    const responses = requests.map((request) => {
+      if (request.method === 'eth_getLogs') {
+        activityRequests += 1;
+        return {
+          jsonrpc: '2.0',
+          id: request.id,
+          error: { code: -32005, message: 'Mock event index limit' },
+        };
+      }
+
+      let result: string;
+      if (request.method === 'eth_blockNumber') result = `0x${11_541_040n.toString(16)}`;
+      else if (request.method === 'eth_getCode') result = '0x6000';
+      else if (request.method === 'eth_getBalance') result = `0x${1_250_000_000_000_000_000n.toString(16)}`;
+      else if (request.method === 'eth_chainId') result = `0x${11_155_111n.toString(16)}`;
+      else if (request.method === 'eth_call') {
+        const call = request.params?.[0] as { data?: string } | undefined;
+        const selector = call?.data?.slice(0, 10);
+        if (selector === '0x5c975abb') result = encodeAbiParameters([{ type: 'bool' }], [false]);
+        else if (selector === '0xfc0c546a') result = encodeAbiParameters([{ type: 'address' }], ['0x38A28074C414F94024bc56AA52641DdEdDf17df7']);
+        else if (selector === '0x61d027b3') result = encodeAbiParameters([{ type: 'address' }], ['0x1111111111111111111111111111111111111111']);
+        else if (selector === '0x22dcd13e') result = encodeAbiParameters([{ type: 'uint16' }], [40]);
+        else if (selector === '0x70a08231') result = encodeAbiParameters([{ type: 'uint256' }], [123_456_789n]);
+        else if (selector === '0x95d89b41') result = encodeAbiParameters([{ type: 'string' }], ['mUSDC']);
+        else if (selector === '0x313ce567') result = encodeAbiParameters([{ type: 'uint8' }], [6]);
+        else return { jsonrpc: '2.0', id: request.id, error: { code: -32601, message: `Unknown eth_call selector ${selector}` } };
+      } else {
+        return { jsonrpc: '2.0', id: request.id, error: { code: -32601, message: `Unknown method ${request.method}` } };
+      }
+      return { jsonrpc: '2.0', id: request.id, result };
+    });
+
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: { 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify(Array.isArray(payload) ? responses : responses[0]),
+    });
+  });
+
+  await page.goto('/#/');
+
+  await expect(page.getByText('运行中', { exact: true })).toBeVisible();
+  await expect(page.getByText('11,541,040', { exact: true })).toBeVisible();
+  await expect(page.getByText('123.46', { exact: true })).toBeVisible();
+  await expect(page.getByText('1.25', { exact: true })).toBeVisible();
+  await expect(page.getByText('基础合约状态已同步，但事件索引节点暂时不可用。')).toBeVisible();
+  await expect(page.getByText('实时 RPC 暂时不可用，静态合约档案仍可验证。')).toHaveCount(0);
+  expect(primaryRequests).toBeGreaterThan(0);
+  expect(fallbackRequests).toBeGreaterThan(0);
+  expect(activityRequests).toBeGreaterThan(0);
+});
+
+test('public homepage switches between English, Japanese, and Chinese and remembers the choice', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route('**/ethereum-sepolia-rpc.publicnode.com/**', (route) => route.abort('failed'));
+  await page.route('**/11155111.rpc.thirdweb.com/**', (route) => route.abort('failed'));
+
+  await page.goto('/#/');
+  await expect(page.getByRole('heading', { name: 'Work aligned. Capital traced.' })).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+
+  await page.getByLabel('Choose language').selectOption('ja-JP');
+  await expect(page.getByRole('heading', { name: '協働に合意を、 資金に経路を。' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Etherscan で検証' })).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'ja-JP');
+  await expect(page.locator('.contract-hero')).toHaveAttribute('data-pretext-ready', 'true');
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: '協働に合意を、 資金に経路を。' })).toBeVisible();
+  await expect(page.getByLabel('言語を選択')).toHaveValue('ja-JP');
+
+  await page.getByLabel('言語を選択').selectOption('zh-CN');
+  await expect(page.getByRole('heading', { name: '协作有共识， 资金有路径。' })).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+});
+
 test('legacy contract URL redirects to the public homepage', async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem('agentmesh:public-locale', 'zh-CN'));
   await page.goto('/#/contract');
   await expect(page).toHaveURL(/\/#\/$/);
   await expect(page.getByRole('heading', { name: '协作有共识， 资金有路径。' })).toBeVisible();
@@ -119,7 +284,7 @@ test('verified ENS primary name replaces the current wallet label', async ({ pag
   await page.goto('/#/dashboard');
 
   await expect(page.locator('#app-sidebar').getByText('vitalik.eth', { exact: true })).toBeVisible();
-  const walletButton = page.getByRole('button', { name: '身份钱包 vitalik.eth' });
+  const walletButton = page.getByRole('button', { name: 'Web3 外部钱包 vitalik.eth' });
   await expect(walletButton).toBeVisible();
   await walletButton.click();
   await expect(page.getByText('ENS', { exact: true })).toBeVisible();
@@ -204,7 +369,7 @@ test('public Agent directory remains available when private workspace hydration 
     id: 'official-evidence-scout', ownerId: 'agentmesh-official', name: 'Evidence Scout', category: '数据研究',
     summary: '面向测试网任务的证据研究 Agent，返回可审计的结构化研究结果。', tags: ['研究', '证据', '核验'],
     status: 'active', trustScore: 9.1, successRate: 91, responseTime: '1.2s', price: 12, jobs: 0, volume: 0,
-    author: 'AgentMesh Official', version: 'v1.0.0', official: true, wallet: '0x2200000000000000000000000000000000000a11',
+    author: 'AgentMesh Official', version: 'v1.0.0', official: true, wallet: '0x73325bd3e93d9a12e5d2d5219424daf0e55f856d',
     endpoint: 'https://agentmesh-platform-74a3.api.pinme.pro/api/agents/official-evidence-scout/invoke', authType: 'bearer',
     quality: {
       agentId: 'official-evidence-scout', marketplaceStatus: 'listed', reputation: 91.5,
@@ -552,18 +717,36 @@ test('requester invitations and developer acceptance unlock funding only after e
   await page.goto('/#/developer/agents');
   const fleetScene = page.getByRole('region', { name: 'Agent 数字孪生指挥舱' });
   await expect(fleetScene).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole('link', { name: '3D 指挥舱' })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: '打开 3D 指挥舱' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Agent 列表' })).toHaveCount(0);
+  await expect(fleetScene.getByText('拖拽旋转 · 滚轮或双指缩放 ±20% · 点击 Agent 查看卡片')).toBeVisible();
+  const fleetBounds = await fleetScene.boundingBox();
+  expect(fleetBounds?.width).toBeGreaterThan(900);
+  expect(fleetBounds?.width).toBeLessThan(1280);
+  expect(fleetBounds?.height).toBeGreaterThan(600);
+  const fleetCanvas = fleetScene.locator('canvas');
+  const canvasBounds = await fleetCanvas.boundingBox();
+  expect(canvasBounds).not.toBeNull();
+  if (canvasBounds) {
+    await page.mouse.move(canvasBounds.x + canvasBounds.width * 0.72, canvasBounds.y + canvasBounds.height * 0.64);
+    await page.mouse.down();
+    await page.mouse.move(canvasBounds.x + canvasBounds.width * 0.58, canvasBounds.y + canvasBounds.height * 0.56, { steps: 8 });
+    await page.mouse.up();
+    await page.mouse.wheel(0, -2_400);
+  }
+  await expect(page.getByRole('navigation', { name: '开发者控制台' })).toBeVisible();
+  await expect(fleetScene.getByRole('dialog')).toHaveCount(0);
   await expect(fleetScene.getByText('0 执行')).toBeVisible();
   await expect(fleetScene.getByText('3 待接单')).toBeVisible();
-  await fleetScene.getByRole('button', { name: 'Agent 2，等待接单' }).click();
-  await expect(fleetScene.locator('aside').getByRole('heading', { name: 'Agent 2' })).toBeVisible();
-  await expect(fleetScene.locator('aside').getByText(mission.title)).toBeVisible();
-  await expect(fleetScene.locator('aside').getByText('0%', { exact: true })).toBeVisible();
-  const tourButton = fleetScene.getByRole('button', { name: /演示巡航|停止巡航/ });
-  await tourButton.click();
-  await expect(tourButton).toHaveAttribute('aria-pressed', 'true');
-  await tourButton.click();
+  await fleetScene.getByRole('button', { name: '查看 Agent 2 工作卡片' }).evaluate((button: HTMLButtonElement) => button.click());
+  const agentCard = fleetScene.getByRole('dialog', { name: 'Agent 2' });
+  await expect(agentCard).toBeVisible();
+  await expect(agentCard.getByText(mission.title)).toBeVisible();
+  await expect(agentCard.getByText('0%', { exact: true })).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(fleetScene).toBeVisible();
+  await expect(agentCard).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
   await page.setViewportSize({ width: 1280, height: 720 });
 

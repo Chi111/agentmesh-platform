@@ -1,0 +1,13 @@
+{
+  "status": "pass",
+  "checkedAt": "2026-08-30T03:30:14.155Z",
+  "workspace": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt",
+  "finalPptx": "/Users/mac/workcode/agentmesh-platform/docs/pinme-mesh-roadshow-20260830.pptx",
+  "starterPptx": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt/template-starter.pptx",
+  "mapPath": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt/template-frame-map.json",
+  "starterLayoutDir": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt/template-inspect/layouts",
+  "finalLayoutDir": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt/final-inspect/layouts",
+  "editDir": "/Users/mac/workcode/agentmesh-platform/.tmp/roadshow-20260830/ppt",
+  "issueCount": 0,
+  "issues": []
+}

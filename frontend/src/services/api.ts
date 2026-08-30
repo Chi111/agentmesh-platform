@@ -31,6 +31,7 @@ import type {
   StageOffer,
   UserProfile,
   UserPreferences,
+  PinmeIntegrationStatus,
   UserRole,
   WalletAccount,
   YdChainConfig,
@@ -187,6 +188,13 @@ export const api = {
   getPreferences: () => request<UserPreferences>('/api/me/preferences', { authenticated: true }),
   updatePreferences: (preferences: Omit<UserPreferences, 'updatedAt'>) => request<UserPreferences>('/api/me/preferences', {
     method: 'PUT', authenticated: true, body: JSON.stringify(preferences),
+  }),
+  getPinmeIntegration: () => request<PinmeIntegrationStatus>('/api/me/integrations/pinme', { authenticated: true }),
+  savePinmeIntegration: (appKey: string) => request<PinmeIntegrationStatus>('/api/me/integrations/pinme', {
+    method: 'PUT', authenticated: true, body: JSON.stringify({ appKey }),
+  }),
+  deletePinmeIntegration: () => request<PinmeIntegrationStatus>('/api/me/integrations/pinme', {
+    method: 'DELETE', authenticated: true,
   }),
   getWalletAccount: () => request<WalletAccount>('/api/wallet', { authenticated: true }),
   claimTestCredit: () => request<{ account: WalletAccount; credited: boolean }>('/api/wallet/test-topup', {

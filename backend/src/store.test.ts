@@ -134,6 +134,74 @@ describe('D1PlatformStore concurrency invariants', () => {
     store = new D1PlatformStore(database);
   });
 
+  it('synchronizes only the authoritative external wallet for a Privy identity', async () => {
+    const subject = 'did:privy:web2-wallet-sync';
+    const previouslyAcceptedEmbeddedWallet = '0x7300000000000000000000000000000000008f2c';
+    const created = await store.ensureIdentityProfile({
+      provider: 'privy',
+      subject,
+      email: 'wallet-sync@example.com',
+      displayName: 'Wallet Sync',
+      walletAddress: previouslyAcceptedEmbeddedWallet,
+      walletAddressAuthoritative: true,
+    });
+    expect(created.walletAddress).toBe(previouslyAcceptedEmbeddedWallet);
+
+    const web2Only = await store.ensureIdentityProfile({
+      provider: 'privy',
+      subject,
+      email: 'wallet-sync@example.com',
+      displayName: 'Wallet Sync',
+      walletAddressAuthoritative: true,
+    });
+    expect(web2Only.walletAddress).toBeUndefined();
+    expect(database.db.prepare(`
+      SELECT wallet_address FROM auth_identities WHERE provider = 'privy' AND subject = ?
+    `).get(subject)).toEqual({ wallet_address: null });
+
+    const independentlyAssignedWallet = '0x7400000000000000000000000000000000008f2c';
+    database.db.prepare('UPDATE profiles SET wallet_address = ? WHERE id = ?')
+      .run(independentlyAssignedWallet, web2Only.id);
+    const preserved = await store.ensureIdentityProfile({
+      provider: 'privy',
+      subject,
+      email: 'wallet-sync@example.com',
+      displayName: 'Wallet Sync',
+      walletAddressAuthoritative: true,
+    });
+    expect(preserved.walletAddress).toBe(independentlyAssignedWallet);
+  });
+
+  it('replays the visual DAG migration without changing a locked edge-less workflow', () => {
+    const migration = readFileSync(join(import.meta.dirname, '../../db/016_visual_workflow_dag.sql'), 'utf8');
+
+    expect(() => database.db.exec(migration)).not.toThrow();
+    expect(database.db.prepare(`
+      SELECT COUNT(*) AS count FROM workflow_edges WHERE mission_id = 'TASK-2026-0815'
+    `).get()).toEqual({ count: 0 });
+
+    database.db.prepare(`UPDATE escrows SET status = 'pending' WHERE mission_id = 'TASK-2026-0815'`).run();
+    expect(() => database.db.exec(migration)).not.toThrow();
+    expect(database.db.prepare(`
+      SELECT COUNT(*) AS count FROM workflow_edges WHERE mission_id = 'TASK-2026-0815'
+    `).get()).toEqual({ count: 1 });
+  });
+
+  it('persists only encrypted user PinMe credential envelopes', async () => {
+    const credential = {
+      userId: 'demo-requester',
+      addressHint: '0x12345…cdef',
+      ciphertext: 'encrypted-payload',
+      iv: 'random-iv',
+      updatedAt: '2026-08-29T00:00:00.000Z',
+    };
+    expect(await store.getUserPinmeCredential(credential.userId)).toBeNull();
+    expect(await store.saveUserPinmeCredential(credential)).toEqual(credential);
+    expect(await store.getUserPinmeCredential(credential.userId)).toEqual(credential);
+    expect(await store.deleteUserPinmeCredential(credential.userId)).toBe(true);
+    expect(await store.getUserPinmeCredential(credential.userId)).toBeNull();
+  });
+
   it('persists an append-only CID version chain, acceptance snapshot and public Agent portfolio', async () => {
     const firstCid = 'bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm';
     const secondCid = 'bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsy';
@@ -249,6 +317,49 @@ describe('D1PlatformStore concurrency invariants', () => {
     ]);
     expect(official.every((agent) => agent.official && agent.status === 'active')).toBe(true);
     expect(official.every((agent) => agent.endpoint.startsWith('agentmesh://builtin/'))).toBe(true);
+    expect(official.every((agent) => agent.wallet === '0x73325bd3e93d9a12e5d2d5219424daf0e55f856d')).toBe(true);
+  });
+
+  it('assigns official Agent Web2 ownership and CREDIT rewards to the verified administrator email profile', async () => {
+    database.db.exec(`
+      INSERT INTO wallet_transactions
+        (id, settlement_key, user_id, transaction_type, amount, token, mission_id, created_at)
+      VALUES
+        ('official-payout-before-admin', 'official-payout-before-admin', 'agentmesh-official',
+         'agent_payout', 12.5, 'CREDIT', 'TASK-2026-0809', '2026-08-29T00:00:00.000Z');
+
+      INSERT INTO reward_activities
+        (id, source_key, user_id, mission_id, dispute_id, role, formula_version, asset,
+         settled_amount, quality_bps, penalty_bps, score_micros, eligible, detail_json, occurred_at, created_at)
+      VALUES
+        ('official-reward-before-admin', 'official-reward-before-admin', 'agentmesh-official',
+         'TASK-2026-0809', NULL, 'agent_owner', 'agentmesh-yd-v1', 'CREDIT',
+         12.5, 10000, 0, 1000000, 1, '{}', '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z');
+
+      INSERT INTO profiles (id, email, display_name, role)
+      VALUES ('admin-email-web2-uid', 'CHI435900020@GMAIL.COM', 'Platform Administrator', 'requester');
+    `);
+
+    const official = (await store.listAgents()).filter((agent) => agent.official);
+    expect(official).toHaveLength(3);
+    expect(official.every((agent) => (
+      agent.ownerId === 'admin-email-web2-uid'
+      && agent.wallet === '0x73325bd3e93d9a12e5d2d5219424daf0e55f856d'
+      && agent.author === 'Platform Administrator'
+    ))).toBe(true);
+    expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('agentmesh-official')).toEqual({ balance: 0 });
+    expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('admin-email-web2-uid')).toEqual({ balance: 12.5 });
+    expect(database.db.prepare('SELECT user_id FROM wallet_transactions WHERE id = ?').get('official-payout-before-admin')).toEqual({ user_id: 'admin-email-web2-uid' });
+    expect(database.db.prepare('SELECT user_id FROM reward_activities WHERE id = ?').get('official-reward-before-admin')).toEqual({ user_id: 'admin-email-web2-uid' });
+    expect(database.db.prepare('SELECT role, wallet_address FROM profiles WHERE id = ?').get('admin-email-web2-uid')).toEqual({
+      role: 'admin',
+      wallet_address: null,
+    });
+
+    const migration = readFileSync(join(import.meta.dirname, '../../db/032_assign_official_agents_to_admin.sql'), 'utf8');
+    expect(() => database.db.exec(migration)).not.toThrow();
+    expect(() => database.db.exec(migration)).not.toThrow();
+    expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('admin-email-web2-uid')).toEqual({ balance: 12.5 });
   });
 
   it('keeps Agent quality events idempotent, deterministically recomputable and feedback versioned', async () => {
@@ -912,6 +1023,63 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM workflow_stage_attempts WHERE stage_id = ? AND is_current = 1').get('stage-visual')).toEqual({ count: 1 });
     expect(database.db.prepare('SELECT run_id FROM workflow_stage_attempts WHERE stage_id = ? AND is_current = 1').get('stage-visual')).toEqual({
       run_id: 'run-active-during-migration',
+    });
+  });
+
+  it('replays manual Trial overrides without replacing a newer Agent state', () => {
+    database.db.exec(`
+      INSERT INTO agents
+        (id, owner_id, name, category, summary, endpoint_url, price_usdc, wallet_address, status, author_name, updated_at)
+      VALUES
+        ('mastra-workflow-bridge', 'demo-developer', 'Mastra Workflow Bridge', '软件开发', 'Manual Trial fixture',
+         'https://agents.test.invalid/mastra', 1, '0x2200000000000000000000000000000000009b11', 'active', 'Test Developer', '2026-08-28 00:00:00'),
+        ('deepseek-chill-coding-agent', 'demo-developer', 'DeepSeek Chill Coding Agent', '软件开发', 'Manual Trial fixture',
+         'https://agents.test.invalid/deepseek', 10, '0x2200000000000000000000000000000000009b12', 'active', 'Test Developer', '2026-08-28 00:00:00');
+
+      INSERT INTO agent_versions
+        (id, agent_id, version, endpoint_url, auth_type, created_at)
+      SELECT 'AGVER-' || id || '-v1-0-0', id, 'v1.0.0', endpoint_url, 'none', '2026-08-28 00:00:00'
+      FROM agents WHERE id IN ('mastra-workflow-bridge', 'deepseek-chill-coding-agent');
+
+      INSERT INTO agent_stats (agent_id, marketplace_status, payout_valid, eligibility_reasons_json, updated_at)
+      SELECT id, 'registered', 1, '["正式 Trial 尚未通过","Endpoint 最近 24 小时无健康记录"]', '2026-08-28 00:00:00'
+      FROM agents WHERE id IN ('mastra-workflow-bridge', 'deepseek-chill-coding-agent');
+    `);
+    const migration = readFileSync(join(import.meta.dirname, '../../db/027_manual_trial_overrides.sql'), 'utf8');
+    database.db.exec(migration);
+    database.db.exec(migration);
+
+    for (const agentId of ['mastra-workflow-bridge', 'deepseek-chill-coding-agent']) {
+      expect(database.db.prepare('SELECT trust_score, status FROM agents WHERE id = ?').get(agentId)).toEqual({ trust_score: 7.5, status: 'active' });
+      expect(database.db.prepare('SELECT COUNT(*) AS count FROM agent_trials WHERE agent_id = ?').get(agentId)).toEqual({ count: 1 });
+      expect(database.db.prepare("SELECT COUNT(*) AS count FROM agent_metric_events WHERE agent_id = ? AND event_type = 'trial_passed'").get(agentId)).toEqual({ count: 1 });
+      expect(database.db.prepare('SELECT trial_passed, endpoint_healthy, last_trial_at FROM agent_stats WHERE agent_id = ?').get(agentId)).toEqual({
+        trial_passed: 1, endpoint_healthy: 0, last_trial_at: '2026-08-29 04:34:00',
+      });
+    }
+
+    database.db.prepare("UPDATE agent_stats SET marketplace_status = 'suspended' WHERE agent_id = ?").run('mastra-workflow-bridge');
+    const healthMigration = readFileSync(join(import.meta.dirname, '../../db/028_restore_launch_agent_health.sql'), 'utf8');
+    database.db.exec(healthMigration);
+    database.db.exec(healthMigration);
+    for (const agentId of ['mastra-workflow-bridge', 'deepseek-chill-coding-agent']) {
+      expect(database.db.prepare('SELECT COUNT(*) AS count FROM agent_health_checks WHERE agent_id = ?').get(agentId)).toEqual({ count: 1 });
+      expect(database.db.prepare("SELECT COUNT(*) AS count FROM agent_metric_events WHERE agent_id = ? AND event_type = 'endpoint_healthy'").get(agentId)).toEqual({ count: 1 });
+      expect(database.db.prepare('SELECT endpoint_healthy, last_health_check_at FROM agent_stats WHERE agent_id = ?').get(agentId)).toEqual({
+        endpoint_healthy: 1, last_health_check_at: '2026-08-29 04:38:24',
+      });
+    }
+    expect(database.db.prepare('SELECT marketplace_status FROM agent_stats WHERE agent_id = ?').get('mastra-workflow-bridge')).toEqual({ marketplace_status: 'degraded' });
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM agent_metric_events WHERE agent_id = ? AND event_type = 'admin_adjustment'").get('mastra-workflow-bridge')).toEqual({ count: 1 });
+
+    database.db.prepare("UPDATE agents SET trust_score = 9, status = 'paused', updated_at = '2026-08-30 00:00:00' WHERE id = ?").run('mastra-workflow-bridge');
+    database.db.prepare("UPDATE agent_stats SET marketplace_status = 'listed', last_trial_at = '2026-08-30 00:00:00', last_health_check_at = '2026-08-30 00:00:00', updated_at = '2026-08-30 00:00:00' WHERE agent_id = ?").run('mastra-workflow-bridge');
+    database.db.exec(migration);
+    database.db.exec(healthMigration);
+    expect(database.db.prepare('SELECT trust_score, status FROM agents WHERE id = ?').get('mastra-workflow-bridge')).toEqual({ trust_score: 9, status: 'paused' });
+    expect(database.db.prepare('SELECT last_trial_at FROM agent_stats WHERE agent_id = ?').get('mastra-workflow-bridge')).toEqual({ last_trial_at: '2026-08-30 00:00:00' });
+    expect(database.db.prepare('SELECT marketplace_status, last_health_check_at FROM agent_stats WHERE agent_id = ?').get('mastra-workflow-bridge')).toEqual({
+      marketplace_status: 'listed', last_health_check_at: '2026-08-30 00:00:00',
     });
   });
 

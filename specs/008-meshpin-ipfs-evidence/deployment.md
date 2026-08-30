@@ -63,7 +63,7 @@
 
 ## 后续可选范围
 
-- 可选配置一个固定公共 HTTPS `IPFS_GATEWAY_BASE`；不配置时验证接口保持 `unavailable`，其余证据功能可用。
+- Worker 默认使用固定公共 HTTPS Gateway `https://ipfs.io`；可用 `IPFS_GATEWAY_BASE` 覆盖，Gateway 不可用时证据保持可读并标记为 `unavailable`。
 - 如需浏览器内自动绑定新 Domain，PinMe 还需提供正式的 bind-existing-CID CLI/API 和作用域 Token。
 
 ## 明确排除
@@ -85,7 +85,7 @@
 
 - 全栈发布可使用 `pinme save`。明确批准拆分发布时，必须先 `pinme update-db`、确认全部 migration 成功后再 `pinme update-worker`；Web 只能上传可重建的 `frontend/dist`，绝不上传源码。
 - 功能回滚可停止前端入口和 Worker 新写入，旧 legacy deliverables 继续读取；新增表保留以避免丢失已登记 CID/快照。
-- Gateway 配置异常时先移除/修正 `IPFS_GATEWAY_BASE`，验证 fail closed，不删除证据历史。
+- Gateway 配置异常时先移除/修正 `IPFS_GATEWAY_BASE`；移除后回退到 `https://ipfs.io`，验证失败不会删除证据历史。
 - 合约 metadata 改动只影响未来重新部署；本次发布不包含任何合约地址变更。
 
 ## 发布后验收

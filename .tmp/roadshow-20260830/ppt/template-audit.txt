@@ -1,0 +1,27 @@
+Source deck: docs/pinme-mesh-demo-20260829.pptx
+Canvas: 16:9, 1280 × 720 render target
+Slide count: 9
+
+Visual system
+- Alternating near-black and warm-white full-bleed canvases.
+- Cyan is the operational accent; electric lime marks trust, evidence, and contribution.
+- Typography is large, restrained, and geometric with small monospaced-like eyebrow labels.
+- Cards use shallow borders, soft shadows on light slides, and precise rounded geometry.
+- Footer is consistent: product / date at left and slide number at right.
+
+Slide-by-slide audit
+1. Dark cover with left thesis, lower proof cards, and a framed product screenshot on the right.
+2. Light product thesis using a five-node lifecycle and three explanation cards.
+3. Light end-to-end loop with a two-row sequence of ten steps and one state-machine band.
+4. Dark architecture slide with four horizontal layers and three trust-boundary cards.
+5. Light Agent-market proof slide: large screenshot left, three capability cards right.
+6. Light 3D digital-twin proof slide: large screenshot left, state legend right.
+7. Dark verifiable-delivery slide with version chain, frozen dossier, and four capability cards.
+8. Light Web3/contribution slide with concentric PM visual and four separation cards.
+9. Dark demo close with six-step run-of-show and a release-check panel.
+
+Update principle
+- Preserve all masters, layouts, theme, typography, spacing, and narrative structure.
+- Replace only UI evidence images on slides 1, 5, and 6.
+- Refresh the cover CID/date and deck footers to the 2026-08-30 material date.
+- No new visual language or structural deviations.

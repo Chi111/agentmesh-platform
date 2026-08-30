@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS deliverables (
   content_hash TEXT NOT NULL,
   mime_type    TEXT NOT NULL,
   status       TEXT NOT NULL DEFAULT 'submitted' CHECK (status IN ('submitted', 'accepted', 'rejected')),
-  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  attempt_no   INTEGER CHECK (attempt_no IS NULL OR attempt_no >= 1)
 );
 
 CREATE INDEX IF NOT EXISTS idx_deliverables_mission ON deliverables(mission_id, created_at);

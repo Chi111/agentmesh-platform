@@ -1,1 +1,0 @@
-import{u as e}from"./vendor~index~AgentDetailPage~AgentMarketPage~DeveloperAgentsPage~DeveloperDashboardPage~Exe~fr426kdw-BE03NbPQ.js";import{r as t}from"./index-DZzW7_4f.js";function n(){let{missionId:n}=e();return t(e=>e.missions.find(e=>e.id===n))}export{n as t};

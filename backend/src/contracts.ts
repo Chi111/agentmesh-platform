@@ -43,6 +43,8 @@ export interface AuthIdentityInput {
   email?: string;
   displayName: string;
   walletAddress?: string;
+  /** The verified identity payload contains the complete current external-wallet state. */
+  walletAddressAuthoritative?: boolean;
 }
 
 export interface Agent {
@@ -858,6 +860,15 @@ export interface UserPreferences {
   updatedAt: string;
 }
 
+/** Encrypted-at-rest PinMe credential. Plaintext AppKeys never cross the store boundary. */
+export interface UserPinmeCredentialRecord {
+  userId: string;
+  addressHint: string;
+  ciphertext: string;
+  iv: string;
+  updatedAt: string;
+}
+
 export interface DisputeAction {
   id: string;
   disputeId: string;
@@ -1093,7 +1104,7 @@ export interface PlatformStore {
   listAgents(): Promise<Agent[]>;
   getAgent(id: string): Promise<Agent | null>;
   createAgent(agent: Agent): Promise<Agent>;
-  updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs?: number): Promise<Agent | null>;
+  updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs?: number | null): Promise<Agent | null>;
   updateAgentStatus(id: string, status: AgentStatus): Promise<Agent | null>;
   getAgentQualityStats(agentId: string): Promise<AgentQualityStats | null>;
   listAgentQualityStats(): Promise<AgentQualityStats[]>;
@@ -1241,6 +1252,9 @@ export interface PlatformStore {
   markNotificationsRead(userId: string): Promise<void>;
   getUserPreferences(userId: string): Promise<UserPreferences>;
   updateUserPreferences(userId: string, preferences: UserPreferences): Promise<UserPreferences>;
+  getUserPinmeCredential(userId: string): Promise<UserPinmeCredentialRecord | null>;
+  saveUserPinmeCredential(credential: UserPinmeCredentialRecord): Promise<UserPinmeCredentialRecord>;
+  deleteUserPinmeCredential(userId: string): Promise<boolean>;
 
   listAdminUsers(limit: number): Promise<AdminUser[]>;
   listArbitrationMembers(): Promise<ArbitrationMember[]>;

@@ -158,6 +158,28 @@
       "selectedOption": 1,
       "approvedAt": "2026-08-28T13:45:00+08:00",
       "approvalSource": "User explicitly said: 允许执行上述 Sepolia PM 完整冒烟交易。"
+    },
+    {
+      "id": "complex-delivery-release-008",
+      "status": "approved",
+      "feature": "specs/009-complex-mission-delivery",
+      "agent": "deploy",
+      "requestedAction": "Split-deploy additive D1 migrations, the reviewed Worker, and the built frontend to the existing mesh-pinme PinMe Domain, then rerun the full user flow with Computer Use.",
+      "riskReason": "The existing hosted D1, Worker and mesh-pinme frontend will be mutated; database migrations must complete before the Worker and the previous frontend CID must remain available as rollback.",
+      "recommendedOption": 1,
+      "options": [
+        {
+          "id": 1,
+          "label": "发布并完整重测",
+          "description": "Run update-db, update-worker, upload only frontend/dist to mesh-pinme, smoke CORS and health, then use Computer Use to recreate and execute a complex task from the start."
+        }
+      ],
+      "safeAlternative": "Keep the current deployed CID and Worker unchanged.",
+      "resumeCommand": "",
+      "createdAt": "2026-08-29T16:08:00+08:00",
+      "selectedOption": 1,
+      "approvedAt": "2026-08-29T16:08:00+08:00",
+      "approvalSource": "User explicitly requested: 发布；用 Computer Use 再重头测试一遍。"
     }
   ]
 }

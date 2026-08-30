@@ -387,26 +387,26 @@ function Topbar({
           </div>
 
           <div className="relative">
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-ink transition hover:bg-canvas" onClick={() => setPanel(panel === 'wallet' ? null : 'wallet')} aria-label={profile ? walletLabel ? `身份钱包 ${walletLabel}` : '身份钱包' : '登录后关联钱包'} aria-expanded={panel === 'wallet'}>
+          <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-ink transition hover:bg-canvas" onClick={() => setPanel(panel === 'wallet' ? null : 'wallet')} aria-label={profile ? walletLabel ? `Web3 外部钱包 ${walletLabel}` : 'Web3 外部钱包' : '登录后关联外部钱包'} aria-expanded={panel === 'wallet'}>
             <WalletCards size={17} />
-            <span className="hidden max-w-40 truncate md:inline">{profile ? walletLabel ?? '身份钱包' : '登录后关联钱包'}</span>
+            <span className="hidden max-w-40 truncate md:inline">{profile ? walletLabel ?? 'Web3 钱包' : '登录后关联钱包'}</span>
           </button>
           {panel === 'wallet' ? (
             <div className="absolute right-0 top-12 w-72 rounded-2xl border border-line bg-white p-4 shadow-float">
               {profile ? <>
                 <div className="flex items-center justify-between">
-                  <span className="inline-flex items-center gap-2 text-xs font-semibold"><span className={`size-2 rounded-full ${walletAddress ? 'bg-lime' : 'bg-warning'}`} />{walletAddress ? '身份钱包已连接' : linkedWalletAddress ? '钱包连接已中断' : 'Web2 身份已验证'}</span>
+                  <span className="inline-flex items-center gap-2 text-xs font-semibold"><span className={`size-2 rounded-full ${walletAddress ? 'bg-lime' : 'bg-warning'}`} />{walletAddress ? 'Web3 外部钱包已连接' : linkedWalletAddress ? '外部钱包连接已中断' : 'Web2 账号已登录'}</span>
                   <span className="mono-chip">{provider === 'privy' ? 'PRIVY' : 'PINME'}</span>
                 </div>
                 {identityWallet ? <div className="mt-4 rounded-xl border border-line bg-canvas p-3">
-                  <div className="flex items-center justify-between gap-3"><p className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted">{walletAddress ? 'Current signer' : 'Linked identity'}</p>{ensName ? <span className="mono-chip">ENS</span> : null}</div>
+                  <div className="flex items-center justify-between gap-3"><p className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted">{walletAddress ? 'Web3 signer' : 'Linked external wallet'}</p>{ensName ? <span className="mono-chip">ENS</span> : null}</div>
                   {ensName ? <p className="mt-2 truncate text-sm font-semibold text-ink" title={ensName}>{ensName}</p> : null}
                   <p className={`${ensName ? 'mt-1' : 'mt-2'} break-all font-mono text-[10px] font-semibold text-ink`}>{identityWallet}</p>
-                </div> : <p className="mt-4 text-sm leading-6 text-muted">当前账户使用 Web2 身份。关联钱包后可以用同一账户进行签名登录，无需创建第二套资料。</p>}
+                </div> : <p className="mt-4 text-sm leading-6 text-muted">当前仅使用 Google/邮箱 Web2 账号，不会自动创建钱包。需要 mUSDC 或 sETH 支付时再主动连接外部钱包。</p>}
                 {provider === 'privy' && profile && !walletAddress ? <button type="button" className="btn-signal mt-4 w-full" onClick={() => void linkWallet()}>{linkedWalletAddress ? '重新连接钱包' : '关联现有钱包'}</button> : null}
-                <p className="mt-4 text-xs leading-5 text-muted">Web2 任务使用充值余额；Web3 任务可选择 Sepolia mUSDC 或 sETH，平台不会保管私钥。</p>
+                <p className="mt-4 text-xs leading-5 text-muted">Web2 任务只扣 Token（CREDIT）余额；Web3 任务只使用 Sepolia mUSDC 或 sETH，两个支付通道互不混用。</p>
                 <Link to="/wallet/test-funds" className="btn-secondary mt-4 w-full" onClick={() => setPanel(null)}>查看与领取测试资金</Link>
-              </> : <p className="text-sm leading-6 text-muted">登录后可关联身份钱包，并进入经过 Worker 鉴权的任务托管与结算流程。</p>}
+              </> : <p className="text-sm leading-6 text-muted">登录后可按需关联 Web3 外部钱包；Google/邮箱登录本身不会生成钱包。</p>}
             </div>
           ) : null}
           </div>
@@ -469,6 +469,7 @@ function RouteContent() {
 
 export function AppShell() {
   const location = useLocation();
+  const isFleetWorkspace = /^\/developer\/(?:fleet|agents)\/?$/.test(location.pathname);
   const isWorkflowWorkspace = /^\/missions\/[^/]+\/workflow\/?$/.test(location.pathname);
   const isExecutionWorkspace = /^\/missions\/[^/]+\/execution\/?$/.test(location.pathname);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -547,10 +548,12 @@ export function AppShell() {
   return (
     <div className="app-shell flex min-h-screen bg-transparent">
       <Sidebar open={mobileOpen} interactive={desktopSidebar || mobileOpen} collapsed={desktopSidebar && sidebarCollapsed} sidebarRef={sidebarRef} onClose={closeMobileMenu} onToggleCollapsed={() => setSidebarCollapsed((current) => !current)} onOpenAuth={openAuth} />
-      <div className={`min-w-0 flex-1 ${isWorkflowWorkspace ? 'flex h-dvh min-h-0 flex-col overflow-hidden' : isExecutionWorkspace ? 'xl:flex xl:h-dvh xl:min-h-0 xl:flex-col xl:overflow-hidden' : ''}`}>
+      <div className={`min-w-0 flex-1 ${isFleetWorkspace || isWorkflowWorkspace ? 'flex h-dvh min-h-0 flex-col overflow-hidden' : isExecutionWorkspace ? 'xl:flex xl:h-dvh xl:min-h-0 xl:flex-col xl:overflow-hidden' : ''}`}>
         <Topbar mobileMenuOpen={mobileOpen} menuButtonRef={menuButtonRef} onOpenMenu={openMobileMenu} />
-        <main className={isWorkflowWorkspace
-          ? 'mx-auto min-h-0 w-full max-w-[1800px] flex-1 overflow-hidden p-2.5 sm:p-3 md:p-4'
+        <main className={isFleetWorkspace
+          ? 'min-h-0 w-full flex-1 overflow-hidden p-2.5 pt-2 sm:p-3 sm:pt-2'
+          : isWorkflowWorkspace
+            ? 'mx-auto min-h-0 w-full max-w-[1800px] flex-1 overflow-hidden p-2.5 sm:p-3 md:p-4'
           : isExecutionWorkspace
             ? 'mx-auto w-full max-w-[1540px] p-4 pb-28 md:p-7 md:pb-28 xl:min-h-0 xl:flex-1 xl:overflow-hidden xl:p-5'
           : 'mx-auto w-full max-w-[1540px] p-4 pb-28 md:p-7 md:pb-28 xl:p-8 xl:pb-28'}>

@@ -50,6 +50,13 @@ import {
   type PinmeEnv,
   type VerifiedIdentity,
 } from './pinme';
+import { uploadPinmeDirectory, PinmeUploadError } from './pinmeUpload';
+import {
+  buildClientDeliveryBundle,
+  type ClientDeliveryArtifactReference,
+  type ClientDeliveryWorkstream,
+} from './clientDelivery';
+import { openUserPinmeAppKey, sealUserPinmeAppKey } from './pinmeCredentials';
 import {
   isPrivyConfigured,
   looksLikePrivyToken,
@@ -73,6 +80,7 @@ import { AGENTMESH_TESTNET_SETTLEMENT, isWeb3Payment, paymentBudgetPrecision } f
 import {
   artifactBelongsToCurrentAttempt,
   hasMeaningfulStageOutput,
+  stageExecutionMode,
   stageRequiresArtifact,
   structuredStageResult,
   workflowDeliveryReadiness,
@@ -152,6 +160,7 @@ interface AppDependencies {
   fetcher?: typeof fetch;
   emailSender?: typeof sendPinmeEmail;
   llmCaller?: typeof callPinmeLlm;
+  pinmeUploader?: typeof uploadPinmeDirectory;
   endpointValidator?: (endpoint: string, env: Env) => Promise<void>;
   depositVerifier?: typeof verifyDepositTransaction;
   ydEpochPublisherVerifier?: typeof verifyRewardEpochPublished;
@@ -165,19 +174,23 @@ interface AppDependencies {
 const BUILTIN_AGENT_PROFILES = {
   research: {
     id: 'official-evidence-scout',
-    instruction: 'Act as an evidence researcher. Separate facts, assumptions, gaps, and risks. Return concise structured JSON with a summary, findings, risks, and recommended follow-ups.',
+    instruction: 'Act as one evidence-research workstream inside a larger mission. Produce a reusable research working paper, not a chat answer. Separate supported facts, assumptions, evidence gaps, risks, source references actually present in the input, and recommended follow-ups.',
   },
   analysis: {
     id: 'official-strategy-analyst',
-    instruction: 'Act as a strategy analyst. Compare viable options, make tradeoffs explicit, and return concise structured JSON with an assessment, options, recommendation, and validation plan.',
+    instruction: 'Act as one strategy-analysis workstream inside a larger mission. Produce a decision-ready analysis with viable options, explicit tradeoffs, recommendation, validation plan, dependencies, and unresolved questions. Do not merely restate the task.',
   },
   writing: {
     id: 'official-delivery-writer',
-    instruction: 'Act as a delivery writer. Turn the task and upstream evidence into an acceptance-ready structured deliverable with a title, executive summary, body, limitations, and action list.',
+    instruction: 'Act as a delivery integrator inside a multi-stage mission. Turn the supplied workstream portfolio into a coherent, directly usable client outcome. Preserve important evidence, decisions, limitations and actions while removing execution chatter and raw JSON.',
   },
 } as const;
 
 const DEFAULT_BUILTIN_AGENT_MODEL = 'openai/gpt-5.6-sol';
+// Complex, client-ready work products can legitimately take longer than the
+// lightweight orchestration pass. Keep a finite ceiling, but do not abort a
+// healthy long-form response at the former 90-second boundary.
+const BUILTIN_AGENT_TIMEOUT_MS = 180_000;
 
 type BuiltinAgentKind = keyof typeof BUILTIN_AGENT_PROFILES;
 
@@ -353,6 +366,7 @@ class ApiError extends Error {
 
 const MAX_JSON_BYTES = 1_000_000;
 const DEFAULT_CORS_ORIGINS = [
+  'https://5ed6cec3.pinit.eth.limo',
   'https://agentmesh.pinit.eth.limo',
   'https://mesh-pinme.pinit.eth.limo',
   'https://meshpin-agentmesh.pinit.eth.limo',
@@ -432,6 +446,55 @@ function failure(request: Request, env: Env, requestId: string, error: ApiError)
     error: { code: error.code, message: error.message, ...(error.details === undefined ? {} : { details: error.details }) },
     meta: { requestId },
   }, error.status);
+}
+
+function streamedJsonWork(
+  request: Request,
+  env: Env,
+  requestId: string,
+  work: () => Promise<Response>,
+): Response {
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  let keepalive: ReturnType<typeof setInterval> | null = null;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Leading JSON whitespace is standards-compliant and keeps the downstream
+      // gateway connection active while an official Agent builds a long result.
+      controller.enqueue(encoder.encode('\n'));
+      keepalive = setInterval(() => {
+        if (!cancelled) {
+          try { controller.enqueue(encoder.encode('\n')); } catch { cancelled = true; }
+        }
+      }, 10_000);
+      void work().then(async (response) => {
+        const body = await response.text();
+        if (!cancelled) controller.enqueue(encoder.encode(body));
+      }).catch(async (error) => {
+        const response = failure(
+          request, env, requestId,
+          error instanceof ApiError ? error : new ApiError(500, 'INTERNAL_ERROR', 'Internal server error'),
+        );
+        if (!cancelled) controller.enqueue(encoder.encode(await response.text()));
+      }).finally(() => {
+        if (keepalive) clearInterval(keepalive);
+        if (!cancelled) controller.close();
+      });
+    },
+    cancel() {
+      cancelled = true;
+      if (keepalive) clearInterval(keepalive);
+    },
+  });
+  return new Response(stream, {
+    status: 202,
+    headers: {
+      ...corsHeaders(request, env),
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
 }
 
 async function readObject(request: Request): Promise<Record<string, unknown>> {
@@ -676,6 +739,107 @@ function handoffSummary(stage: WorkflowStage): Record<string, unknown> {
   return handoff;
 }
 
+function isTerminalTaskStage(stage: WorkflowStage, edges: WorkflowEdge[]): boolean {
+  return stage.nodeType === 'task' && outgoingStageIds(stage.id, edges).length === 0;
+}
+
+function markdownField(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => markdownField(item)).filter(Boolean).map((item) => `- ${item.replace(/\n/g, '\n  ')}`).join('\n');
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>)
+      .slice(0, 24)
+      .map(([key, nested]) => `### ${key}\n\n${markdownField(nested)}`)
+      .join('\n\n');
+  }
+  return '';
+}
+
+function stageWorkstreamMarkdown(stage: WorkflowStage, agentName: string): string {
+  const result = structuredStageResult(stage.output) ?? {};
+  const lines = [
+    `# ${stage.name}`,
+    '',
+    `> 阶段目标：${stage.purpose}`,
+    '',
+    `执行 Agent：${agentName}  `,
+    `执行模式：${stageExecutionMode(stage)}`,
+  ];
+  const sections: Array<[string, unknown]> = [
+    ['阶段成果', result.deliverable],
+    ['执行摘要', result.executiveSummary ?? result.summary],
+    ['核心发现', result.findings],
+    ['方案与取舍', result.options],
+    ['建议', result.recommendation ?? result.recommendations],
+    ['验证与验收', result.acceptanceChecks ?? result.validationPlan],
+    ['限制与风险', result.limitations ?? result.risks],
+    ['后续行动', result.actionList ?? result.nextSteps],
+  ];
+  for (const [title, value] of sections) {
+    const content = markdownField(value);
+    if (content) lines.push('', `## ${title}`, '', content);
+  }
+  return lines.join('\n').slice(0, 60_000);
+}
+
+function currentAttemptArtifacts(stages: WorkflowStage[], deliverables: Deliverable[]): Deliverable[] {
+  const stageById = new Map(stages.map((stage) => [stage.id, stage]));
+  return deliverables.filter((deliverable) => {
+    if (deliverable.status === 'rejected' || !deliverable.stageId) return false;
+    const owner = stageById.get(deliverable.stageId);
+    return Boolean(owner && artifactBelongsToCurrentAttempt(owner, deliverable));
+  });
+}
+
+function workflowPortfolio(
+  currentStage: WorkflowStage,
+  stages: WorkflowStage[],
+  agents: Agent[],
+  deliverables: Deliverable[],
+): Array<Record<string, unknown>> {
+  const agentNames = new Map(agents.map((candidate) => [candidate.id, candidate.name]));
+  return stages
+    .filter((candidate) => candidate.nodeType === 'task' && candidate.id !== currentStage.id && candidate.status === 'done')
+    .sort((left, right) => left.position - right.position)
+    .slice(0, 20)
+    .map((candidate) => ({
+      id: candidate.id,
+      name: candidate.name,
+      purpose: candidate.purpose,
+      executionMode: stageExecutionMode(candidate, stages),
+      agent: candidate.agentId ? agentNames.get(candidate.agentId) ?? candidate.agentId : 'unassigned',
+      handoff: handoffSummary(candidate),
+      artifacts: deliverables
+        .filter((artifact) => artifactBelongsToCurrentAttempt(candidate, artifact) && artifact.status !== 'rejected')
+        .slice(0, 20)
+        .map((artifact) => ({
+          name: artifact.name,
+          uri: artifact.uri,
+          contentHash: artifact.contentHash,
+          mimeType: artifact.mimeType,
+        })),
+    }));
+}
+
+function clientArtifactMimeType(artifact: Record<string, unknown>, evidence: NonNullable<Deliverable['ipfsEvidence']> | null): string {
+  const explicit = typeof artifact.mimeType === 'string' ? artifact.mimeType.trim() : '';
+  if (explicit) return explicit.slice(0, 120);
+  if (!evidence) return requiredString(artifact, 'mimeType', 3, 120);
+  return evidence.manifest.files.find((file) => file.path === 'index.html')?.mimeType
+    ?? evidence.manifest.files.find((file) => !file.mimeType.toLowerCase().includes('json'))?.mimeType
+    ?? 'application/octet-stream';
+}
+
+function clientArtifactUri(artifact: Record<string, unknown>, evidence: NonNullable<Deliverable['ipfsEvidence']> | null, field: string): string {
+  const explicit = typeof artifact.uri === 'string' ? artifact.uri.trim() : '';
+  if (explicit) return safeUrl(explicit, field);
+  if (evidence) return `ipfs://${evidence.rootCid}`;
+  return safeUrl(requiredString(artifact, 'uri', 8, 2_000), field);
+}
+
 async function callbackArtifacts(
   body: Record<string, unknown>,
   missionId: string,
@@ -725,9 +889,9 @@ async function callbackArtifacts(
       attemptNo,
       agentId,
       name,
-      uri: ipfsEvidence ? `ipfs://${ipfsEvidence.rootCid}` : safeUrl(requiredString(artifact, 'uri', 8, 2_000), `artifacts[${index}].uri`),
+      uri: clientArtifactUri(artifact, ipfsEvidence, `artifacts[${index}].uri`),
       contentHash,
-      mimeType: ipfsEvidence ? 'application/vnd.agentmesh.manifest+json' : requiredString(artifact, 'mimeType', 3, 120),
+      mimeType: clientArtifactMimeType(artifact, ipfsEvidence),
       status: 'submitted',
       createdAt,
       ipfsEvidence,
@@ -790,8 +954,7 @@ function ipfsEvidenceApiError(error: unknown): never {
 }
 
 function configuredIpfsGateway(env: Env): URL {
-  const value = env.IPFS_GATEWAY_BASE?.trim();
-  if (!value) throw new ApiError(503, 'IPFS_GATEWAY_NOT_CONFIGURED', 'IPFS verification gateway is not configured');
+  const value = env.IPFS_GATEWAY_BASE?.trim() || 'https://ipfs.io';
   let url: URL;
   try { url = new URL(value); } catch { throw new ApiError(503, 'IPFS_GATEWAY_NOT_CONFIGURED', 'IPFS verification gateway is invalid'); }
   const host = url.hostname.toLowerCase();
@@ -1158,6 +1321,7 @@ async function requireUser(
       email: identity.email,
       displayName,
       walletAddress: identity.walletAddress,
+      walletAddressAuthoritative: identity.walletAddressAuthoritative,
     });
   } catch (error) {
     if (error instanceof Error && error.message.includes('IDENTITY_CONFLICT')) {
@@ -1165,8 +1329,13 @@ async function requireUser(
     }
     throw error;
   }
-  if (roles && !roles.includes(user.role)) throw new ApiError(403, 'FORBIDDEN', `This action requires one of these roles: ${roles.join(', ')}`);
-  return user;
+  // A persisted profile wallet can support ownership/reporting, but Privy
+  // Web3 authorization must come from the current signed identity token.
+  const authenticatedUser = identity.provider === 'privy'
+    ? { ...user, walletAddress: identity.walletAddress }
+    : user;
+  if (roles && !roles.includes(authenticatedUser.role)) throw new ApiError(403, 'FORBIDDEN', `This action requires one of these roles: ${roles.join(', ')}`);
+  return authenticatedUser;
 }
 
 async function enforceRateLimit(
@@ -1680,6 +1849,43 @@ function parseJsonObject(content: string | undefined): Record<string, unknown> |
   }
 }
 
+function builtinResultText(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'object') {
+    const serialized = stableJson(value);
+    return serialized === '{}' || serialized === '[]' ? null : serialized;
+  }
+  return null;
+}
+
+function normalizeBuiltinResult(
+  parsed: Record<string, unknown> | null,
+  fallback: Record<string, unknown>,
+): Record<string, unknown> {
+  const raw = parsed ?? fallback;
+  const rawFindings = Array.isArray(raw.findings) ? raw.findings : [raw.findings];
+  const fallbackFindings = Array.isArray(fallback.findings) ? fallback.findings : [fallback.findings];
+  const findings = rawFindings
+    .map(builtinResultText)
+    .filter((value): value is string => Boolean(value));
+  const normalizedFallbackFindings = fallbackFindings
+    .map(builtinResultText)
+    .filter((value): value is string => Boolean(value));
+
+  return {
+    ...raw,
+    summary: builtinResultText(raw.summary)
+      ?? builtinResultText(fallback.summary)
+      ?? '官方 Agent 已完成结构化执行。',
+    findings: findings.length > 0 ? findings : normalizedFallbackFindings,
+    recommendation: builtinResultText(raw.recommendation)
+      ?? builtinResultText(fallback.recommendation)
+      ?? '请按验收标准复核当前结果。',
+  };
+}
+
 async function runBuiltinAgent(
   env: Env,
   dependencies: AppDependencies,
@@ -1688,6 +1894,8 @@ async function runBuiltinAgent(
   stage: WorkflowStage,
   stages: WorkflowStage[],
   edges: WorkflowEdge[],
+  agents: Agent[],
+  deliverables: Deliverable[],
   mappedInput: Record<string, unknown>,
   transitionCheckpoints: WorkflowTransitionCheckpoint[],
 ): Promise<{ output: Record<string, unknown>; source: 'pinme-llm' | 'deterministic-fallback' }> {
@@ -1696,7 +1904,9 @@ async function runBuiltinAgent(
   const directUpstream = new Set(incomingStageIds(stage.id, edges));
   const upstream = stages
     .filter((candidate) => directUpstream.has(candidate.id))
-    .map((candidate) => ({ id: candidate.id, name: candidate.name, output: candidate.output }));
+    .map((candidate) => ({ id: candidate.id, name: candidate.name, handoff: handoffSummary(candidate) }));
+  const terminal = isTerminalTaskStage(stage, edges);
+  const portfolio = terminal ? workflowPortfolio(stage, stages, agents, deliverables) : [];
   const fallback: Record<string, unknown> = {
     summary: `${agent.name} 已完成“${stage.name}”的结构化测试网执行。`,
     findings: [
@@ -1725,7 +1935,24 @@ async function runBuiltinAgent(
       category: stage.category,
       input: stage.input,
     },
+    deliveryContract: terminal ? {
+      kind: 'final_mission_package',
+      requirements: [
+        'Synthesize all supplied workstreams into one coherent client outcome instead of repeating them.',
+        'Return title, executiveSummary, deliverable, acceptanceChecks, limitations, and actionList.',
+        'The deliverable Markdown must contain the actual finished work, decisions, and usable outputs.',
+        'State evidence gaps honestly and never claim browsing, code execution, testing, or external verification that did not occur.',
+      ],
+    } : {
+      kind: 'stage_working_output',
+      requirements: [
+        'Return a substantive reusable work product for this stage in the deliverable Markdown field.',
+        'Respect the node inputContract and outputContract.',
+        'Do not describe yourself, the prompt, or generic workflow execution.',
+      ],
+    },
     upstream,
+    workflowPortfolio: portfolio,
     mappedInput,
     transitionCheckpoints: transitionCheckpoints.map((checkpoint) => ({
       id: checkpoint.id,
@@ -1750,13 +1977,13 @@ async function executeBuiltinAgent(
   const llm = await (dependencies.llmCaller ?? callPinmeLlm)(env, [
     {
       role: 'system',
-      content: `${profile.instruction} Do not claim access to sources that are not present in the input. Return one JSON object only.`,
+      content: `${profile.instruction} Do not claim access to sources that are not present in the input. Return one JSON object only. Always put the substantive human-readable work product in a Markdown string field named deliverable; never put JSON or execution metadata inside that field. Follow deliveryContract exactly. For final_mission_package also return title, executiveSummary, acceptanceChecks, limitations, and actionList.`,
     },
     {
       role: 'user',
       content: stableJson(input),
     },
-  ], { model });
+  ], { model, timeoutMs: BUILTIN_AGENT_TIMEOUT_MS });
   const parsed = parseJsonObject(llm.content);
   const source = parsed ? 'pinme-llm' : 'deterministic-fallback';
   return {
@@ -1764,7 +1991,7 @@ async function executeBuiltinAgent(
     output: {
       agent: { id: agent.id, name: agent.name, capability: kind },
       source,
-      result: parsed ?? fallback,
+      result: normalizeBuiltinResult(parsed, fallback),
       runtime: { protocol: 'agentmesh.builtin.v1', model, llmError: parsed ? null : llm.error ?? 'invalid_json' },
     },
   };
@@ -1791,15 +2018,6 @@ async function invokeBuiltinAgent(
   });
 }
 
-function builtinDeliverableUri(request: Request, env: Env, missionId: string): string {
-  const requestOrigin = request.headers.get('Origin')?.trim();
-  const allowedRequestOrigin = requestOrigin && configuredOrigins(env).includes(requestOrigin) ? requestOrigin : null;
-  const frontendOrigin = allowedRequestOrigin
-    ?? configuredOrigins(env).find((origin) => origin.startsWith('https://'))
-    ?? new URL(request.url).origin;
-  return `${frontendOrigin.replace(/\/$/, '')}/#/missions/${encodeURIComponent(missionId)}/acceptance`;
-}
-
 async function completeBuiltinAgentDispatch(input: {
   request: Request;
   env: Env;
@@ -1808,6 +2026,7 @@ async function completeBuiltinAgentDispatch(input: {
   mission: Mission;
   stages: WorkflowStage[];
   edges: WorkflowEdge[];
+  agents: Agent[];
   stage: WorkflowStage;
   agent: Agent;
   mappedInput: Record<string, unknown>;
@@ -1817,28 +2036,145 @@ async function completeBuiltinAgentDispatch(input: {
   now: Date;
 }): Promise<{ stage: WorkflowStage; mission: Mission | null; acknowledgement: Record<string, unknown> }> {
   const {
-    request, env, dependencies, store, mission, stages, edges, stage, agent,
+    env, dependencies, store, mission, stages, edges, agents, stage, agent,
     mappedInput, transitionCheckpoints, runId, expiresAt, now,
   } = input;
+  const [existingDeliverables, changeRequests] = await Promise.all([
+    store.listDeliverables(mission.id),
+    store.listMissionChangeRequests(mission.id),
+  ]);
   const execution = await runBuiltinAgent(
-    env, dependencies, agent, mission, stage, stages, edges, mappedInput, transitionCheckpoints,
+    env, dependencies, agent, mission, stage, stages, edges, agents, existingDeliverables, mappedInput, transitionCheckpoints,
   );
+  if (execution.source === 'deterministic-fallback') {
+    const runtime = objectRecord(execution.output.runtime);
+    throw new ApiError(503, 'BUILTIN_AGENT_MODEL_UNAVAILABLE', 'The official Agent did not generate a client-ready deliverable. Retry this node when the model is available.', {
+      retryable: true,
+      llmError: typeof runtime.llmError === 'string' ? runtime.llmError : 'invalid_model_output',
+    });
+  }
+  const result = objectRecord(execution.output.result);
+  const clientMarkdown = typeof result.deliverable === 'string' ? result.deliverable.trim() : '';
+  if (!clientMarkdown) {
+    throw new ApiError(503, 'BUILTIN_AGENT_DELIVERABLE_MISSING', 'The official Agent did not return a substantive stage work product. Retry this node.', { retryable: true });
+  }
   const completedAt = (dependencies.now?.() ?? new Date()).toISOString();
-  const deliverableId = makeId('DEL');
-  const contentHash = `sha256:${await canonicalRequestHash(execution.output)}`;
-  const deliverable: Deliverable = {
-    id: deliverableId,
-    missionId: mission.id,
-    stageId: stage.id,
-    attemptNo: stage.attemptNo,
-    agentId: agent.id,
-    name: `${stage.name} · ${agent.name} 结构化结果`,
-    uri: builtinDeliverableUri(request, env, mission.id),
-    contentHash,
-    mimeType: 'application/json',
-    status: 'submitted',
-    createdAt: completedAt,
-  };
+  const terminal = isTerminalTaskStage(stage, edges);
+  const publishArtifact = terminal || stageRequiresArtifact(stage, stages);
+  const logicalName = terminal
+    ? `${mission.title} · 完整任务成果包`
+    : `${stage.name} · ${agent.name} 阶段制品`;
+  let deliverable: Deliverable | null = null;
+  let published: Awaited<ReturnType<typeof uploadPinmeDirectory>> | null = null;
+  let bundle: Awaited<ReturnType<typeof buildClientDeliveryBundle>> | null = null;
+  if (publishArtifact) {
+    const previous = existingDeliverables
+      .filter((item) => item.stageId === stage.id && (item.attemptNo ?? 1) === stage.attemptNo && item.ipfsEvidence)
+      .sort((left, right) => (right.ipfsEvidence?.versionNo ?? 0) - (left.ipfsEvidence?.versionNo ?? 0))[0] ?? null;
+    const acceptanceEvidence = await acceptanceCriteriaEvidence(mission, stages, changeRequests);
+    const agentNames = new Map(agents.map((candidate) => [candidate.id, candidate.name]));
+    const workstreams: ClientDeliveryWorkstream[] = terminal
+      ? stages.filter((candidate) => candidate.nodeType === 'task' && candidate.id !== stage.id && candidate.status === 'done')
+        .sort((left, right) => left.position - right.position)
+        .map((candidate) => ({
+          position: candidate.position,
+          stageId: candidate.id,
+          stageName: candidate.name,
+          purpose: candidate.purpose,
+          executionMode: stageExecutionMode(candidate, stages),
+          agentName: candidate.agentId ? agentNames.get(candidate.agentId) ?? candidate.agentId : '未分配',
+          markdown: stageWorkstreamMarkdown(candidate, candidate.agentId ? agentNames.get(candidate.agentId) ?? candidate.agentId : '未分配'),
+        }))
+      : [];
+    const stageNames = new Map(stages.map((candidate) => [candidate.id, candidate.name]));
+    const artifactReferences: ClientDeliveryArtifactReference[] = terminal
+      ? currentAttemptArtifacts(stages, existingDeliverables).map((artifact) => ({
+        name: artifact.name,
+        uri: artifact.uri,
+        contentHash: artifact.contentHash,
+        mimeType: artifact.mimeType,
+        stageName: artifact.stageId ? stageNames.get(artifact.stageId) ?? artifact.stageId : '任务级交付',
+      }))
+      : [];
+    bundle = await buildClientDeliveryBundle({
+      missionId: mission.id,
+      missionTitle: mission.title,
+      stageId: stage.id,
+      stageName: stage.name,
+      attemptNo: stage.attemptNo,
+      agentId: agent.id,
+      agentName: agent.name,
+      logicalName,
+      title: typeof result.title === 'string' && result.title.trim() ? result.title.trim() : logicalName,
+      deliverableMarkdown: clientMarkdown,
+      acceptanceCriteriaSha256: acceptanceEvidence.sha256,
+      acceptanceCriteria: acceptanceEvidence.criteria,
+      workstreams,
+      artifactReferences,
+      versionNo: (previous?.ipfsEvidence?.versionNo ?? 0) + 1,
+      supersedesRootCid: previous?.ipfsEvidence?.rootCid ?? null,
+      createdAt: completedAt,
+    });
+    try {
+      const userCredential = await store.getUserPinmeCredential(mission.requesterId);
+      let uploadEnv = env;
+      if (userCredential) {
+        try {
+          uploadEnv = { ...env, PINME_UPLOAD_APP_KEY: await openUserPinmeAppKey(env, userCredential) };
+        } catch {
+          throw new ApiError(503, 'PINME_USER_CREDENTIAL_INVALID', 'The task owner PinMe AppKey could not be decrypted. Re-save it in Settings and retry the node.', { retryable: true });
+        }
+      }
+      published = await (dependencies.pinmeUploader ?? uploadPinmeDirectory)(uploadEnv, {
+        directoryName: `agentmesh-${mission.id}-${stage.id}-attempt-${stage.attemptNo}`,
+        files: bundle.files,
+      });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (error instanceof PinmeUploadError && error.code === 'PINME_UPLOAD_NOT_CONFIGURED') {
+        throw new ApiError(409, 'PINME_APP_KEY_REQUIRED', 'Configure a PinMe AppKey in Settings before running an implementation or final delivery node.', { retryable: true });
+      }
+      throw new ApiError(503, 'PINME_DELIVERY_PUBLISH_FAILED', 'The client outcome could not be published to PinMe. The node was not completed and can be retried.', {
+        retryable: true,
+        reason: error instanceof PinmeUploadError ? error.code : 'PINME_UPLOAD_FAILED',
+      });
+    }
+    const deliverableId = makeId('DEL');
+    const ipfsEvidence = await parseIpfsEvidence({
+      rootCid: published.rootCid,
+      visibility: 'public',
+      manifestSha256: bundle.manifestSha256,
+      manifest: bundle.manifest,
+      supersedesDeliverableId: previous?.id ?? null,
+    }, {
+      missionId: mission.id,
+      stageId: stage.id,
+      attemptNo: stage.attemptNo,
+      agentId: agent.id,
+      logicalName,
+      acceptanceCriteriaSha256: acceptanceEvidence.sha256,
+    });
+    deliverable = {
+      id: deliverableId,
+      missionId: mission.id,
+      stageId: stage.id,
+      attemptNo: stage.attemptNo,
+      agentId: agent.id,
+      name: logicalName,
+      uri: published.publicUrl,
+      contentHash: bundle.contentHash,
+      mimeType: 'text/html',
+      status: 'submitted',
+      createdAt: completedAt,
+      ipfsEvidence,
+    };
+    execution.output.deliveryPackage = {
+      kind: terminal ? 'mission_outcome_package' : 'stage_artifact',
+      fileCount: bundle.manifest.files.length,
+      workstreamCount: workstreams.length,
+      artifactReferenceCount: artifactReferences.length,
+    };
+  }
   await store.addEvent({
     id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'dispatch.accepted',
     message: `${agent.name} 官方运行时已接收任务`, actorType: 'platform', actorId: null,
@@ -1854,23 +2190,46 @@ async function completeBuiltinAgentDispatch(input: {
     now: completedAt,
     status: 'done',
     output: execution.output,
-    artifacts: [deliverable],
+    artifacts: deliverable ? [deliverable] : [],
     progress: Math.min(100, Math.round((stage.position / Math.max(stages.length, 1)) * 100)),
     currentStage: `${stage.name} 已完成`,
     event: {
       id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'stage.done',
-      message: `${agent.name} 已生成结构化交付`, actorType: 'agent', actorId: agent.id,
-      payload: { source: execution.source, builtin: true, deliverableId, contentHash }, createdAt: completedAt,
+      message: deliverable
+        ? `${agent.name} 已生成${terminal ? '完整任务成果包' : '阶段制品'}并发布到 PinMe`
+        : `${agent.name} 已完成阶段工作底稿`,
+      actorType: 'agent', actorId: agent.id,
+      payload: {
+        source: execution.source,
+        builtin: true,
+        artifactPublished: Boolean(deliverable),
+        packageKind: terminal ? 'mission_outcome_package' : publishArtifact ? 'stage_artifact' : 'working_output',
+        ...(deliverable && bundle && published ? {
+          deliverableId: deliverable.id,
+          contentHash: bundle.contentHash,
+          rootCid: published.rootCid,
+        } : {}),
+      }, createdAt: completedAt,
     },
   });
   if (callbackResult.state !== 'applied') {
     throw new ApiError(409, 'BUILTIN_AGENT_EXECUTION_CONFLICT', `Official Agent completion could not be applied: ${callbackResult.state}`);
   }
-  await store.addEvent({
-    id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'deliverable.submitted',
-    message: `${agent.name} 已提交结构化交付物`, actorType: 'agent', actorId: agent.id,
-    payload: { deliverableId, contentHash, builtin: true }, createdAt: completedAt,
-  });
+  if (deliverable && bundle && published) {
+    await store.addEvent({
+      id: makeId('EVT'), missionId: mission.id, stageId: stage.id, type: 'deliverable.submitted',
+      message: `${agent.name} 已通过 PinMe 提交${terminal ? '完整任务成果包' : '阶段制品'}`, actorType: 'agent', actorId: agent.id,
+      payload: {
+        deliverableId: deliverable.id,
+        contentHash: bundle.contentHash,
+        rootCid: published.rootCid,
+        uri: published.publicUrl,
+        builtin: true,
+        packageKind: terminal ? 'mission_outcome_package' : 'stage_artifact',
+        fileCount: bundle.manifest.files.length,
+      }, createdAt: completedAt,
+    });
+  }
   const [latestStages, latestDeliverables] = await Promise.all([
     store.listStages(mission.id),
     store.listDeliverables(mission.id),
@@ -1882,14 +2241,23 @@ async function completeBuiltinAgentDispatch(input: {
   await deliverNotification(store, env, dependencies, {
     userId: mission.requesterId,
     category: 'task',
-    title: '官方测试 Agent 阶段已完成',
-    detail: `${mission.title} · ${agent.name} 已提交结构化结果。`,
+    title: terminal ? '完整任务成果包已生成' : '官方 Agent 阶段已完成',
+    detail: deliverable
+      ? `${mission.title} · ${agent.name} 已发布${terminal ? '完整成果包' : '阶段制品'}到 PinMe。`
+      : `${mission.title} · ${agent.name} 已完成阶段底稿，结果将进入后续汇总。`,
     tone: 'success',
   });
   return {
     stage: callbackResult.stage,
     mission: latestMission,
-    acknowledgement: { accepted: true, completed: true, source: execution.source, deliverableId },
+    acknowledgement: {
+      accepted: true,
+      completed: true,
+      source: execution.source,
+      artifactPublished: Boolean(deliverable),
+      packageKind: terminal ? 'mission_outcome_package' : publishArtifact ? 'stage_artifact' : 'working_output',
+      ...(deliverable && published ? { deliverableId: deliverable.id, rootCid: published.rootCid, uri: published.publicUrl } : {}),
+    },
   };
 }
 
@@ -2111,7 +2479,7 @@ async function dispatchTaskNode(input: {
     await store.createAgentDispatch({ runId, missionId: mission.id, stageId: stage.id, agentId: agent.id, expiresAt });
     if (builtinKind) {
       const completed = await completeBuiltinAgentDispatch({
-        request, env, dependencies, store, mission, stages, edges, stage: claimedStage, agent,
+        request, env, dependencies, store, mission, stages, edges, agents, stage: claimedStage, agent,
         mappedInput, transitionCheckpoints, runId, expiresAt, now,
       });
       await refreshWorkflowAggregate(store, mission.id);
@@ -2245,8 +2613,9 @@ async function dispatchReadyWorkflowNodes(input: {
   missionId: string;
   now: Date;
   cascadeBuiltin?: boolean;
+  deferBuiltin?: boolean;
 }): Promise<Array<NodeDispatchResult | { stageId: string; error: { status: number; code: string; message: string } }>> {
-  const { request, env, dependencies, store, missionId, now, cascadeBuiltin = false } = input;
+  const { request, env, dependencies, store, missionId, now, cascadeBuiltin = false, deferBuiltin = false } = input;
   const currentMission = await store.getMission(missionId);
   if (!currentMission) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
   if (currentMission.status !== 'running') return [];
@@ -2270,7 +2639,16 @@ async function dispatchReadyWorkflowNodes(input: {
     if (!await store.claimDispatch(item.id, now.toISOString())) return;
     await store.completeDispatch(item.id, 'done', now.toISOString());
   }));
-  const items = missionPending.filter((item) => readyIds.has(item.stageId));
+  const runnableItems = missionPending.filter((item) => readyIds.has(item.stageId));
+  // Browser-facing requests only advance the durable outbox. Built-in Agents
+  // can legitimately spend minutes producing a client-ready artifact, so they
+  // must run from the scheduled Worker event rather than inherit an HTTP
+  // gateway lifetime. External Agent handshakes remain bounded to 15 seconds.
+  const items = deferBuiltin ? runnableItems.filter((item) => {
+    const stage = stages.find((candidate) => candidate.id === item.stageId);
+    const agent = stage ? agents.find((candidate) => candidate.id === stage.agentId) : null;
+    return !agent || !builtinAgentKind(agent);
+  }) : runnableItems;
   const results = await Promise.all(items.map(async (item) => {
     if (!await store.claimDispatch(item.id, now.toISOString())) {
       return { stageId: item.stageId, error: { status: 409, code: 'STAGE_ALREADY_DISPATCHED', message: 'Dispatch was claimed by another worker' } };
@@ -2296,7 +2674,10 @@ async function dispatchReadyWorkflowNodes(input: {
     }
   }));
   if (cascadeBuiltin && results.some((result) => !('error' in result) && result.builtin && result.stage.status === 'done')) {
-    const downstream = await dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now: dependencies.now?.() ?? new Date(), cascadeBuiltin: true });
+    const downstream = await dispatchReadyWorkflowNodes({
+      request, env, dependencies, store, missionId, now: dependencies.now?.() ?? new Date(),
+      cascadeBuiltin: true, deferBuiltin,
+    });
     return [...results, ...downstream];
   }
   return results;
@@ -2482,7 +2863,7 @@ export function createApp(dependencies: AppDependencies = {}) {
             auth: [
               'email_password',
               'google_id_token',
-              ...(isPrivyConfigured(env) ? ['email_otp', 'siwe_wallet', 'embedded_wallet'] : []),
+              ...(isPrivyConfigured(env) ? ['email_otp', 'siwe_wallet'] : []),
             ],
             orchestration: [
               'compile',
@@ -2550,9 +2931,14 @@ export function createApp(dependencies: AppDependencies = {}) {
             subject: identity.uid,
             email: identity.email,
             walletAddress: identity.walletAddress,
+            walletAddressAuthoritative: identity.walletAddressAuthoritative,
             displayName: identity.displayName ?? identity.email?.split('@')[0] ?? BRAND.platform.defaultUserName,
           });
-          return success(request, env, requestId, { profile });
+          return success(request, env, requestId, {
+            profile: identity.provider === 'privy'
+              ? { ...profile, walletAddress: identity.walletAddress }
+              : profile,
+          });
         }
 
         const store = getStore(env, dependencies);
@@ -2807,9 +3193,6 @@ export function createApp(dependencies: AppDependencies = {}) {
             if (stageStatus === 'done') {
               await enqueueReadyTaskNodes(store, missionId, now.toISOString());
               latestMission = await store.getMission(missionId) ?? latestMission;
-              if (executionContext) {
-                executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
-              }
             }
           }
           await deliverNotification(store, env, dependencies, {
@@ -2919,6 +3302,39 @@ export function createApp(dependencies: AppDependencies = {}) {
             updatedAt: (dependencies.now?.() ?? new Date()).toISOString(),
           });
           return success(request, env, requestId, preferences);
+        }
+
+        if (pathname === '/api/me/integrations/pinme' && method === 'GET') {
+          const credential = await store.getUserPinmeCredential(user.id);
+          return success(request, env, requestId, credential ? {
+            configured: true,
+            addressHint: credential.addressHint,
+            updatedAt: credential.updatedAt,
+          } : { configured: false, addressHint: null, updatedAt: null });
+        }
+
+        if (pathname === '/api/me/integrations/pinme' && method === 'PUT') {
+          await enforceRateLimit(store, request, 'pinme-integration-write', 10, 3_600, now, user.id);
+          const body = await readObject(request);
+          const appKey = requiredString(body, 'appKey', 5, 16_000);
+          const updatedAt = (dependencies.now?.() ?? new Date()).toISOString();
+          try {
+            const saved = await store.saveUserPinmeCredential(await sealUserPinmeAppKey(env, user.id, appKey, updatedAt));
+            return success(request, env, requestId, {
+              configured: true,
+              addressHint: saved.addressHint,
+              updatedAt: saved.updatedAt,
+            });
+          } catch (error) {
+            if (error instanceof PinmeUploadError) throw new ApiError(400, error.code, error.message);
+            throw new ApiError(503, 'PINME_CREDENTIAL_STORAGE_UNAVAILABLE', 'PinMe AppKey could not be encrypted. Please retry later.');
+          }
+        }
+
+        if (pathname === '/api/me/integrations/pinme' && method === 'DELETE') {
+          await enforceRateLimit(store, request, 'pinme-integration-write', 10, 3_600, now, user.id);
+          await store.deleteUserPinmeCredential(user.id);
+          return success(request, env, requestId, { configured: false, addressHint: null, updatedAt: null });
         }
 
         if (pathname === '/api/wallet' && method === 'GET') {
@@ -3418,7 +3834,7 @@ export function createApp(dependencies: AppDependencies = {}) {
           const missionId = decodeURIComponent(missionChangeRequestsMatch[1]);
           const context = await requireMissionAccess(store, user, missionId);
           if (method === 'GET') return success(request, env, requestId, await store.listMissionChangeRequests(missionId));
-          if (context.mission.requesterId !== user.id || user.role !== 'requester') {
+          if (context.mission.requesterId !== user.id || !['requester', 'admin'].includes(user.role)) {
             throw new ApiError(403, 'FORBIDDEN', 'Only the mission requester can create a change request');
           }
           const body = await readObject(request);
@@ -3692,7 +4108,6 @@ export function createApp(dependencies: AppDependencies = {}) {
               actorType: 'requester', actorId: user.id, payload: { feedback }, createdAt: decidedAt,
             });
             await enqueueReadyTaskNodes(store, missionId, decidedAt);
-            if (executionContext) executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
           } else {
             if (context.mission.requesterId !== user.id) throw new ApiError(403, 'FORBIDDEN', 'Only the requester can request Gate rework');
             const reworkNodeIds = stringArray(body, 'reworkNodeIds', 30);
@@ -3752,10 +4167,34 @@ export function createApp(dependencies: AppDependencies = {}) {
           const missionId = decodeURIComponent(retryNodeMatch[1]);
           const stageId = decodeURIComponent(retryNodeMatch[2]);
           const context = await requireMissionAccess(store, user, missionId);
-          if (context.mission.requesterId !== user.id || user.role !== 'requester') throw new ApiError(403, 'FORBIDDEN', 'Only the requester can retry a task node');
+          if (context.mission.requesterId !== user.id || !['requester', 'admin'].includes(user.role)) {
+            throw new ApiError(403, 'FORBIDDEN', 'Only the mission owner can retry a task node');
+          }
           if (context.mission.status !== 'running' || (await store.getEscrow(missionId))?.status !== 'held') throw new ApiError(409, 'MISSION_NOT_RUNNING', 'Retry requires a running funded mission');
-          const stage = context.stages.find((candidate) => candidate.id === stageId && candidate.nodeType === 'task');
+          let stage = context.stages.find((candidate) => candidate.id === stageId && candidate.nodeType === 'task');
           if (!stage) throw new ApiError(404, 'NODE_NOT_FOUND', 'Task node not found');
+          let latestStages = context.stages;
+          if (stage.status === 'running') {
+            const assignedAgent = context.agents.find((candidate) => candidate.id === stage?.agentId);
+            if (user.role !== 'admin' || !assignedAgent || !builtinAgentKind(assignedAgent)) {
+              throw new ApiError(409, 'NODE_STILL_RUNNING', 'Only an administrator can recover a stuck official Agent node');
+            }
+            const recoveredAt = now.toISOString();
+            const recovered = await store.transitionRunningStage(missionId, stageId, 'failed', {
+              error: 'Official Agent dispatch was interrupted before its result was committed.',
+              retryable: true,
+              recoveredByAdmin: true,
+            });
+            if (!recovered) throw new ApiError(409, 'NODE_RECOVERY_CONFLICT', 'The node changed while recovery was requested');
+            await store.addEvent({
+              id: makeId('EVT'), missionId, stageId, type: 'node.stuck_recovered',
+              message: `${stage.name} 的中断执行已由管理员恢复`, actorType: 'platform', actorId: user.id,
+              payload: { priorStatus: 'running' }, createdAt: recoveredAt,
+            });
+            latestStages = await store.listStages(missionId);
+            stage = latestStages.find((candidate) => candidate.id === stageId && candidate.nodeType === 'task');
+            if (!stage) throw new ApiError(404, 'NODE_NOT_FOUND', 'Task node not found after recovery');
+          }
           if (stage.status !== 'failed') throw new ApiError(409, 'NODE_NOT_FAILED', 'Only a failed task node can be retried');
           const failedTransitions = (await store.listCurrentWorkflowTransitions(missionId)).filter((checkpoint) => (
             checkpoint.targetStageId === stageId && checkpoint.errorCode
@@ -3768,7 +4207,7 @@ export function createApp(dependencies: AppDependencies = {}) {
           }
           const retriedAt = now.toISOString();
           const resetStageIds = downstreamStageIds([stageId], context.edges);
-          if (context.stages.some((candidate) => resetStageIds.includes(candidate.id) && candidate.status === 'running')) {
+          if (latestStages.some((candidate) => resetStageIds.includes(candidate.id) && candidate.status === 'running')) {
             throw new ApiError(409, 'CHANGE_REQUEST_BLOCKED_BY_RUNNING_STAGE', 'Retry cannot replace a branch while one of its affected nodes is running');
           }
           const pause = await store.pauseMission(missionId, user.id, 'requester', `重试失败节点：${stage.name}`, retriedAt);
@@ -3905,7 +4344,7 @@ export function createApp(dependencies: AppDependencies = {}) {
               publications: await store.listEvidencePublications(missionId),
               publishGuide: {
                 command: `pinme upload ./agentmesh-review-${subjectId}`,
-                note: `下载 JSON 到独立目录后，使用你自己的 ${BRAND.evidence.providerName} 登录态上传；不要把 AppKey 粘贴到 ${BRAND.platform.name}。`,
+                note: `这是仲裁委员可选的离线审计归档，不是客户交付流程。请使用你自己的 ${BRAND.evidence.providerName} 登录态上传；AppKey 只在“设置 → PinMe 自动交付”中配置，不要粘贴到档案或 CID 输入框。`,
               },
             });
           }
@@ -4177,7 +4616,14 @@ export function createApp(dependencies: AppDependencies = {}) {
             }, 1, '执行网络已启动');
             await enqueueReadyTaskNodes(store, missionId, now.toISOString());
             if (executionContext) {
-              executionContext.waitUntil(dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }).then(() => undefined));
+              // Keep the request alive until the first runnable batch has durably
+              // completed. A waitUntil task only gets a short grace period after
+              // the response is sent, which can strand an official LLM node in
+              // `running` before its completion or failure is persisted.
+              await dispatchReadyWorkflowNodes({
+                request, env, dependencies, store, missionId, now,
+                deferBuiltin: Boolean(executionContext),
+              });
             }
             return success(request, env, requestId, { mission: saved, escrow: await store.getEscrow(missionId), pollAfterMs: 3000 });
           }
@@ -4193,19 +4639,24 @@ export function createApp(dependencies: AppDependencies = {}) {
               const recovering = context.stages.some((stage) => stage.nodeType === 'task' && stage.status === 'running' && pendingIds.has(stage.id));
               if (!recovering) throw new ApiError(409, 'NO_RUNNABLE_NODE', 'No queued workflow task node is ready to dispatch; failed nodes require an explicit retry');
             }
-            const dispatches = await dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now });
-            if (!dispatches.length) throw new ApiError(409, 'NO_RUNNABLE_NODE', 'No workflow task node is ready to dispatch');
-            const first = dispatches[0];
-            if (dispatches.length === 1 && 'error' in first) throw new ApiError(first.error.status, first.error.code, first.error.message);
-            const firstSuccess = dispatches.find((item): item is NodeDispatchResult => !('error' in item));
-            return success(request, env, requestId, {
-              dispatches,
-              // Compatibility fields for clients that still consume one linear stage.
-              stage: firstSuccess?.stage ?? null,
-              mission: firstSuccess?.mission ?? await store.getMission(missionId),
-              agent: firstSuccess?.agent ?? null,
-              acknowledgement: firstSuccess?.acknowledgement ?? null,
-            }, 202, { count: dispatches.length, parallel: dispatches.length > 1, builtin: firstSuccess?.builtin ?? false });
+            const executeDispatch = async () => {
+              const dispatches = await dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now });
+              if (!dispatches.length) throw new ApiError(409, 'NO_RUNNABLE_NODE', 'No workflow task node is ready to dispatch');
+              const first = dispatches[0];
+              if (dispatches.length === 1 && 'error' in first) throw new ApiError(first.error.status, first.error.code, first.error.message);
+              const firstSuccess = dispatches.find((item): item is NodeDispatchResult => !('error' in item));
+              return success(request, env, requestId, {
+                dispatches,
+                // Compatibility fields for clients that still consume one linear stage.
+                stage: firstSuccess?.stage ?? null,
+                mission: firstSuccess?.mission ?? await store.getMission(missionId),
+                agent: firstSuccess?.agent ?? null,
+                acknowledgement: firstSuccess?.acknowledgement ?? null,
+              }, 202, { count: dispatches.length, parallel: dispatches.length > 1, builtin: firstSuccess?.builtin ?? false });
+            };
+            return executionContext
+              ? streamedJsonWork(request, env, requestId, executeDispatch)
+              : await executeDispatch();
           }
 
           if (action === 'events' && method === 'GET') {
@@ -4287,9 +4738,9 @@ export function createApp(dependencies: AppDependencies = {}) {
               attemptNo: stage?.attemptNo ?? null,
               agentId: stage?.agentId ?? null,
               name,
-              uri: ipfsEvidence ? `ipfs://${ipfsEvidence.rootCid}` : safeUrl(requiredString(body, 'uri', 8, 2_000), 'uri'),
+              uri: clientArtifactUri(body, ipfsEvidence, 'uri'),
               contentHash: ipfsEvidence ? ipfsEvidence.manifestSha256 : requiredString(body, 'contentHash', 8, 256),
-              mimeType: ipfsEvidence ? 'application/vnd.agentmesh.manifest+json' : requiredString(body, 'mimeType', 3, 120),
+              mimeType: clientArtifactMimeType(body, ipfsEvidence),
               status: 'submitted',
               createdAt: (dependencies.now?.() ?? new Date()).toISOString(),
               ipfsEvidence,
@@ -4751,7 +5202,7 @@ export function createApp(dependencies: AppDependencies = {}) {
           })));
         }
 
-        const adminAgentQualityMatch = pathname.match(/^\/api\/admin\/agents\/([^/]+)\/quality\/(recompute|events)$/);
+        const adminAgentQualityMatch = pathname.match(/^\/api\/admin\/agents\/([^/]+)\/quality\/(recompute|events|trial-override)$/);
         if (adminAgentQualityMatch && method === 'POST') {
           if (user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Admin role is required');
           const agentId = decodeURIComponent(adminAgentQualityMatch[1]);
@@ -4762,6 +5213,57 @@ export function createApp(dependencies: AppDependencies = {}) {
             return success(request, env, requestId, await store.recomputeAgentQuality(agentId, evaluatedAt));
           }
           const body = await readObject(request);
+          if (adminAgentQualityMatch[2] === 'trial-override') {
+            const score = finiteNumber(body, 'score', 7.5, 10);
+            const reason = requiredString(body, 'reason', 12, 2_000);
+            const result = await runIdempotent(request, store, user, body, async () => {
+              const trialId = makeId('AGTRIAL');
+              const trial: AgentTrial = {
+                id: trialId,
+                agentId,
+                agentVersionId: `AGVER-${agent.id}-${agent.version.replaceAll('.', '-')}`,
+                suiteVersion: 'agentmesh.trial.manual.v1',
+                status: 'passed',
+                score: score * 10,
+                responseTimeMs: 0,
+                checks: [{
+                  key: 'admin_override',
+                  passed: true,
+                  score: score * 10,
+                  summary: '管理员人工覆盖 Trial；未据此声明 Endpoint 健康。',
+                }],
+                summary: `管理员人工通过 Trial：${reason}`,
+                evidence: { manualOverride: true, liveChallenge: false, reason },
+                startedAt: evaluatedAt,
+                completedAt: evaluatedAt,
+                createdBy: user.id,
+              };
+              await store.recordAgentTrial(trial);
+              await store.recordAgentMetricEvent(qualityMetric({
+                idempotencyKey: `trial:${trialId}`,
+                agentId,
+                type: 'trial_passed',
+                value: trial.score,
+                weight: 1,
+                severity: 'info',
+                sourceType: 'admin',
+                sourceId: trialId,
+                detail: { suiteVersion: trial.suiteVersion, actorId: user.id, reason, manualOverride: true },
+                occurredAt: evaluatedAt,
+              }, evaluatedAt), evaluatedAt);
+              const updated = await store.updateAgentTrial(agentId, score, 'active', null);
+              const stats = await store.recomputeAgentQuality(agentId, evaluatedAt);
+              return {
+                status: 201,
+                body: {
+                  trial,
+                  agent: updated ? agentClientView(request, updated, stats, env.AGENT_QUALITY_GATE_MODE) : null,
+                  stats,
+                },
+              };
+            });
+            return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
+          }
           const eventType = enumValue(body, 'type', ['security_incident', 'security_resolved', 'admin_adjustment'] as const);
           const reason = requiredString(body, 'reason', 12, 2_000);
           const value = body.value === undefined ? 0 : finiteNumber(body, 'value', -20, 100);
@@ -5055,17 +5557,19 @@ export function createApp(dependencies: AppDependencies = {}) {
       const missionIds = [...new Set([...pending.map((item) => item.missionId), ...dirty.map((item) => item.missionId)])];
       const configuredOrigin = env.PUBLIC_BASE_URL?.trim()
         || (env.PROJECT_NAME?.trim() ? `https://${env.PROJECT_NAME.trim()}.api.pinme.pro` : 'https://agentmesh.invalid');
-      for (const missionId of missionIds) {
+      await Promise.all(missionIds.map(async (missionId) => {
         const request = new Request(`${configuredOrigin.replace(/\/$/, '')}/api/internal/workflow-dispatch`);
         const revision = dirtyRevision.get(missionId);
-        executionContext.waitUntil((revision === undefined
-          ? Promise.resolve()
-          : reconcileMissionRuntime({
+        if (revision !== undefined) {
+          await reconcileMissionRuntime({
             request, env, dependencies, store, missionId, schedulerRevision: revision, actorId: null,
-          }))
-          .then(() => dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now, cascadeBuiltin: true }))
-          .then(() => undefined));
-      }
+          });
+        }
+        // A scheduled event has no HTTP response whose completion can truncate
+        // the model call. Process one ready batch per mission and let the next
+        // durable outbox/cron cycle advance the graph.
+        await dispatchReadyWorkflowNodes({ request, env, dependencies, store, missionId, now });
+      }));
     },
   };
 }

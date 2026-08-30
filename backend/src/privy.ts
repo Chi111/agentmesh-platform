@@ -114,6 +114,14 @@ function accountText(account: LinkedAccount | undefined, keys: string[]): string
   return undefined;
 }
 
+function isEmbeddedWallet(account: LinkedAccount): boolean {
+  const walletClientType = accountText(account, ['wallet_client_type', 'walletClientType'])?.toLocaleLowerCase();
+  const connectorType = accountText(account, ['connector_type', 'connectorType'])?.toLocaleLowerCase();
+  return walletClientType === 'privy'
+    || walletClientType === 'privy-v2'
+    || connectorType === 'embedded';
+}
+
 export async function verifyPrivyIdentityToken(
   env: PrivyEnv,
   identityToken: string,
@@ -134,7 +142,14 @@ export async function verifyPrivyIdentityToken(
     const accounts = parseLinkedAccounts(payload.linked_accounts);
     const emailAccount = accounts.find((account) => account.type === 'email')
       ?? accounts.find((account) => account.type?.includes('oauth') && accountText(account, ['email', 'address']));
-    const walletAccount = accounts.find((account) => account.type === 'wallet' && accountText(account, ['address']));
+    // Google/email authentication is Web2-only. Only a wallet the user
+    // explicitly connected can become the Web3 settlement identity.
+    const walletAccount = accounts.find((account) => (
+      account.type === 'wallet'
+      && accountText(account, ['address'])
+      && accountText(account, ['chain_type', 'chainType'])?.toLocaleLowerCase() !== 'solana'
+      && !isEmbeddedWallet(account)
+    ));
     const email = accountText(emailAccount, ['address', 'email'])?.toLocaleLowerCase();
     const walletAddress = accountText(walletAccount, ['address'])?.toLocaleLowerCase();
     const displayName = accountText(emailAccount, ['name'])
@@ -148,6 +163,7 @@ export async function verifyPrivyIdentityToken(
         provider: 'privy',
         email,
         walletAddress,
+        walletAddressAuthoritative: true,
         displayName,
         claims: {
           authProvider: 'privy',

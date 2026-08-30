@@ -1,0 +1,16 @@
+No visual or structural deviation from the source template is planned.
+
+Allowed content deviations:
+- Slide 1 current CID and report date.
+- Slide 3 workflow copy updated to the verified 6-step / 3-agent mission.
+- Slide 4 intelligence and security-boundary copy updated to the implemented shared PinMe LLM architecture.
+- Slide 7 delivery copy updated from manual CLI upload to automatic Worker upload with encrypted user AppKey and a 9-file mission package.
+- Slide 9 demo route, validation checklist, and next-step labels updated to current verified behavior.
+- All slide footers updated from 2026-08-28 to 2026-08-29.
+
+No slide additions, deletions, image replacements, layout changes, or new shapes.
+
+Technical export normalization:
+- The standard starter-deck helper failed because four inherited reverse-direction connectors on slide 3 had negative widths.
+- The custom starter step normalizes those four bounding boxes to positive widths and retains the tail arrowhead so the lower row continues to point left.
+- No OOXML package mutation is used.

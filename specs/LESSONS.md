@@ -24,3 +24,13 @@
 - 已验证 CID 后续暂时不可达属于可用性观察，不应撤销历史完整性结论；Gateway 超时、重定向、体积限制和验证状态需要分别建模。
 - 仲裁委员需要访问冻结纠纷档案，但不应因此获得整项 Mission 的普通编辑/读取权限；案件级 evidence authorization 应与 Mission participant authorization 分开。
 - 公共 Agent CID 履历只能由已完成 Mission 的当前 attempt 派生，且 encrypted 证据只公开摘要，不能复用内部 Manifest 读取接口直接暴露文件清单。
+
+## 2026-08-29 复杂任务交付
+
+- 编排复杂度不等于交付复杂度；如果每个节点都独立发布一次 LLM 文本，客户看到的仍然只是零散回答。
+- Analyze 输出应是可传递的工作底稿，Implement 输出应是阶段制品，只有拓扑终结节点负责把全部已完成工作流综合成统一成果包。
+- 最终交付应同时提供人读主报告、分阶段依据、验收边界、真实制品索引和机器可验的 Manifest；内部 JSON 只能作为折叠技术证据。
+- 成果页默认选择必须由工作流拓扑和当前 attempt 决定，不能依赖固定步骤数、阶段名称或“最后创建的 artifact”。
+- PinMe `update-db` 会重放全部 SQL；历史迁移不能在每次重放时重建被新表外键引用的旧表，否则会级联删除后续证据。基础 schema 应直接包含最终列，历史 rebuild 文件在完成升级后必须变成可重放 no-op，并用连续两遍全量 migration 验证。
+- PinMe 上传 API 的 `ShortUrl` 可能只是带尾斜杠的短码；交付适配器应把短码规范化为 `<code>.pinme.dev`，不能把它当成 dotless HTTPS 主机名。
+- 不应在 React 验收页和静态交付页分别用正则手写 Markdown 子集；复杂成果很快会用到 GFM 表格、代码块和嵌套结构，必须共享一套安全渲染策略并分别维护明暗主题样式。

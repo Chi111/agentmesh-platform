@@ -4,11 +4,23 @@ export interface PinmeEnv {
   BASE_URL?: string;
   LLM_MODEL?: string;
   BUILTIN_AGENT_MODEL?: string;
+  /** Optional platform fallback; task-owner credentials are preferred and encrypted per user. */
+  PINME_UPLOAD_APP_KEY?: string;
+  PINME_UPLOAD_BASE_URL?: string;
 }
 
 export interface PinmeLlmOptions {
   model?: string;
+  timeoutMs?: number;
 }
+
+type OpenRouterChatChunk = {
+  choices?: Array<{
+    message?: { content?: string };
+    delta?: { content?: string };
+    text?: string;
+  }>;
+};
 
 type PinmeEnvelope<T = unknown> = {
   code: number;
@@ -22,6 +34,8 @@ export interface VerifiedIdentity {
   email?: string;
   displayName?: string;
   walletAddress?: string;
+  /** True only when the provider supplied its complete current external-wallet list. */
+  walletAddressAuthoritative?: boolean;
   claims: Record<string, unknown>;
 }
 
@@ -55,6 +69,30 @@ function pinmeConfig(env: PinmeEnv): { apiKey: string; projectName: string; base
     projectName: env.PROJECT_NAME,
     baseUrl: env.BASE_URL ?? 'https://pinme.cloud',
   };
+}
+
+function chatChunkContent(chunk: OpenRouterChatChunk): string {
+  const choice = chunk.choices?.[0];
+  return choice?.message?.content ?? choice?.delta?.content ?? choice?.text ?? '';
+}
+
+function parseChatCompletionBody(body: string): string | null {
+  try {
+    const content = chatChunkContent(JSON.parse(body) as OpenRouterChatChunk);
+    if (content) return content;
+  } catch {
+    // Streaming responses are parsed as SSE below.
+  }
+
+  let content = '';
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    try { content += chatChunkContent(JSON.parse(payload) as OpenRouterChatChunk); }
+    catch { /* Ignore non-JSON SSE keepalive/event lines. */ }
+  }
+  return content || null;
 }
 
 export async function registerPinmeUser(
@@ -131,9 +169,11 @@ export async function callPinmeLlm(
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': config.apiKey },
+        signal: options.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined,
         body: JSON.stringify({
           model: options.model?.trim() || env.LLM_MODEL?.trim() || 'openai/gpt-4o-mini',
           temperature: 0.2,
+          stream: false,
           response_format: { type: 'json_object' },
           messages,
         }),
@@ -143,9 +183,14 @@ export async function callPinmeLlm(
     return { error: 'LLM network error' };
   }
   if (!response.ok) return { error: await extractPinmeError(response) };
-  const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content;
-  return content ? { content } : { error: 'LLM returned an empty response' };
+  try {
+    // PinMe normally returns OpenRouter JSON for stream=false, but older proxy
+    // deployments can still respond with SSE. Read once and support both forms.
+    const content = parseChatCompletionBody(await response.text());
+    return content ? { content } : { error: 'LLM returned an empty response' };
+  } catch {
+    return { error: 'LLM response read error' };
+  }
 }
 
 export async function sendPinmeEmail(

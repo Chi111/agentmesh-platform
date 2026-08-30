@@ -46,6 +46,13 @@ export function artifactBelongsToCurrentAttempt(stage: WorkflowStage, deliverabl
   return attemptNo === 1;
 }
 
+export function isClientReadyArtifact(deliverable: Deliverable): boolean {
+  const mimeType = deliverable.mimeType.trim().toLowerCase();
+  return Boolean(deliverable.uri.trim())
+    && mimeType !== 'application/json'
+    && mimeType !== 'application/vnd.agentmesh.manifest+json';
+}
+
 export function structuredStageResult(output: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
   if (!output || output.invalidated === true || objectValue(output.error)) return null;
   return objectValue(output.result) ?? output;
@@ -54,8 +61,10 @@ export function structuredStageResult(output: Record<string, unknown> | null | u
 export function hasMeaningfulStageOutput(stage: Pick<WorkflowStage, 'nodeType' | 'status' | 'output'>): boolean {
   if (stage.status !== 'done') return false;
   if (stage.nodeType === 'approval') return true;
+  if (stage.output?.source === 'deterministic-fallback') return false;
   const result = structuredStageResult(stage.output);
   if (!result) return false;
+  if (stage.output?.source === 'pinme-llm' && !hasText(result.deliverable)) return false;
   const completionStatus = result.completionStatus;
   if (completionStatus !== undefined && completionStatus !== 'succeeded') return false;
   if (!hasText(result.summary)) return false;
@@ -91,7 +100,9 @@ export function workflowDeliveryReadiness(
 
   const missingArtifactStageIds = stages
     .filter((stage) => stageRequiresArtifact(stage, stages) && !deliverables.some((deliverable) => (
-      deliverable.status !== 'rejected' && artifactBelongsToCurrentAttempt(stage, deliverable)
+      deliverable.status !== 'rejected'
+      && artifactBelongsToCurrentAttempt(stage, deliverable)
+      && isClientReadyArtifact(deliverable)
     )))
     .map((stage) => stage.id);
   if (missingArtifactStageIds.length > 0) {

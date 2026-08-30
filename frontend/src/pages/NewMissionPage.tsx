@@ -98,7 +98,7 @@ export function NewMissionPage() {
           <section className="panel p-5 md:p-6">
             <div className="flex items-center gap-3 border-b border-line pb-4">
               <span className="flex size-10 items-center justify-center rounded-xl bg-canvas"><CircleDollarSign size={19} /></span>
-              <div><h2 className="font-semibold">预算与支付</h2><p className="mt-1 text-xs text-muted">Web2 使用充值余额；Web3 使用 Sepolia mUSDC 或原生 ETH。</p></div>
+              <div><h2 className="font-semibold">预算与支付</h2><p className="mt-1 text-xs text-muted">Web2 只使用 Token（CREDIT）余额；Web3 只使用 Sepolia mUSDC 或 sETH。</p></div>
             </div>
             <div className="mt-5 grid gap-3 md:grid-cols-3">
               {paymentOptions.map((option) => <button

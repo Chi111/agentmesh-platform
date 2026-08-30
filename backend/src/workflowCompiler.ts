@@ -503,7 +503,7 @@ function planningPrompt(mission: Mission, analysis: WorkflowAnalysis): Array<{ r
   return [
     {
       role: 'system',
-      content: `You are the planning node of a DAG workflow compiler. Return one JSON object only with objective, acceptanceCriteria, risks, nodes, and edges. Use ${analysis.recommendedTaskCount.min}-${analysis.recommendedTaskCount.max} task nodes because this mission is ${analysis.complexity}; do not default to three. Add at most two approval nodes, with zero budget, only when analysis requires them. Give every node a unique stable short id. Task nodes require nodeType="task", name, purpose, category, positive relative budget, positionX, positionY, and input with executionMode (analyze|implement|review), non-empty inputContract and outputContract. Approval nodes require nodeType="approval", name, purpose, category, positionX, positionY, and non-empty input.approvalCriteria. Edges use source and target ids. Express independent workstreams as fan-out branches and join them before integration or review. The graph must be weakly connected, acyclic, and have no duplicate edges. Include at least one final review task for moderate or complex work. Never assign an Agent.`,
+      content: `You are the planning node of a DAG workflow compiler. Return one JSON object only with objective, acceptanceCriteria, risks, nodes, and edges. The non-binding baseline for this ${analysis.complexity} mission is ${analysis.recommendedTaskCount.min}-${analysis.recommendedTaskCount.max} task nodes, but choose the final node count from the mission's actual execution needs. Do not pad, merge, or discard useful stages merely to hit that baseline, and do not default to three. Add at most two approval nodes, with zero budget, only when analysis requires them. Give every node a unique stable short id. Task nodes require nodeType="task", name, purpose, category, positive relative budget, positionX, positionY, and input with executionMode (analyze|implement|review), non-empty inputContract and outputContract. Approval nodes require nodeType="approval", name, purpose, category, positionX, positionY, and non-empty input.approvalCriteria. Edges use source and target ids. Express independent workstreams as fan-out branches and join them before integration or review. The graph must be weakly connected, acyclic, and have no duplicate edges. Include at least one final review task for moderate or complex work. Never assign an Agent.`,
     },
     {
       role: 'user',
@@ -550,9 +550,6 @@ function candidateQualityErrors(compilation: WorkflowCompilation, analysis: Work
   const errors: string[] = [];
   const tasks = compilation.stages.filter((stage) => stage.nodeType === 'task');
   const approvals = compilation.stages.filter((stage) => stage.nodeType === 'approval');
-  if (tasks.length < analysis.recommendedTaskCount.min || tasks.length > analysis.recommendedTaskCount.max) {
-    errors.push(`Task node count ${tasks.length} must be within ${analysis.recommendedTaskCount.min}-${analysis.recommendedTaskCount.max} for ${analysis.complexity} work.`);
-  }
   const names = new Set(tasks.map((stage) => stage.name.trim().toLocaleLowerCase()));
   if (names.size !== tasks.length) errors.push('Task node names must be distinct and mission-specific.');
   const missingContract = tasks.find((stage) => (

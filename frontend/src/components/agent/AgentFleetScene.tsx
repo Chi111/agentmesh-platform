@@ -1,4 +1,4 @@
-import { Activity, Bot, ExternalLink, Pause, Play, ShieldCheck } from 'lucide-react';
+import { Activity, ExternalLink, MousePointer2, Pause, Play, ShieldCheck, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { Agent, Mission } from '../../types/domain';
@@ -21,6 +21,8 @@ interface AgentFleetSceneProps {
   agents: Agent[];
   missions: Mission[];
   busyAgentId: string | null;
+  demoMode?: boolean;
+  readOnly?: boolean;
   onToggleAgent: (agentId: string) => Promise<void>;
 }
 
@@ -77,11 +79,11 @@ function NounAgentAvatar({ agent }: { agent: Agent }) {
   </div>;
 }
 
-export function AgentFleetScene({ agents, missions, busyAgentId, onToggleAgent }: AgentFleetSceneProps) {
+export function AgentFleetScene({ agents, missions, busyAgentId, demoMode = false, readOnly = false, onToggleAgent }: AgentFleetSceneProps) {
   const fleet = useMemo(() => buildFleet(agents, missions), [agents, missions]);
   const visibleFleet = fleet.slice(0, MAX_VISIBLE_AGENTS);
-  const [selectedId, setSelectedId] = useState(visibleFleet[0]?.agent.id ?? '');
-  const selected = fleet.find((node) => node.agent.id === selectedId) ?? visibleFleet[0] ?? null;
+  const [selectedId, setSelectedId] = useState('');
+  const selected = visibleFleet.find((node) => node.agent.id === selectedId) ?? null;
   const officeActors: AgentOfficeActor[] = visibleFleet.map((node) => ({
     id: node.agent.id,
     name: node.agent.name,
@@ -91,88 +93,91 @@ export function AgentFleetScene({ agents, missions, busyAgentId, onToggleAgent }
   }));
 
   useEffect(() => {
-    if (fleet.some((node) => node.agent.id === selectedId)) return;
-    setSelectedId(fleet[0]?.agent.id ?? '');
-  }, [fleet, selectedId]);
+    if (!selectedId || visibleFleet.some((node) => node.agent.id === selectedId)) return;
+    setSelectedId('');
+  }, [selectedId, visibleFleet]);
+
+  useEffect(() => {
+    if (!selectedId) return undefined;
+    const closeCard = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSelectedId('');
+    };
+    window.addEventListener('keydown', closeCard);
+    return () => window.removeEventListener('keydown', closeCard);
+  }, [selectedId]);
 
   const stateCounts = fleet.reduce<Record<FleetState, number>>((counts, node) => {
     counts[node.state] += 1;
     return counts;
   }, { executing: 0, assigned: 0, ready: 0, trial: 0, paused: 0, attention: 0 });
 
-  if (!selected) return null;
-
   return (
-    <section className="agent-fleet-shell overflow-hidden rounded-[28px] border border-ink/20 text-ink shadow-card" aria-labelledby="agent-fleet-title">
-      <div className="agent-fleet-header flex flex-col gap-4 border-b border-ink/15 px-5 py-5 sm:flex-row sm:items-start sm:justify-between md:px-6">
-        <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.18em] text-cyan">Nounish workspace · 3D digital twin</p>
-          <div className="mt-2 flex items-center gap-2">
-            <Activity size={18} className="text-lime" aria-hidden="true" />
-            <h2 id="agent-fleet-title" className="text-lg font-semibold">Agent 数字孪生指挥舱</h2>
-            <span className="agent-fleet-live-badge">NOUNISH 3D</span>
-          </div>
-          <p className="mt-2 max-w-2xl text-xs leading-5 text-ink/55">把 Agent、任务和质量状态映射成实时空间行为：员工会在功能区之间切换，任务链路以像素数据流呈现，并支持自动镜头巡航。</p>
+    <section className="agent-fleet-immersive" data-card-open={selected ? 'true' : 'false'} role="region" aria-label="Agent 数字孪生指挥舱">
+      <div className="agent-fleet-world">
+        <AgentOfficeCanvas actors={officeActors} selectedId={selectedId} onSelect={setSelectedId} onClearSelection={() => setSelectedId('')} />
+      </div>
+
+      <header className="agent-fleet-overlay-header">
+        <div className="agent-fleet-title-block">
+          <p>PINME-MESH · DIGITAL WORKPLACE</p>
+          <h1><Activity size={17} aria-hidden="true" />3D 指挥舱</h1>
         </div>
-        <div className="flex flex-wrap gap-2" aria-label="Agent 状态汇总">
+        <div className="agent-fleet-status-strip" aria-label="Agent 状态汇总">
           <span className="agent-fleet-summary" data-state="executing">{stateCounts.executing} 执行</span>
           {stateCounts.assigned ? <span className="agent-fleet-summary" data-state="assigned">{stateCounts.assigned} 待接单</span> : null}
           <span className="agent-fleet-summary" data-state="ready">{stateCounts.ready} 待命</span>
-          <span className="agent-fleet-summary" data-state="trial">{stateCounts.trial} 试炼</span>
+          {stateCounts.trial ? <span className="agent-fleet-summary" data-state="trial">{stateCounts.trial} 试炼</span> : null}
           {stateCounts.attention ? <span className="agent-fleet-summary" data-state="attention">{stateCounts.attention} 异常</span> : null}
           {stateCounts.paused ? <span className="agent-fleet-summary" data-state="paused">{stateCounts.paused} 暂停</span> : null}
         </div>
+      </header>
+
+      {!selected ? <div className="agent-fleet-click-hint"><MousePointer2 size={15} /><span>拖拽旋转 · 滚轮或双指缩放 ±20% · 点击 Agent 查看卡片</span>{demoMode ? <small>公开 Agent 演示空间 · 只读</small> : null}</div> : null}
+
+      <div className="sr-only" role="group" aria-label="可查看的 Agent">
+        {visibleFleet.map((node) => <button type="button" key={node.agent.id} onClick={() => setSelectedId(node.agent.id)}>查看 {node.agent.name} 工作卡片</button>)}
       </div>
 
-      <div className="grid lg:grid-cols-[minmax(0,1fr)_336px]">
-        <div className="agent-fleet-stage relative min-h-[460px] overflow-hidden border-b border-ink/15 lg:min-h-[550px] lg:border-b-0 lg:border-r">
-          <div className="absolute inset-x-0 bottom-[72px] top-0">
-            <AgentOfficeCanvas actors={officeActors} selectedId={selected.agent.id} onSelect={setSelectedId} />
-          </div>
-          <div className="agent-office-roster absolute inset-x-0 bottom-0 z-10 flex gap-2 overflow-x-auto border-t border-ink/15 bg-panel/95 px-4 py-3" role="group" aria-label="选择一个 Agent 员工查看状态">
-            {visibleFleet.map((node) => <button type="button" key={node.agent.id} data-state={node.state} data-selected={selected.agent.id === node.agent.id} aria-pressed={selected.agent.id === node.agent.id} aria-label={`${node.agent.name}，${node.label}`} onClick={() => setSelectedId(node.agent.id)}><Bot size={13} aria-hidden="true" /><span>{node.agent.name}</span><small>{node.label}</small></button>)}
+      {selected ? <aside className="agent-fleet-card" role="dialog" aria-modal="false" aria-labelledby="agent-fleet-card-title" aria-live="polite">
+        <button type="button" className="agent-fleet-card-close" onClick={() => setSelectedId('')} aria-label="关闭 Agent 工作卡片"><X size={17} /></button>
+
+        <div className="flex items-start gap-3 pr-9">
+          <NounAgentAvatar agent={selected.agent} />
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 id="agent-fleet-card-title" className="truncate text-base font-semibold">{selected.agent.name}</h2>
+              <StatusBadge tone={selected.tone} variant="inverted">{selected.label}</StatusBadge>
+            </div>
+            <p className="mt-1 truncate font-mono text-[9px] text-ink/45">{selected.agent.version} · {selected.agent.category}</p>
           </div>
         </div>
 
-        <aside className="agent-fleet-inspector flex min-h-[390px] flex-col p-5 md:p-6" aria-live="polite">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex min-w-0 items-center gap-3">
-              <NounAgentAvatar agent={selected.agent} />
-              <div className="min-w-0">
-                <h3 className="truncate font-semibold">{selected.agent.name}</h3>
-                <p className="mt-1 truncate font-mono text-[9px] text-ink/45">{selected.agent.version} · {selected.agent.category}</p>
-              </div>
-            </div>
-            <StatusBadge tone={selected.tone} variant="inverted">{selected.label}</StatusBadge>
+        <p className="agent-fleet-card-detail">{selected.detail}</p>
+
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <div className="agent-fleet-metric"><span>信誉</span><strong>{selected.agent.quality?.reputation ?? selected.agent.trustScore ?? '—'}</strong></div>
+          <div className="agent-fleet-metric"><span>成功率</span><strong>{selected.agent.successRate.toFixed(1)}%</strong></div>
+          <div className="agent-fleet-metric"><span>Endpoint</span><strong>{selected.agent.quality ? selected.agent.quality.endpointHealthy ? 'HEALTHY' : 'CHECK' : selected.agent.responseTime}</strong></div>
+          <div className="agent-fleet-metric"><span>接单量</span><strong>{selected.agent.quality?.settledJobs ?? selected.agent.jobs}</strong></div>
+        </div>
+
+        {selected.mission ? <div className="agent-fleet-mission">
+          <div className="flex items-center justify-between gap-3"><span>当前任务</span><code>{selected.mission.id}</code></div>
+          <p>{selected.mission.title}</p>
+          <div className="mt-3 h-1.5 overflow-hidden bg-ink/10"><span className="block h-full bg-gradient-to-r from-cyan to-lime" style={{ width: `${Math.max(2, selected.mission.progress)}%` }} /></div>
+          <div className="mt-2 flex justify-between font-mono text-[9px] text-ink/45"><span>{selected.mission.currentStage}</span><span>{selected.mission.progress}%</span></div>
+        </div> : <div className="agent-fleet-mission"><span>当前任务</span><p className="font-normal text-ink/60">没有进行中的任务，可接受新的调度。</p></div>}
+
+        <div className="mt-5">
+          <p className="mb-3 flex items-center gap-1.5 text-[9px] text-ink/45"><ShieldCheck size={12} />{formatHealthCheck(selected.agent.quality?.lastHealthCheckAt)}</p>
+          <div className={`grid gap-2 ${readOnly ? '' : 'grid-cols-2'}`}>
+            {!readOnly ? <button type="button" className="agent-fleet-card-action" disabled={busyAgentId === selected.agent.id} onClick={() => void onToggleAgent(selected.agent.id)}>
+              {selected.agent.status === 'active' ? <Pause size={14} /> : <Play size={14} />}{selected.agent.status === 'active' ? '暂停' : '启动'}
+            </button> : null}
+            <Link className="agent-fleet-card-primary" to={`/agents/${selected.agent.id}`}>查看完整档案 <ExternalLink size={13} /></Link>
           </div>
-
-          <p className="mt-5 rounded-xl border border-ink/15 bg-white/55 p-3 text-xs leading-5 text-ink/65">{selected.detail}</p>
-
-          <div className="mt-5 grid grid-cols-2 gap-2">
-            <div className="agent-fleet-metric"><span>信誉</span><strong>{selected.agent.quality?.reputation ?? selected.agent.trustScore ?? '—'}</strong></div>
-            <div className="agent-fleet-metric"><span>成功率</span><strong>{selected.agent.successRate.toFixed(1)}%</strong></div>
-            <div className="agent-fleet-metric"><span>Endpoint</span><strong>{selected.agent.quality ? selected.agent.quality.endpointHealthy ? 'HEALTHY' : 'CHECK' : selected.agent.responseTime}</strong></div>
-            <div className="agent-fleet-metric"><span>接单量</span><strong>{selected.agent.quality?.settledJobs ?? selected.agent.jobs}</strong></div>
-          </div>
-
-          {selected.mission ? <div className="mt-5 border-t border-ink/15 pt-5">
-            <div className="flex items-center justify-between gap-3"><span className="text-[10px] text-ink/45">当前任务</span><span className="font-mono text-[9px] text-cyan">{selected.mission.id}</span></div>
-            <p className="mt-2 line-clamp-2 text-sm font-semibold leading-5">{selected.mission.title}</p>
-            <div className="mt-3 h-1.5 overflow-hidden bg-ink/10"><span className="block h-full bg-gradient-to-r from-cyan to-lime" style={{ width: `${Math.max(2, selected.mission.progress)}%` }} /></div>
-            <div className="mt-2 flex justify-between font-mono text-[9px] text-ink/45"><span>{selected.mission.currentStage}</span><span>{selected.mission.progress}%</span></div>
-          </div> : <div className="mt-5 border-t border-ink/15 pt-5"><p className="text-[10px] text-ink/45">当前任务</p><p className="mt-2 text-xs text-ink/65">没有进行中的任务，可接受新的调度。</p></div>}
-
-          <div className="mt-auto pt-6">
-            <p className="mb-3 flex items-center gap-1.5 text-[9px] text-ink/45"><ShieldCheck size={12} />{formatHealthCheck(selected.agent.quality?.lastHealthCheckAt)}</p>
-            <div className="grid grid-cols-2 gap-2">
-              <button type="button" className="inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-ink/20 bg-white/55 px-3 text-xs font-semibold text-ink transition hover:bg-white disabled:opacity-40" disabled={busyAgentId === selected.agent.id} onClick={() => void onToggleAgent(selected.agent.id)}>
-                {selected.agent.status === 'active' ? <Pause size={14} /> : <Play size={14} />}{selected.agent.status === 'active' ? '暂停' : '启动'}
-              </button>
-              <Link className="inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-ink px-3 text-xs font-semibold text-white transition hover:bg-cyan hover:text-ink" to={`/agents/${selected.agent.id}`}>详情 <ExternalLink size={13} /></Link>
-            </div>
-          </div>
-        </aside>
-      </div>
+        </div>
+      </aside> : null}
     </section>
   );
 }

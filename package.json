@@ -7,6 +7,9 @@
     "frontend",
     "backend"
   ],
+  "dependencies": {
+    "marked": "18.0.11"
+  },
   "packageManager": "npm@10.9.4",
   "scripts": {
     "dev": "wrangler dev --config backend/wrangler.toml",
