@@ -308,7 +308,7 @@ describe('D1PlatformStore concurrency invariants', () => {
 
   it('seeds the runnable official Agent market after removing historical demo data', async () => {
     const agents = await store.listAgents();
-    const official = agents.filter((agent) => agent.ownerId === 'agentmesh-official');
+    const official = agents.filter((agent) => agent.ownerId === 'agentmesh-admin');
 
     expect(official.map((agent) => agent.id).sort()).toEqual([
       'official-delivery-writer',
@@ -336,30 +336,43 @@ describe('D1PlatformStore concurrency invariants', () => {
          'TASK-2026-0809', NULL, 'agent_owner', 'agentmesh-yd-v1', 'CREDIT',
          12.5, 10000, 0, 1000000, 1, '{}', '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z');
 
-      INSERT INTO profiles (id, email, display_name, role)
-      VALUES ('admin-email-web2-uid', 'CHI435900020@GMAIL.COM', 'Platform Administrator', 'requester');
+      UPDATE profiles
+      SET display_name = 'Platform Administrator'
+      WHERE id = 'agentmesh-admin';
     `);
 
     const official = (await store.listAgents()).filter((agent) => agent.official);
     expect(official).toHaveLength(3);
     expect(official.every((agent) => (
-      agent.ownerId === 'admin-email-web2-uid'
+      agent.ownerId === 'agentmesh-admin'
       && agent.wallet === '0x73325bd3e93d9a12e5d2d5219424daf0e55f856d'
       && agent.author === 'Platform Administrator'
     ))).toBe(true);
     expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('agentmesh-official')).toEqual({ balance: 0 });
-    expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('admin-email-web2-uid')).toEqual({ balance: 12.5 });
-    expect(database.db.prepare('SELECT user_id FROM wallet_transactions WHERE id = ?').get('official-payout-before-admin')).toEqual({ user_id: 'admin-email-web2-uid' });
-    expect(database.db.prepare('SELECT user_id FROM reward_activities WHERE id = ?').get('official-reward-before-admin')).toEqual({ user_id: 'admin-email-web2-uid' });
-    expect(database.db.prepare('SELECT role, wallet_address FROM profiles WHERE id = ?').get('admin-email-web2-uid')).toEqual({
+    expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('agentmesh-admin')).toEqual({ balance: 12.5 });
+    expect(database.db.prepare('SELECT user_id FROM wallet_transactions WHERE id = ?').get('official-payout-before-admin')).toEqual({ user_id: 'agentmesh-admin' });
+    expect(database.db.prepare('SELECT user_id FROM reward_activities WHERE id = ?').get('official-reward-before-admin')).toEqual({ user_id: 'agentmesh-admin' });
+    expect(database.db.prepare('SELECT email, role, wallet_address FROM profiles WHERE id = ?').get('agentmesh-admin')).toEqual({
+      email: 'chi435900020@gmail.com',
       role: 'admin',
       wallet_address: null,
     });
 
-    const migration = readFileSync(join(import.meta.dirname, '../../db/032_assign_official_agents_to_admin.sql'), 'utf8');
+    const linked = await store.ensureIdentityProfile({
+      provider: 'privy',
+      subject: 'did:privy:google-admin',
+      email: 'CHI435900020@GMAIL.COM',
+      displayName: 'Google Administrator',
+      walletAddressAuthoritative: true,
+    });
+    expect(linked.id).toBe('agentmesh-admin');
+    expect(linked.role).toBe('admin');
+    expect(linked.walletAddress).toBeUndefined();
+
+    const migration = readFileSync(join(import.meta.dirname, '../../db/033_bootstrap_admin_web2_profile.sql'), 'utf8');
     expect(() => database.db.exec(migration)).not.toThrow();
     expect(() => database.db.exec(migration)).not.toThrow();
-    expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('admin-email-web2-uid')).toEqual({ balance: 12.5 });
+    expect(database.db.prepare('SELECT balance FROM wallet_balances WHERE user_id = ?').get('agentmesh-admin')).toEqual({ balance: 12.5 });
   });
 
   it('keeps Agent quality events idempotent, deterministically recomputable and feedback versioned', async () => {
