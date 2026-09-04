@@ -26,6 +26,6 @@ export function formatPaymentAmount(amount: number, method: PaymentMethod) {
 
 export function paymentInput(method: PaymentMethod) {
   return method === 'web3_seth'
-    ? { min: 0.000001, step: 0.001, suggested: 0.01 }
+    ? { min: 0.000002, step: 0.000001, suggested: 0.01 }
     : { min: 1, step: 1, suggested: method === 'web3_musdc' ? 80 : 80 };
 }

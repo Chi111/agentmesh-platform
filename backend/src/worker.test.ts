@@ -176,9 +176,10 @@ async function createFundedMission(): Promise<{ mission: Mission; stages: Workfl
   const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
   const matches = candidates.body.data as CandidateMatch[];
   const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
-  expect((await api(`/api/missions/${mission.id}/workflow`, {
+  const workflow = await api(`/api/missions/${mission.id}/workflow`, {
     method: 'POST', body: JSON.stringify({ assignments }),
-  }, requester.id)).response.status).toBe(200);
+  }, requester.id);
+  expect(workflow.response.status, JSON.stringify(workflow.body)).toBe(200);
   await acceptAllStageOffers(mission.id);
   expect((await api(`/api/missions/${mission.id}/start`, { method: 'POST', body: '{}' }, requester.id)).response.status).toBe(200);
   const detail = await api(`/api/missions/${mission.id}`, {}, requester.id);
@@ -1454,6 +1455,50 @@ describe('AgentMesh Worker', () => {
     expect(event?.payload).toMatchObject({ source: 'adaptive-fallback', compiler: { engine: 'langgraph' } });
   });
 
+  it('rejects a mission budget that cannot fund the minimum two task nodes', async () => {
+    const created = await api('/api/missions', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: '极小金额任务无法拆分',
+        description: '验证任务总预算不足以覆盖两个最小可计价工作流节点时返回客户端错误。',
+        category: '商业研究',
+        tags: ['边界'],
+        budget: 0.000001,
+        paymentMethod: 'web3_seth',
+        deadline: '2026-09-01',
+        priority: 'normal',
+        expertise: 'expert',
+        yieldEnabled: false,
+      }),
+    }, requester.id);
+
+    expect(created.response.status).toBe(400);
+    expect(created.body.error.code).toBe('VALIDATION_ERROR');
+    expect(store.missions.size).toBe(0);
+  });
+
+  it('rejects mission budgets below the payment method precision', async () => {
+    const created = await api('/api/missions', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: '无效精度任务预算',
+        description: '验证任务总预算不能使用结算币种不支持的小数精度，避免工作流分配失败。',
+        category: '商业研究',
+        tags: ['边界'],
+        budget: 0.025,
+        paymentMethod: 'web2_balance',
+        deadline: '2026-09-01',
+        priority: 'normal',
+        expertise: 'expert',
+        yieldEnabled: false,
+      }),
+    }, requester.id);
+
+    expect(created.response.status).toBe(400);
+    expect(created.body.error.code).toBe('INVALID_BUDGET_PRECISION');
+    expect(store.missions.size).toBe(0);
+  });
+
   it('compiles a complex mission through LangGraph and reports adaptive fallback metadata', async () => {
     const created = await api('/api/missions', {
       method: 'POST',
@@ -2193,6 +2238,11 @@ describe('AgentMesh Worker', () => {
     expect(candidates.response.status).toBe(200);
     expect(matches).toHaveLength(stages.length);
     expect(matches.every((match) => match.candidates.length > 0)).toBe(true);
+    expect(matches.every((match) => match.candidates.every((candidate) => (
+      candidate.quote.amount > 0
+      && candidate.quote.formulaVersion === 'agentmesh.quote.v1'
+      && candidate.quote.agentPriceVersion === 1
+    )))).toBe(true);
 
     const workflow = await api(`/api/missions/${mission.id}/workflow`, {
       method: 'POST',
@@ -2201,6 +2251,10 @@ describe('AgentMesh Worker', () => {
     expect(workflow.response.status).toBe(200);
     expect(workflow.body.data.mission.team.length).toBeGreaterThan(0);
     expect(workflow.body.data.offers).toHaveLength(stages.length);
+    expect(workflow.body.data.escrow.amount).toBeLessThanOrEqual(mission.budget);
+    expect(workflow.body.data.escrow.amount).toBeCloseTo(
+      workflow.body.data.offers.reduce((sum: number, offer: JsonBody) => sum + offer.quote.amount, 0),
+    );
     await acceptAllStageOffers(mission.id);
     const readyForPayment = await api(`/api/missions/${mission.id}`, {}, requester.id);
     expect(readyForPayment.body.data.mission.status).toBe('matching');
@@ -2213,7 +2267,49 @@ describe('AgentMesh Worker', () => {
     expect(started.response.status).toBe(200);
     expect(started.body.data.mission.status).toBe('running');
     expect(started.body.data.escrow.status).toBe('held');
-    expect((await store.getWalletAccount(requester.id)).balance).toBe(700);
+    expect((await store.getWalletAccount(requester.id)).balance).toBeCloseTo(1_000 - workflow.body.data.escrow.amount);
+  });
+
+  it('allows only one concurrent invitation round to become active', async () => {
+    const { mission } = await createMission();
+    const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    const matches = candidates.body.data as CandidateMatch[];
+    const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
+
+    const results = await Promise.all([
+      api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id),
+      api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id),
+    ]);
+
+    expect(results.every((result) => result.response.status === 200 || result.response.status === 409)).toBe(true);
+    const successful = results.filter((result) => result.response.status === 200);
+    expect(successful.length).toBeGreaterThanOrEqual(1);
+    const activeOfferIds = (await store.listStageOffers(mission.id)).map((offer) => offer.id).sort();
+    for (const response of successful) {
+      expect(activeOfferIds).toEqual((response.body.data.offers as Array<{ id: string }>).map((offer) => offer.id).sort());
+    }
+    expect((await store.listEvents(mission.id)).filter((event) => event.type === 'workflow.offers_created')).toHaveLength(1);
+  });
+
+  it('rejects workflow confirmation when an authoritative stage quote exceeds its budget', async () => {
+    const { mission } = await createMission();
+    const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    const matches = candidates.body.data as CandidateMatch[];
+    const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
+    for (const agentId of new Set(Object.values(assignments))) {
+      const selected = store.agents.get(agentId);
+      if (selected) store.agents.set(agentId, { ...selected, price: 10_000, priceVersion: 2 });
+    }
+
+    const workflow = await api(`/api/missions/${mission.id}/workflow`, {
+      method: 'POST', body: JSON.stringify({ assignments }),
+    }, requester.id);
+
+    expect(workflow.response.status).toBe(409);
+    expect(workflow.body.error.code).toBe('STAGE_QUOTE_EXCEEDS_BUDGET');
+    expect(workflow.body.error.details).toMatchObject({ pricingVersion: 'agentmesh.quote.v1' });
+    expect(await store.listStageOffers(mission.id)).toHaveLength(0);
+    expect((await store.getEscrow(mission.id))?.amount).toBe(mission.budget);
   });
 
   it('requires every current stage offer to be accepted before charging the requester', async () => {
@@ -2257,7 +2353,7 @@ describe('AgentMesh Worker', () => {
     await acceptAllStageOffers(mission.id);
     const started = await api(`/api/missions/${mission.id}/start`, { method: 'POST', body: '{}' }, requester.id);
     expect(started.response.status).toBe(200);
-    expect((await store.getWalletAccount(requester.id)).balance).toBe(700);
+    expect((await store.getWalletAccount(requester.id)).balance).toBeCloseTo(1_000 - reissued.body.data.escrow.amount);
   });
 
   it('allows only the assigned Agent owner to answer a pending, unexpired offer once', async () => {
@@ -2305,7 +2401,7 @@ describe('AgentMesh Worker', () => {
     const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
     const matches = candidates.body.data as CandidateMatch[];
     const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
-    await api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id);
+    const workflow = await api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id);
     await acceptAllStageOffers(mission.id);
 
     const starts = await Promise.all([
@@ -2313,7 +2409,7 @@ describe('AgentMesh Worker', () => {
       api(`/api/missions/${mission.id}/start`, { method: 'POST', body: '{}' }, requester.id),
     ]);
     expect(starts.map((result) => result.response.status)).toEqual([200, 200]);
-    expect((await store.getWalletAccount(requester.id)).balance).toBe(700);
+    expect((await store.getWalletAccount(requester.id)).balance).toBeCloseTo(1_000 - workflow.body.data.escrow.amount);
     expect((await store.getWalletAccount(requester.id)).transactions.filter((item) => item.type === 'mission_hold' && item.missionId === mission.id)).toHaveLength(1);
     expect((await store.listEvents(mission.id)).filter((event) => event.type === 'mission.started')).toHaveLength(1);
   });
@@ -2346,6 +2442,29 @@ describe('AgentMesh Worker', () => {
       ? { ...item, wallet: '0x4400000000000000000000000000000000009A11' }
       : item);
     expect(buildSettlementPlan(assigned, changedAgents).payoutHash).not.toBe(first.payoutHash);
+
+    const quoted = buildSettlementPlan(assigned, agents, assigned.map((stage, index) => ({
+      id: `OFFER-CHAIN-${index}`,
+      missionId: stage.missionId,
+      stageId: stage.id,
+      agentId: stage.agentId!,
+      status: 'accepted',
+      quote: {
+        amount: (index + 1) * 11,
+        token: 'mUSDC',
+        basePriceUsdc: 10,
+        agentPriceVersion: 1,
+        formulaVersion: 'agentmesh.quote.v1',
+        comparableToBasePrice: true,
+        multipliers: { complexity: 1, urgency: 1, expertise: 1, load: 1 },
+      },
+      expiresAt: '2026-09-05T00:00:00.000Z',
+      respondedAt: '2026-09-04T00:00:00.000Z',
+      createdAt: '2026-09-04T00:00:00.000Z',
+      updatedAt: '2026-09-04T00:00:00.000Z',
+    })));
+    expect(quoted.weights).toEqual([66_000_000n]);
+    expect(quoted.payoutHash).not.toBe(first.payoutHash);
   });
 
   it('rejects a Web2 mission start when the recharged balance is insufficient', async () => {
@@ -3089,7 +3208,7 @@ describe('AgentMesh Worker', () => {
     const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
     const matches = candidates.body.data as CandidateMatch[];
     const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
-    await api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id);
+    const workflow = await api(`/api/missions/${mission.id}/workflow`, { method: 'POST', body: JSON.stringify({ assignments }) }, requester.id);
     await acceptAllStageOffers(mission.id);
     await api(`/api/missions/${mission.id}/start`, { method: 'POST', body: '{}' }, requester.id);
 
@@ -3199,7 +3318,7 @@ describe('AgentMesh Worker', () => {
     expect(ledger.body.data.entries.length).toBeGreaterThan(0);
     expect(ledger.body.data.entries[0].missionId).toBe(mission.id);
     expect(ledger.body.data.entries[0].entryType).toBe('agent_payout');
-    expect(ledger.body.data.totals.settled).toBeCloseTo(298.8);
+    expect(ledger.body.data.totals.settled).toBeCloseTo(workflow.body.data.escrow.amount * 0.996);
 
     const requesterLedger = await api('/api/developer/ledger', {}, requester.id);
     expect(requesterLedger.response.status).toBe(403);
@@ -3280,6 +3399,39 @@ describe('AgentMesh Worker', () => {
     }, developer.id);
     expect(bypass.response.status).toBe(409);
     expect(bypass.body.error.code).toBe('AGENT_TRIAL_REQUIRED');
+  });
+
+  it('versions Agent base-price changes without mutating an existing offer quote', async () => {
+    const { mission } = await createMission();
+    const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    const matches = candidates.body.data as CandidateMatch[];
+    const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
+    const workflow = await api(`/api/missions/${mission.id}/workflow`, {
+      method: 'POST', body: JSON.stringify({ assignments }),
+    }, requester.id);
+    const lockedOffer = workflow.body.data.offers[0] as JsonBody;
+    const lockedEscrowAmount = workflow.body.data.escrow.amount as number;
+
+    const forbidden = await api(`/api/agents/${lockedOffer.agentId}/price`, {
+      method: 'POST', body: JSON.stringify({ price: 123 }),
+    }, otherDeveloper.id);
+    expect(forbidden.response.status).toBe(403);
+
+    const headers = { 'Idempotency-Key': 'agent-price-version-test' };
+    const updated = await api(`/api/agents/${lockedOffer.agentId}/price`, {
+      method: 'POST', headers, body: JSON.stringify({ price: 123 }),
+    }, developer.id);
+    const replayed = await api(`/api/agents/${lockedOffer.agentId}/price`, {
+      method: 'POST', headers, body: JSON.stringify({ price: 123 }),
+    }, developer.id);
+    expect(updated.response.status).toBe(200);
+    expect(updated.body.data).toMatchObject({ price: 123, priceVersion: 2 });
+    expect(replayed.body.meta.replayed).toBe(true);
+    expect(replayed.body.data.priceVersion).toBe(2);
+
+    const detail = await api(`/api/missions/${mission.id}`, {}, requester.id);
+    expect(detail.body.data.offers.find((offer: JsonBody) => offer.id === lockedOffer.id).quote).toEqual(lockedOffer.quote);
+    expect(detail.body.data.escrow.amount).toBe(lockedEscrowAmount);
   });
 
   it('uses one shadow/enforce quality gate for the public market and mission candidates', async () => {

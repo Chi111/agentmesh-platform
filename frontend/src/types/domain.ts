@@ -48,6 +48,7 @@ export interface Agent {
   successRate: number;
   responseTime: string;
   price: number;
+  priceVersion?: number;
   jobs: number;
   volume: number;
   author: string;
@@ -316,16 +317,32 @@ export interface StageOffer {
   stageId: string;
   agentId: string;
   status: 'pending' | 'accepted' | 'declined' | 'expired';
+  quote: StageQuote;
   expiresAt: string;
   respondedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
 
+export interface StageQuote {
+  amount: number;
+  token: 'CREDIT' | 'mUSDC' | 'sETH';
+  basePriceUsdc: number;
+  agentPriceVersion: number;
+  formulaVersion: string;
+  comparableToBasePrice: boolean;
+  multipliers: {
+    complexity: number;
+    urgency: number;
+    expertise: number;
+    load: number;
+  };
+}
+
 export interface CandidateMatch {
   stageId: string;
   stageName: string;
-  candidates: Array<{ agent: Agent; score: number; reasons: string[] }>;
+  candidates: Array<{ agent: Agent; score: number; reasons: string[]; quote: StageQuote }>;
 }
 
 export interface ExecutionEvent {

@@ -72,9 +72,9 @@ Privy 的部署配置、回退逻辑和安全边界见 [`authentication.md`](aut
 | `GET` | `/api/missions/:id` | 任务、DAG 节点与边、接单邀请、事件、交付物、托管与争议聚合 |
 | `GET` | `/api/missions/:id/stream` | 鉴权 SSE 任务快照；客户端断线后回退轮询 |
 | `POST` | `/api/missions/:id/compile` | LangGraph 执行复杂度分析、DAG 规划、本地校验和一次定向修复；兼容旧 `stages` 响应，失败时生成 2–12 个任务节点的自适应 DAG；不自动分配 Agent |
-| `GET` | `/api/missions/:id/candidates` | 分类、标签、信誉、质量、价格与公平扰动匹配 |
+| `GET` | `/api/missions/:id/candidates` | 分类、标签、信誉、质量、动态报价与公平扰动匹配；每个候选返回报价构成和公式版本 |
 | `PUT` | `/api/missions/:id/workflow/draft` | 以 `workflowVersion` 乐观锁保存节点、边和 viewport；重新编排使旧邀请失效 |
-| `POST` | `/api/missions/:id/workflow` | 确认当前图和手动 Agent 分配；只为任务节点生成 24 小时邀请，Gate 不接单也不分账 |
+| `POST` | `/api/missions/:id/workflow` | 确认当前图和手动 Agent 分配；校验报价不超过节点预算，为任务节点生成带锁价快照的 24 小时邀请 |
 | `POST` | `/api/missions/:id/offers/:offerId` | 被分配 Agent 的所有者接受或拒绝阶段邀请 |
 | `POST` | `/api/missions/:id/start` | 全部当前邀请接受后原子锁定账本并启动；并发请求只扣款和写启动事件一次；合约模式验证带 `payoutHash` 的 `depositTxHash` |
 | `POST` | `/api/missions/:id/dispatch` | 并行派发全部依赖已满足的任务节点；失败节点不会隐式重试 |
@@ -90,6 +90,7 @@ Privy 的部署配置、回退逻辑和安全边界见 [`authentication.md`](aut
 | `POST` | `/api/agents/:id/invoke` | 登录用户直接调用官方 Agent；需要 Bearer ID Token，按用户和 Agent 独立限流 |
 | `POST` | `/api/agents/:id/trial` | 对 Endpoint 发起随机挑战后评分；挑战失败不能激活 |
 | `POST` | `/api/agents/:id/status` | 已通过试炼且信誉达标的 Agent 上线或暂停 |
+| `POST` | `/api/agents/:id/price` | Agent 所有者或管理员修改 USDC 基础价并生成不可变价格版本；不追溯修改既有邀请报价 |
 | `POST` | `/api/admin/agents/:id/quality/trial-override` | 管理员以 7.5–10 分人工通过 Trial；写入独立审计证据，不伪造 Endpoint 健康记录 |
 | `GET` | `/api/developer/summary` | 接单数、活跃 Agent、成交额与待结算 |
 | `GET` | `/api/developer/ledger?token=CREDIT&limit=50&cursor=…` | 按 CREDIT / mUSDC / sETH 隔离的逐笔账目、状态汇总、12 周趋势和不透明游标；单页最多 100 条 |
@@ -158,7 +159,11 @@ Gate 在所有入边完成后由 `queued` 转为 `running`（待审批）。批�
 
 Agent 注册 API 不接受 `apiKey`、`token`、`secret` 或 `credential` 字段。需要认证的 Agent Endpoint 必须在 Worker Secret `AGENT_CREDENTIALS_JSON` 中按 Agent ID 配置凭据；在凭据不可用时，派发接口返回 `409 AGENT_CREDENTIAL_REQUIRED`。Endpoint 必须使用 HTTPS 443；Worker 拒绝用户名密码、localhost、私网/保留 IPv4 和直接 IPv6 字面地址，试炼和派发前还会解析 A/AAAA 并拒绝任何非公网结果。生产可再用 `AGENT_ENDPOINT_ALLOWLIST` 限制域名。
 
-工作流确认会为每个阶段生成绑定当前 `stageId + agentId` 的 24 小时邀请。只有 Agent 所有者能响应；拒绝、未响应过期或重新编排后，任务方必须重新发送当前工作流邀请。在期限内接受后，该承诺持续有效到工作流被替换或托管开始，避免钱包存入期间出现到期竞态。启动守卫在 Worker 和 D1 两层确认每个阶段都存在 `accepted` 邀请，未满足时返回 `409 OFFERS_NOT_ACCEPTED`，且不得产生 Web2 扣款或链上验证副作用。
+工作流确认会为每个阶段生成绑定当前 `stageId + agentId` 的 24 小时邀请。`agentmesh.quote.v1` 以 Agent 版本化 USDC 基础价为起点，叠加节点执行类型、任务优先级、专家等级和负载系数，并把金额、币种、各乘数、基础价版本与公式版本完整写入邀请快照。负载按 Agent 在运行中任务里的 `queued/running` 阶段数计算：空闲为 `0.9`、1 个阶段为 `1.0`，之后每增加一个并发阶段加 `0.05`，最高 `1.2`；候选查询展示实时估算，确认工作流时重新计算并锁价。CREDIT 与 mUSDC 报价不得高于对应节点预算，否则返回 `409 STAGE_QUOTE_EXCEEDS_BUDGET`；sETH 在没有可信汇率预言机前沿用节点预算，不把 USDC 基础价直接换算成原生资产。
+
+节点预算是价格上限，不再是必然扣款额。确认工作流后，待托管金额会收敛为所有任务节点锁定报价之和；Web2 启动只冻结该金额，Web3 存款校验和 `payoutHash` 也使用同一快照。平台费仍为托管金额的 0.4%，各 Agent 的结算权重来自对应锁定报价。Agent 后续修改基础价会生成新版本，但不追溯影响已有邀请、托管或结算；工作流修改或重发邀请时，上一轮报价会转入只追加的历史表继续保留。
+
+只有 Agent 所有者能响应邀请；拒绝、未响应过期或重新编排后，任务方必须重新发送当前工作流邀请。在期限内接受后，该承诺持续有效到工作流被替换或托管开始，避免钱包存入期间出现到期竞态。启动守卫在 Worker 和 D1 两层确认每个阶段都存在 `accepted` 邀请，未满足时返回 `409 OFFERS_NOT_ACCEPTED`，且不得产生 Web2 扣款或链上验证副作用。
 
 官方测试 Agent 由平台运行时直接托管，不存在等待人工开发者响应的环节，因此工作流确认时会生成已接受的邀请。派发仍执行同样的阶段占用、运行记录、终态 CAS、履约统计和交付哈希流程；输出优先来自项目级 PinMe LLM，无法形成有效结构化结果时节点失败且不会发布降级占位。Analyze 节点不创建客户 artifact；Implement 节点创建阶段制品；终结节点额外获得所有已完成节点的有界 portfolio，并发布 `deliverable.md + acceptance-report.md + artifact-index.md + workstreams/*.md + index.html + manifest.json`。它们同时通过 `/api/agents/:id/invoke` 暴露 HTTPS 调用契约：GET 可匿名读取文档，POST 必须登录、限制请求体并按用户与 Agent 限流。第三方 Agent 不获得自动接单或该托管调用能力。
 
@@ -199,6 +204,7 @@ Agent 市场质量使用独立的只追加事件账本，不再把旧 `trustScor
 - `019_yd_rewards_governance.sql`：隔离的 YD 周期奖励、Merkle 分配、锁仓 read model、Power 快照和生态治理。
 - `020_agent_market_quality.sql`：Agent 版本、正式 Trial、Endpoint 健康、只追加质量事件、版本化反馈、信誉读模型与快照。
 - `032_assign_official_agents_to_admin.sql`：将 3 个官方 Agent 的链上收款地址统一为管理员钱包 `0x73325bD3e93d9A12e5D2d5219424DaF0e55F856D`，并按该钱包绑定的管理员 Profile UID 迁移 Web2 所有权、CREDIT 收益和 PM 贡献记录。旧地址已写入不可变 `payoutHash` 的在途 Web3 托管不得释放到旧地址，需先原路退款再按新地址重新托管。
+- `034_versioned_pricing_quotes.sql`：可重放的 Agent 基础价版本、当前阶段锁价与历史报价旁表；同时把旧数据中的零基础价归一到最低 `0.01 USDC`。
 
 部署 Worker 与数据库的联合修改使用：
 

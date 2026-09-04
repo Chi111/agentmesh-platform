@@ -94,6 +94,7 @@ interface AppState {
   registerAgent: (input: NewAgentInput) => Promise<string>;
   runAgentTrial: (agentId: string) => Promise<void>;
   toggleAgentStatus: (agentId: string) => Promise<void>;
+  updateAgentPrice: (agentId: string, price: number) => Promise<void>;
   releasePayment: (missionId: string, releaseTxHash?: string | null) => Promise<void>;
   createDispute: (missionId: string, reason: string, freezeTxHash?: string | null) => Promise<void>;
   startDisputeReview: (disputeId: string, weightMode?: 'one_person_one_vote' | 'power') => Promise<void>;
@@ -285,7 +286,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       missions: state.missions.map((mission) => mission.id === missionId ? result.mission : mission),
       missionStages: { ...state.missionStages, [missionId]: result.stages },
       missionDetails: state.missionDetails[missionId]
-        ? { ...state.missionDetails, [missionId]: { ...state.missionDetails[missionId], mission: result.mission, stages: result.stages, edges: result.edges, offers: result.offers } }
+        ? { ...state.missionDetails, [missionId]: { ...state.missionDetails[missionId], mission: result.mission, stages: result.stages, edges: result.edges, offers: result.offers, escrow: result.escrow ?? state.missionDetails[missionId].escrow } }
         : state.missionDetails,
       toast: notice('阶段邀请已发送，等待所有 Agent 接单。'),
     }));
@@ -394,6 +395,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     const nextStatus = current.status === 'active' ? 'paused' : 'active';
     const updated = normalizeAgent(await api.updateAgentStatus(agentId, nextStatus));
     set((state) => ({ agents: state.agents.map((agent) => agent.id === agentId ? updated : agent), toast: notice(`${updated.name} 已${nextStatus === 'active' ? '上线' : '暂停'}。`) }));
+  },
+  updateAgentPrice: async (agentId, price) => {
+    requireApiSession();
+    const updated = normalizeAgent(await api.updateAgentPrice(agentId, price));
+    set((state) => ({
+      agents: state.agents.map((agent) => agent.id === agentId ? updated : agent),
+      toast: notice(`${updated.name} 基础价已更新为 ${updated.price} USDC（价格 v${updated.priceVersion ?? 1}）。`),
+    }));
   },
   releasePayment: async (missionId, releaseTxHash = null) => {
     requireApiSession();

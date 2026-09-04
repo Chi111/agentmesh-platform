@@ -1,6 +1,7 @@
 import { END, START, StateGraph, StateSchema } from '@langchain/langgraph/web';
 import { z } from 'zod';
 import type { Mission, WorkflowStage } from './contracts';
+import { minimumPaymentAmount } from './payments';
 import {
   parseLlmCompilation,
   type WorkflowCompilation,
@@ -221,7 +222,8 @@ export function adaptiveFallbackCompilation(
   mission: Mission,
   analysis = estimateWorkflowAnalysis(mission),
 ): WorkflowCompilation {
-  const taskCount = targetTaskCount(analysis);
+  const affordableTaskCount = Math.floor((mission.budget + Number.EPSILON) / minimumPaymentAmount(mission.paymentMethod));
+  const taskCount = Math.max(2, Math.min(targetTaskCount(analysis), affordableTaskCount));
   const nodes: Array<Record<string, unknown>> = [];
   const edges: Array<{ source: string; target: string }> = [];
   const addTask = (input: {

@@ -100,6 +100,26 @@ describe('workflowAggregate', () => {
 });
 
 describe('workflow layout validation', () => {
+  it('rejects zero or sub-quantum task budgets while keeping zero-cost approval nodes valid', () => {
+    const zeroTask = stage({ id: 'STAGE-zero', position: 1, budget: 0, status: 'queued' });
+    expect(() => validateWorkflowGraph({ mission: { ...mission, budget: 0 }, stages: [zeroTask], edges: [] }))
+      .toThrow('Task node budgets must be at least 0.01');
+
+    const tinySethTask = stage({ id: 'STAGE-tiny-seth', position: 1, budget: 0.0000009, status: 'queued' });
+    expect(() => validateWorkflowGraph({
+      mission: { ...mission, budget: 0.0000009, paymentMethod: 'web3_seth' },
+      stages: [tinySethTask],
+      edges: [],
+    })).toThrow('Task node budgets must be at least 0.000001');
+
+    const validSethTask = { ...tinySethTask, budget: 0.000001 };
+    expect(validateWorkflowGraph({
+      mission: { ...mission, budget: 0.000001, paymentMethod: 'web3_seth' },
+      stages: [validSethTask],
+      edges: [],
+    })).toHaveLength(1);
+  });
+
   it('rejects overlapping persisted coordinates and accepts the same graph after layout', () => {
     const stages = [
       stage({ id: 'STAGE-overlap-a', position: 1, budget: 100, status: 'queued', positionX: 80, positionY: 80 }),

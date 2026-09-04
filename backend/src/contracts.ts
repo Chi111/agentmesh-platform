@@ -59,6 +59,8 @@ export interface Agent {
   inputSchema: Record<string, unknown>;
   outputSchema: Record<string, unknown>;
   price: number;
+  /** Monotonically increases whenever the owner changes the base price. */
+  priceVersion?: number;
   wallet: string;
   status: AgentStatus;
   version: string;
@@ -84,6 +86,22 @@ export interface AgentVersion {
   outputSchema: Record<string, unknown>;
   capabilities: string[];
   createdAt: string;
+}
+
+export interface StageQuote {
+  /** Customer-funded gross amount for this stage, before the protocol fee. */
+  amount: number;
+  token: 'CREDIT' | 'mUSDC' | 'sETH';
+  basePriceUsdc: number;
+  agentPriceVersion: number;
+  formulaVersion: string;
+  comparableToBasePrice: boolean;
+  multipliers: {
+    complexity: number;
+    urgency: number;
+    expertise: number;
+    load: number;
+  };
 }
 
 export interface AgentTrial {
@@ -245,6 +263,8 @@ export interface StageOffer {
   stageId: string;
   agentId: string;
   status: 'pending' | 'accepted' | 'declined' | 'expired';
+  /** Immutable for the lifetime of this offer and used as its settlement weight. */
+  quote: StageQuote;
   expiresAt: string;
   respondedAt: string | null;
   createdAt: string;
@@ -992,6 +1012,7 @@ export interface CandidateMatch {
     agent: Agent;
     score: number;
     reasons: string[];
+    quote: StageQuote;
   }>;
 }
 
@@ -1103,7 +1124,9 @@ export interface PlatformStore {
 
   listAgents(): Promise<Agent[]>;
   getAgent(id: string): Promise<Agent | null>;
+  getAgentLoadMultipliers(agentIds: string[]): Promise<Map<string, number>>;
   createAgent(agent: Agent): Promise<Agent>;
+  updateAgentPrice(id: string, ownerId: string, price: number, updatedAt: string, changedBy?: string): Promise<Agent | null>;
   updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs?: number | null): Promise<Agent | null>;
   updateAgentStatus(id: string, status: AgentStatus): Promise<Agent | null>;
   getAgentQualityStats(agentId: string): Promise<AgentQualityStats | null>;
@@ -1125,7 +1148,7 @@ export interface PlatformStore {
   createMission(mission: Mission, stages: WorkflowStage[], edges?: WorkflowEdge[]): Promise<Mission>;
   saveCompilation(id: string, spec: Record<string, unknown>, stages: WorkflowStage[], edges: WorkflowEdge[], expectedVersion: number): Promise<WorkflowDraftSaveResult>;
   saveWorkflowDraft(id: string, stages: WorkflowStage[], edges: WorkflowEdge[], viewport: WorkflowViewport, expectedVersion: number): Promise<WorkflowDraftSaveResult>;
-  confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[]): Promise<Mission | null>;
+  confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[], expectedVersion?: number): Promise<Mission | null>;
   startMission(
     id: string,
     requesterId: string,

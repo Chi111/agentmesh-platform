@@ -98,7 +98,7 @@ export function NewMissionPage() {
           <section className="panel p-5 md:p-6">
             <div className="flex items-center gap-3 border-b border-line pb-4">
               <span className="flex size-10 items-center justify-center rounded-xl bg-canvas"><CircleDollarSign size={19} /></span>
-              <div><h2 className="font-semibold">预算与支付</h2><p className="mt-1 text-xs text-muted">Web2 只使用 Token（CREDIT）余额；Web3 只使用 Sepolia mUSDC 或 sETH。</p></div>
+              <div><h2 className="font-semibold">预算与支付</h2><p className="mt-1 text-xs text-muted">这里填写最高预算；撮合后只锁定 Agent 接受的动态报价，协议费包含在报价内。</p></div>
             </div>
             <div className="mt-5 grid gap-3 md:grid-cols-3">
               {paymentOptions.map((option) => <button
@@ -116,7 +116,7 @@ export function NewMissionPage() {
               </button>)}
             </div>
             <div className="mt-5 grid gap-5 md:grid-cols-3">
-              <label><span className="field-label">预算（{paymentToken(paymentMethod)}）</span><input className="field" type="number" min={paymentInput(paymentMethod).min} step={paymentInput(paymentMethod).step} value={budget} onChange={(event) => setBudget(readNumber(event.currentTarget, paymentInput(paymentMethod).min))} /></label>
+              <label><span className="field-label">预算上限（{paymentToken(paymentMethod)}）</span><input className="field" type="number" min={paymentInput(paymentMethod).min} step={paymentInput(paymentMethod).step} value={budget} onChange={(event) => setBudget(readNumber(event.currentTarget, paymentInput(paymentMethod).min))} /></label>
               <label><span className="field-label">截止日期</span><input className="field" type="date" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label>
               <label><span className="field-label">优先级</span><select className="field" value={priority} onChange={(event) => setPriority(event.target.value as Mission['priority'])}><option value="normal">普通</option><option value="high">高</option><option value="urgent">紧急</option></select></label>
             </div>
@@ -131,8 +131,8 @@ export function NewMissionPage() {
               {['识别任务类型与风险', '拆解为可执行阶段', '召回并洗牌候选 Agent', '生成预算与验收标准'].map((item, index) => <li className="flex gap-3 text-sm text-white/65" key={item}><span className="flex size-6 shrink-0 items-center justify-center rounded-full border border-cyan/30 bg-cyan/10 font-mono text-[9px] text-cyan">0{index + 1}</span>{item}</li>)}
             </ol>
             <div className="mt-6 border-t border-white/10 pt-4">
-              <div className="flex justify-between text-xs text-white/45"><span>预计预算</span><span className="font-mono text-white">{formatPaymentAmount(budget, paymentMethod)}</span></div>
-              <div className="mt-2 flex justify-between text-xs text-white/45"><span>平台费（0.4%）</span><span className="font-mono text-white">{formatPaymentAmount(budget * 0.004, paymentMethod)}</span></div>
+              <div className="flex justify-between text-xs text-white/45"><span>最高预算</span><span className="font-mono text-white">{formatPaymentAmount(budget, paymentMethod)}</span></div>
+              <div className="mt-2 flex justify-between text-xs text-white/45"><span>其中协议费上限（0.4%）</span><span className="font-mono text-white">{formatPaymentAmount(budget * 0.004, paymentMethod)}</span></div>
             </div>
           </section>
           {error ? <p className="rounded-xl border border-danger/25 bg-danger/10 p-3 text-sm text-danger" role="alert">{error}</p> : null}

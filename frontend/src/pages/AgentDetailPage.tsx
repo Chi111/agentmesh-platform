@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, BarChart3, CheckCircle2, Clock3, Code2, ExternalLink, Fingerprint, ShieldCheck, Sparkles, WalletCards } from 'lucide-react';
+import { ArrowLeft, ArrowRight, BarChart3, CheckCircle2, Clock3, Code2, ExternalLink, Fingerprint, LoaderCircle, Pencil, ShieldCheck, Sparkles, WalletCards } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { AgentAvatar } from '../components/ui/AgentCard';
@@ -10,8 +10,14 @@ import type { AgentQualityPublicDetail } from '../types/domain';
 export function AgentDetailPage() {
   const { agentId } = useParams();
   const agents = useAppStore((state) => state.agents);
+  const profile = useAppStore((state) => state.profile);
+  const updateAgentPrice = useAppStore((state) => state.updateAgentPrice);
+  const showToast = useAppStore((state) => state.showToast);
   const [qualityDetail, setQualityDetail] = useState<AgentQualityPublicDetail | null>(null);
   const [qualityResolved, setQualityResolved] = useState(false);
+  const [editingPrice, setEditingPrice] = useState(false);
+  const [priceDraft, setPriceDraft] = useState('');
+  const [priceBusy, setPriceBusy] = useState(false);
   const agent = agents.find((item) => item.id === agentId) ?? qualityDetail?.agent;
 
   useEffect(() => {
@@ -37,6 +43,24 @@ export function AgentDetailPage() {
   const outputSchema = agent.outputSchema ?? { status: 'string', result: 'object', evidence_hash: 'string' };
   const quality = qualityDetail?.agent.quality ?? agent.quality;
   const acceptsNewWork = quality?.eligible ?? agent.status === 'active';
+  const canEditPrice = agent.ownerId === profile?.id || profile?.role === 'admin';
+
+  const savePrice = async () => {
+    const price = Number(priceDraft);
+    if (!Number.isFinite(price) || price < 0.01) {
+      showToast('基础价必须大于或等于 0.01 USDC。', 'error');
+      return;
+    }
+    setPriceBusy(true);
+    try {
+      await updateAgentPrice(agent.id, price);
+      setEditingPrice(false);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '基础价更新失败。', 'error');
+    } finally {
+      setPriceBusy(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -66,7 +90,11 @@ export function AgentDetailPage() {
           </div>
 
           <aside className="space-y-4">
-            <section className="rounded-2xl border border-line bg-canvas/40 p-5"><p className="text-sm font-semibold">定价详情</p><p className="mt-4 font-mono text-4xl font-semibold">{agent.price}<span className="ml-2 text-sm text-muted">USDC / 次</span></p><p className="mt-3 text-xs leading-5 text-muted">实际预算由任务复杂度和阶段 SLA 决定，执行前锁定上限。</p></section>
+            <section className="rounded-2xl border border-line bg-canvas/40 p-5">
+              <div className="flex items-center justify-between gap-3"><p className="text-sm font-semibold">定价详情</p><span className="mono-chip">PRICE v{agent.priceVersion ?? 1}</span></div>
+              {editingPrice ? <div className="mt-4 space-y-3"><label><span className="field-label">单次调用基础价（USDC）</span><input className="field font-mono" type="number" min="0.01" step="0.01" value={priceDraft} onChange={(event) => setPriceDraft(event.target.value)} autoFocus /></label><div className="flex justify-end gap-2"><button type="button" className="btn-secondary !px-3 !py-2" disabled={priceBusy} onClick={() => setEditingPrice(false)}>取消</button><button type="button" className="btn-primary !px-3 !py-2" disabled={priceBusy} onClick={() => void savePrice()}>{priceBusy ? <LoaderCircle size={14} className="animate-spin" /> : null}保存新版本</button></div></div> : <><p className="mt-4 font-mono text-4xl font-semibold">{agent.price}<span className="ml-2 text-sm text-muted">USDC / 次</span></p>{canEditPrice ? <button type="button" className="btn-secondary mt-4 w-full" onClick={() => { setPriceDraft(String(agent.price)); setEditingPrice(true); }}><Pencil size={14} />调整未来报价</button> : null}</>}
+              <p className="mt-3 text-xs leading-5 text-muted">基础价只影响新邀请；已发出的报价快照和已托管任务不会被追价。</p>
+            </section>
             {agent.endpoint ? <section className="rounded-2xl border border-cyan/35 bg-cyan/[0.06] p-5"><p className="text-sm font-semibold">Agent Endpoint</p><p className="mt-2 text-xs leading-5 text-muted">通过 HTTP POST 调用；官方 Agent 需要登录后的 Bearer ID Token。</p><code className="mt-4 block break-all rounded-xl border border-line bg-surface px-3 py-2.5 text-[10px] leading-5 text-cyan">{agent.endpoint}</code><a className="btn-secondary mt-4 w-full" href={agent.endpoint} target="_blank" rel="noreferrer">打开 Endpoint <ExternalLink size={15} /></a></section> : null}
             <section className="rounded-2xl border border-line p-5"><p className="text-sm font-semibold">运行数据</p><dl className="mt-4 space-y-3 text-xs">{[['累计任务', `${agent.jobs} 单`],['累计成交', `${agent.volume.toLocaleString()} USDC`],['调用协议','HTTP / JSON'],['鉴权模式',agent.authType ?? 'none']].map(([label,value]) => <div className="flex justify-between" key={label}><dt className="text-muted">{label}</dt><dd className="font-mono font-semibold">{value}</dd></div>)}</dl></section>
           </aside>

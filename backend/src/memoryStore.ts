@@ -90,6 +90,7 @@ import {
   evaluateArbitrationProposal,
 } from './arbitration';
 import { paymentConfig, TEST_TOPUP_AMOUNT } from './payments';
+import { loadMultiplierForActiveAssignments } from './pricing';
 import {
   exportArtifactExpiresAt,
   exportJobExpiresAt,
@@ -132,6 +133,7 @@ export class MemoryPlatformStore implements PlatformStore {
   readonly workflowTransitions = new Map<string, WorkflowTransitionCheckpoint[]>();
   readonly workflowTemplates = new Map<string, WorkflowTemplateDetail[]>();
   readonly stageOffers = new Map<string, StageOffer[]>();
+  readonly stageOfferHistory = new Map<string, StageOffer>();
   readonly agentPerformance = new Map<string, { agentId: string; outcome: 'done' | 'failed' }>();
   readonly events = new Map<string, ExecutionEvent[]>();
   readonly deliverables = new Map<string, Deliverable[]>();
@@ -302,11 +304,36 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(this.agents.get(id) ?? null);
   }
 
+  async getAgentLoadMultipliers(agentIds: string[]): Promise<Map<string, number>> {
+    return new Map([...new Set(agentIds)].map((agentId) => {
+      const activeAssignments = [...this.stages.entries()].reduce((count, [missionId, stages]) => {
+        const mission = this.missions.get(missionId);
+        if (mission?.status !== 'running' || this.missionControls.get(missionId)?.pausedAt) return count;
+        return count + stages.filter((stage) => (
+          stage.nodeType === 'task'
+          && stage.agentId === agentId
+          && (stage.status === 'queued' || stage.status === 'running')
+        )).length;
+      }, 0);
+      return [agentId, loadMultiplierForActiveAssignments(activeAssignments)];
+    }));
+  }
+
   async createAgent(agent: Agent): Promise<Agent> {
     if (this.agents.has(agent.id)) throw new Error('Duplicate agent');
-    this.agents.set(agent.id, copy(agent));
+    const created = { ...agent, priceVersion: agent.priceVersion ?? 1 };
+    this.agents.set(agent.id, copy(created));
     this.agentQualityStats.set(agent.id, calculateAgentQuality(agent, [], agent.createdAt, 'registered'));
-    return copy(agent);
+    return copy(created);
+  }
+
+  async updateAgentPrice(id: string, ownerId: string, price: number, updatedAt: string, _changedBy = ownerId): Promise<Agent | null> {
+    const agent = this.agents.get(id);
+    if (!agent || agent.ownerId !== ownerId) return null;
+    if (agent.price === price) return copy(agent);
+    const updated = { ...agent, price, priceVersion: (agent.priceVersion ?? 1) + 1, updatedAt };
+    this.agents.set(id, updated);
+    return copy(updated);
   }
 
   async updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs: number | null = 1800): Promise<Agent | null> {
@@ -503,18 +530,51 @@ export class MemoryPlatformStore implements PlatformStore {
     this.missions.set(id, updated);
     this.stages.set(id, copy(stages));
     this.edges.set(id, copy(edges));
+    for (const offer of this.stageOffers.get(id) ?? []) this.stageOfferHistory.set(offer.id, copy(offer));
     this.stageOffers.delete(id);
     return { state: 'saved', mission: copy(updated) };
   }
 
-  async confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[]): Promise<Mission | null> {
+  async confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[], expectedVersion?: number): Promise<Mission | null> {
     const mission = this.missions.get(id);
     if (!mission) return null;
-    if (!['draft', 'matching'].includes(mission.status) || this.escrows.get(id)?.status !== 'pending') return copy(mission);
-    const updated: Mission = { ...mission, team: copy(team), status: 'matching', currentStage: '接单邀请已发送，等待 Agent 确认' };
+    if (!['draft', 'matching'].includes(mission.status) || this.escrows.get(id)?.status !== 'pending') return null;
+    if (expectedVersion !== undefined && mission.workflowVersion !== expectedVersion) return null;
+    const confirmationTime = offers[0]?.createdAt ?? new Date().toISOString();
+    const currentOffers = this.stageOffers.get(id) ?? [];
+    if (currentOffers.length && !currentOffers.some((offer) => (
+      offer.status === 'declined'
+      || (offer.status === 'pending' && Date.parse(offer.expiresAt) <= Date.parse(confirmationTime))
+    ))) return null;
+    const updated: Mission = {
+      ...mission,
+      workflowVersion: mission.workflowVersion + 1,
+      team: copy(team),
+      status: 'matching',
+      currentStage: '接单邀请已发送，等待 Agent 确认',
+    };
+    const token = paymentConfig(mission.paymentMethod).token;
+    const normalizedOffers = offers.map((offer) => offer.quote ? offer : ({
+      ...offer,
+      quote: {
+        amount: stages.find((stage) => stage.id === offer.stageId)?.budget ?? 0,
+        token,
+        basePriceUsdc: 0,
+        agentPriceVersion: 1,
+        formulaVersion: 'legacy.stage-budget',
+        comparableToBasePrice: false,
+        multipliers: { complexity: 1, urgency: 1, expertise: 1, load: 1 },
+      },
+    } satisfies StageOffer));
+    for (const offer of currentOffers) this.stageOfferHistory.set(offer.id, copy(offer));
     this.missions.set(id, updated);
     this.stages.set(id, copy(stages));
-    this.stageOffers.set(id, copy(offers));
+    this.stageOffers.set(id, copy(normalizedOffers));
+    const escrow = this.escrows.get(id);
+    const quotedAmount = Number(normalizedOffers.reduce((sum, offer) => sum + offer.quote.amount, 0).toFixed(6));
+    if (escrow && quotedAmount > 0) {
+      this.escrows.set(id, { ...escrow, amount: quotedAmount, updatedAt: normalizedOffers[0]?.createdAt ?? escrow.updatedAt });
+    }
     return copy(updated);
   }
 
@@ -542,10 +602,10 @@ export class MemoryPlatformStore implements PlatformStore {
       const transactions = this.walletTransactions.get(requesterId) ?? [];
       if (!transactions.some((transaction) => transaction.type === 'mission_hold' && transaction.missionId === id)) {
         const balance = this.walletBalances.get(requesterId) ?? 0;
-        if (balance < mission.budget) throw new Error('INSUFFICIENT_BALANCE');
-        this.walletBalances.set(requesterId, Number((balance - mission.budget).toFixed(6)));
+        if (balance < currentEscrow.amount) throw new Error('INSUFFICIENT_BALANCE');
+        this.walletBalances.set(requesterId, Number((balance - currentEscrow.amount).toFixed(6)));
         this.walletTransactions.set(requesterId, [{
-          id: crypto.randomUUID(), type: 'mission_hold', amount: -mission.budget, token: 'CREDIT',
+          id: crypto.randomUUID(), type: 'mission_hold', amount: -currentEscrow.amount, token: 'CREDIT',
           missionId: id, createdAt: new Date().toISOString(),
         }, ...transactions]);
       }
@@ -801,11 +861,16 @@ export class MemoryPlatformStore implements PlatformStore {
       createdAt: now,
     });
     const stages = this.stages.get(id) ?? [];
-    const stageTotal = stages.reduce((sum, stage) => sum + stage.budget, 0) || escrow.amount;
+    const offers = this.stageOffers.get(id) ?? [];
+    const stageWeights = new Map(stages.map((stage) => {
+      const quoteAmount = offers.find((offer) => offer.stageId === stage.id)?.quote?.amount;
+      return [stage.id, Number.isFinite(quoteAmount) && Number(quoteAmount) > 0 ? Number(quoteAmount) : stage.budget];
+    }));
+    const stageTotal = stages.reduce((sum, stage) => sum + (stageWeights.get(stage.id) ?? 0), 0) || escrow.amount;
     const payouts = new Map<string, number>();
     for (const stage of stages) {
       if (!stage.agentId) continue;
-      const gross = escrow.amount * (stage.budget / stageTotal);
+      const gross = escrow.amount * ((stageWeights.get(stage.id) ?? stage.budget) / stageTotal);
       payouts.set(stage.agentId, (payouts.get(stage.agentId) ?? 0) + gross);
     }
     const walletPayouts = new Map<string, number>();

@@ -134,6 +134,57 @@ describe('D1PlatformStore concurrency invariants', () => {
     store = new D1PlatformStore(database);
   });
 
+  it('replays pricing migrations without losing a newer price version', () => {
+    database.db.prepare("UPDATE agents SET price_usdc = 0 WHERE id = 'visionboard'").run();
+    const migration = readFileSync(join(import.meta.dirname, '../../db/034_versioned_pricing_quotes.sql'), 'utf8');
+    const officialSeed = readFileSync(join(import.meta.dirname, '../../db/011_official_test_agents.sql'), 'utf8');
+
+    expect(() => database.db.exec(migration)).not.toThrow();
+    expect(() => database.db.exec(migration)).not.toThrow();
+    expect(database.db.prepare("SELECT price_usdc FROM agents WHERE id = 'visionboard'").get()).toEqual({ price_usdc: 0.01 });
+    expect(database.db.prepare("SELECT version, price_usdc FROM agent_price_versions WHERE agent_id = 'visionboard'").all()).toEqual([
+      { version: 1, price_usdc: 0.01 },
+    ]);
+
+    database.db.exec(`
+      UPDATE agents SET price_usdc = 99 WHERE id = 'official-evidence-scout';
+      INSERT INTO agent_price_versions (id, agent_id, version, price_usdc, created_by, created_at)
+      VALUES ('AGPRICE-official-evidence-scout-v2-test', 'official-evidence-scout', 2, 99, 'agentmesh-official', '2026-09-04T01:00:00.000Z');
+    `);
+    database.db.exec(officialSeed);
+    database.db.exec(migration);
+    expect(database.db.prepare("SELECT price_usdc FROM agents WHERE id = 'official-evidence-scout'").get()).toEqual({ price_usdc: 99 });
+    expect(database.db.prepare("SELECT MAX(version) AS version FROM agent_price_versions WHERE agent_id = 'official-evidence-scout'").get()).toEqual({ version: 2 });
+  });
+
+  it('updates an Agent base price and its audit version atomically', async () => {
+    const updated = await store.updateAgentPrice(
+      'visionboard',
+      'demo-developer',
+      95,
+      '2026-09-04T01:00:00.000Z',
+      'demo-developer',
+    );
+
+    expect(updated).toMatchObject({ id: 'visionboard', price: 95, priceVersion: 2 });
+    expect(database.db.prepare(`
+      SELECT version, price_usdc, created_by FROM agent_price_versions
+      WHERE agent_id = 'visionboard' ORDER BY version
+    `).all()).toEqual([
+      { version: 2, price_usdc: 95, created_by: 'demo-developer' },
+    ]);
+    expect(await store.updateAgentPrice('visionboard', 'demo-developer', 95, '2026-09-04T01:01:00.000Z')).toMatchObject({ priceVersion: 2 });
+    expect(await store.updateAgentPrice('visionboard', 'demo-requester', 100, '2026-09-04T01:02:00.000Z')).toBeNull();
+  });
+
+  it('derives bounded load multipliers from active assignments', async () => {
+    const loads = await store.getAgentLoadMultipliers(['visionboard', 'motioncraft', 'analyst']);
+
+    expect(loads.get('visionboard')).toBe(1);
+    expect(loads.get('motioncraft')).toBe(1);
+    expect(loads.get('analyst')).toBe(0.9);
+  });
+
   it('synchronizes only the authoritative external wallet for a Privy identity', async () => {
     const subject = 'did:privy:web2-wallet-sync';
     const previouslyAcceptedEmbeddedWallet = '0x7300000000000000000000000000000000008f2c';
@@ -527,6 +578,15 @@ describe('D1PlatformStore concurrency invariants', () => {
       expiresAt: '2026-08-18T00:30:00.000Z', respondedAt: null, createdAt: '2026-08-18T00:00:00.000Z', updatedAt: '2026-08-18T00:00:00.000Z',
     };
     await store.confirmWorkflow('TASK-OFFER-GATE', [stage], ['visionboard'], [offer]);
+    expect((await store.getStageOffer(offer.id))?.quote).toMatchObject({
+      amount: 100,
+      formulaVersion: 'legacy.stage-budget',
+    });
+    expect((await store.getEscrow('TASK-OFFER-GATE'))?.amount).toBe(100);
+
+    const staleConcurrentOffer = { ...offer, id: 'OFFER-D1-GATE-STALE-CONCURRENT' };
+    expect(await store.confirmWorkflow('TASK-OFFER-GATE', [stage], ['visionboard'], [staleConcurrentOffer])).toBeNull();
+    expect((await store.listStageOffers('TASK-OFFER-GATE')).map((item) => item.id)).toEqual([offer.id]);
 
     const blocked = await store.startMission('TASK-OFFER-GATE', 'demo-requester', null, null, '2026-08-18T00:01:00.000Z');
     expect(blocked?.applied).toBe(false);
@@ -539,6 +599,12 @@ describe('D1PlatformStore concurrency invariants', () => {
     const reissuedOffer = { ...offer, id: 'OFFER-D1-GATE-REISSUED', status: 'pending' as const, respondedAt: null };
     await expect(store.confirmWorkflow('TASK-OFFER-GATE', [stage], ['visionboard'], [reissuedOffer])).resolves.toBeTruthy();
     expect((await store.listStageOffers('TASK-OFFER-GATE', '2026-08-18T00:03:00.000Z')).map((item) => item.id)).toEqual([reissuedOffer.id]);
+    expect(database.db.prepare(`
+      SELECT id, status, amount FROM stage_offer_quote_history WHERE id = ?
+    `).get(offer.id)).toEqual({ id: offer.id, status: 'declined', amount: 100 });
+    expect(JSON.parse(String(database.db.prepare(`
+      SELECT snapshot_json FROM stage_offer_quote_history WHERE id = ?
+    `).get(offer.id)?.snapshot_json))).toMatchObject({ amount: 100, formulaVersion: 'legacy.stage-budget' });
     expect(database.db.prepare('SELECT stage_id FROM execution_events WHERE id = ?').get('EVT-OFFER-DECLINED')).toEqual({ stage_id: stage.id });
     await store.respondStageOffer(reissuedOffer.id, 'demo-developer', 'accepted', '2026-08-18T00:05:00.000Z');
     expect((await store.getStageOffer(reissuedOffer.id, '2026-08-18T01:00:00.000Z'))?.status).toBe('accepted');
@@ -549,6 +615,48 @@ describe('D1PlatformStore concurrency invariants', () => {
     expect(started?.mission.status).toBe('running');
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM wallet_transactions WHERE mission_id = ? AND transaction_type = 'mission_hold'").get('TASK-OFFER-GATE')).toEqual({ count: 1 });
     expect((await store.getWalletAccount('demo-requester')).balance).toBe(900);
+  });
+
+  it('serializes workflow saves and invitation confirmation on one workflow revision', async () => {
+    database.db.exec(`
+      INSERT INTO missions
+        (id, requester_id, title, description, category, budget_usdc, deadline, status, progress, current_stage, team_json)
+      VALUES
+        ('TASK-CONFIRM-WINS', 'demo-requester', 'Confirm wins', 'Confirm wins revision race.', '图像生成', 100, '2026-09-01', 'matching', 0, 'Draft', '[]'),
+        ('TASK-SAVE-WINS', 'demo-requester', 'Save wins', 'Save wins revision race.', '图像生成', 100, '2026-09-01', 'matching', 0, 'Draft', '[]');
+      INSERT INTO workflow_stages
+        (id, mission_id, position, name, purpose, category, budget_usdc, status, agent_id)
+      VALUES
+        ('stage-confirm-wins', 'TASK-CONFIRM-WINS', 1, 'Confirm stage', 'Verify confirm CAS', '图像生成', 100, 'queued', 'visionboard'),
+        ('stage-save-wins', 'TASK-SAVE-WINS', 1, 'Save stage', 'Verify save CAS', '图像生成', 100, 'queued', 'visionboard');
+      INSERT INTO escrows (id, mission_id, amount, token, network, payment_method, status)
+      VALUES
+        ('ESC-CONFIRM-WINS', 'TASK-CONFIRM-WINS', 100, 'CREDIT', 'agentmesh', 'web2_balance', 'pending'),
+        ('ESC-SAVE-WINS', 'TASK-SAVE-WINS', 100, 'CREDIT', 'agentmesh', 'web2_balance', 'pending');
+    `);
+    const [confirmStage] = await store.listStages('TASK-CONFIRM-WINS');
+    const [saveStage] = await store.listStages('TASK-SAVE-WINS');
+    const offerFor = (missionId: string, stageId: string) => ({
+      id: `OFFER-${missionId}`, missionId, stageId, agentId: 'visionboard', status: 'pending' as const,
+      expiresAt: '2026-09-04T02:00:00.000Z', respondedAt: null,
+      createdAt: '2026-09-04T01:00:00.000Z', updatedAt: '2026-09-04T01:00:00.000Z',
+    });
+
+    await expect(store.confirmWorkflow(
+      'TASK-CONFIRM-WINS', [confirmStage], ['visionboard'], [offerFor('TASK-CONFIRM-WINS', confirmStage.id)], 1,
+    )).resolves.toMatchObject({ workflowVersion: 2 });
+    await expect(store.saveWorkflowDraft(
+      'TASK-CONFIRM-WINS', [confirmStage], [], { x: 0, y: 0, zoom: 1 }, 1,
+    )).resolves.toMatchObject({ state: 'version_conflict' });
+    expect(await store.listStageOffers('TASK-CONFIRM-WINS')).toHaveLength(1);
+
+    await expect(store.saveWorkflowDraft(
+      'TASK-SAVE-WINS', [saveStage], [], { x: 0, y: 0, zoom: 1 }, 1,
+    )).resolves.toMatchObject({ state: 'saved', mission: { workflowVersion: 2 } });
+    await expect(store.confirmWorkflow(
+      'TASK-SAVE-WINS', [saveStage], ['visionboard'], [offerFor('TASK-SAVE-WINS', saveStage.id)], 1,
+    )).resolves.toBeNull();
+    expect(await store.listStageOffers('TASK-SAVE-WINS')).toEqual([]);
   });
 
   it('applies acceptance side effects only on the first state transition', async () => {

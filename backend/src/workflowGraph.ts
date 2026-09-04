@@ -189,6 +189,10 @@ export function validateWorkflowGraph(input: {
     } else if (stage.nodeType !== 'task') {
       throw new WorkflowValidationError('INVALID_NODE_TYPE', 'Workflow node type must be task or approval');
     } else {
+      const minimumBudget = 10 ** -paymentBudgetPrecision(mission.paymentMethod);
+      if (stage.budget < minimumBudget) {
+        throw new WorkflowValidationError('INVALID_NODE_BUDGET', `Task node budgets must be at least ${minimumBudget}`);
+      }
       if (stage.category.trim().length < 2 || stage.category.length > 80) throw new WorkflowValidationError('INVALID_NODE', 'Task nodes require a bounded category');
       const executionMode = stage.input.executionMode;
       if (executionMode !== undefined && !['analyze', 'implement', 'review'].includes(String(executionMode))) {

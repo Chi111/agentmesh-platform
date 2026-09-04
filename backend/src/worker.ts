@@ -76,7 +76,7 @@ import {
   type SettlementEnv,
 } from './chain';
 import { D1PlatformStore, type D1Database } from './store';
-import { AGENTMESH_TESTNET_SETTLEMENT, isWeb3Payment, paymentBudgetPrecision } from './payments';
+import { AGENTMESH_TESTNET_SETTLEMENT, allocatePaymentBudget, hasValidPaymentPrecision, isWeb3Payment, minimumPaymentAmount, paymentBudgetPrecision } from './payments';
 import {
   artifactBelongsToCurrentAttempt,
   hasMeaningfulStageOutput,
@@ -113,6 +113,7 @@ import {
 } from './workflowCompiler';
 import { REWARD_FORMULA_VERSION } from './ydFinance';
 import { EXPORT_DOWNLOAD_TOKEN_MS } from './exportJobs';
+import { quoteStage } from './pricing';
 import { MESHPIN_PUBLIC_ASSET } from './meshpin';
 import { BRAND } from '../../shared/brand';
 import {
@@ -1666,14 +1667,11 @@ function allocatedTemplateBudgets(
   if (tasks.length === 0 || totalWeight <= 0 || totalUnits <= 0) {
     throw new ApiError(400, 'INVALID_TEMPLATE_BUDGET', 'Template expansion requires a positive task budget');
   }
-  const rawUnits = tasks.map((task) => totalUnits * task.weight / totalWeight);
-  const units = rawUnits.map(Math.floor);
-  let remainder = totalUnits - units.reduce((sum, value) => sum + value, 0);
-  const remainderOrder = rawUnits
-    .map((value, index) => ({ index, fraction: value - Math.floor(value) }))
-    .sort((left, right) => right.fraction - left.fraction || left.index - right.index);
-  for (let index = 0; index < remainder; index += 1) units[remainderOrder[index % remainderOrder.length].index] += 1;
-  return units.map((value) => value / scale);
+  const allocated = allocatePaymentBudget(tasks.map((task) => task.weight), budget, paymentMethod);
+  if (!allocated) {
+    throw new ApiError(400, 'INVALID_TEMPLATE_BUDGET', `Template expansion requires at least ${tasks.length * minimumPaymentAmount(paymentMethod)} total budget`);
+  }
+  return allocated;
 }
 
 function expandWorkflowTemplate(input: {
@@ -3712,6 +3710,17 @@ export function createApp(dependencies: AppDependencies = {}) {
             const now = (dependencies.now?.() ?? new Date()).toISOString();
             const deadline = requiredString(body, 'deadline', 10, 40);
             if (Number.isNaN(Date.parse(deadline))) throw new ApiError(400, 'VALIDATION_ERROR', 'deadline must be an ISO date');
+            const paymentMethod = enumValue(
+              body,
+              'paymentMethod',
+              ['web2_balance', 'web3_musdc', 'web3_seth'] as const,
+              'web2_balance',
+            ) as PaymentMethod;
+            const minimumMissionBudget = minimumPaymentAmount(paymentMethod) * 2;
+            const budget = finiteNumber(body, 'budget', minimumMissionBudget, 1_000_000);
+            if (!hasValidPaymentPrecision(budget, paymentMethod)) {
+              throw new ApiError(400, 'INVALID_BUDGET_PRECISION', `budget supports at most ${paymentBudgetPrecision(paymentMethod)} decimal places`);
+            }
             const mission: Mission = {
               id: makeMissionId(),
               requesterId: user.id,
@@ -3719,13 +3728,8 @@ export function createApp(dependencies: AppDependencies = {}) {
               description: requiredString(body, 'description', 20, 5_000),
               category: requiredString(body, 'category', 2, 80),
               tags: stringArray(body, 'tags'),
-              budget: finiteNumber(body, 'budget', 0.000001, 1_000_000),
-              paymentMethod: enumValue(
-                body,
-                'paymentMethod',
-                ['web2_balance', 'web3_musdc', 'web3_seth'] as const,
-                'web2_balance',
-              ) as PaymentMethod,
+              budget,
+              paymentMethod,
               deadline,
               reviewDueAt: null,
               priority: enumValue(body, 'priority', ['normal', 'high', 'urgent'] as const, 'normal'),
@@ -4435,7 +4439,8 @@ export function createApp(dependencies: AppDependencies = {}) {
             const eligibleAgents = context.agents
               .filter((agent) => isAgentMarketEligible(agent, qualityByAgent.get(agent.id) ?? null, gateMode).eligible)
               .map((agent) => agentClientView(request, agent, qualityByAgent.get(agent.id), env.AGENT_QUALITY_GATE_MODE));
-            return success(request, env, requestId, matchCandidates(context.mission, context.stages, eligibleAgents), 200, { qualityGateMode: gateMode });
+            const loadMultiplierByAgent = await store.getAgentLoadMultipliers(eligibleAgents.map((agent) => agent.id));
+            return success(request, env, requestId, matchCandidates(context.mission, context.stages, eligibleAgents, loadMultiplierByAgent), 200, { qualityGateMode: gateMode });
           }
 
           if (action === 'workflow' && method === 'POST') {
@@ -4487,29 +4492,53 @@ export function createApp(dependencies: AppDependencies = {}) {
               throw new ApiError(409, 'AGENT_MARKET_INELIGIBLE', `${assignedAgent?.name ?? 'Assigned Agent'} 当前不能接收新邀请`, eligibility?.reasons);
             }
             const team = [...new Set(orderedStages.map((stage) => stage.agentId).filter((id): id is string => Boolean(id)))];
+            const loadMultiplierByAgent = await store.getAgentLoadMultipliers(team);
             const createdAt = now.toISOString();
             const expiresAt = new Date(now.getTime() + OFFER_WINDOW_MS).toISOString();
             const offers = orderedStages.filter((stage) => stage.nodeType === 'task').map<StageOffer>((stage) => {
-              const autoAccepted = Boolean(builtinAgentKind(activeAgents.get(stage.agentId!)!));
+              const assignedAgent = activeAgents.get(stage.agentId!)!;
+              const quote = quoteStage(context.mission, stage, assignedAgent, loadMultiplierByAgent.get(assignedAgent.id) ?? 1);
+              if (quote.comparableToBasePrice && quote.amount > stage.budget) {
+                throw new ApiError(409, 'STAGE_QUOTE_EXCEEDS_BUDGET', `${assignedAgent.name} 对“${stage.name}”的动态报价超过节点预算`, {
+                  stageId: stage.id,
+                  agentId: assignedAgent.id,
+                  quoteAmount: quote.amount,
+                  stageBudget: stage.budget,
+                  token: quote.token,
+                  pricingVersion: quote.formulaVersion,
+                });
+              }
+              const autoAccepted = Boolean(builtinAgentKind(assignedAgent));
               return {
                 id: makeId('OFFER'), missionId, stageId: stage.id, agentId: stage.agentId!,
                 status: autoAccepted ? 'accepted' : 'pending',
-                expiresAt,
+                quote, expiresAt,
                 respondedAt: autoAccepted ? createdAt : null,
                 createdAt,
                 updatedAt: createdAt,
               };
             });
-            const saved = await store.confirmWorkflow(missionId, orderedStages, team, offers);
-            if (!saved) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+            const saved = await store.confirmWorkflow(missionId, orderedStages, team, offers, context.mission.workflowVersion);
+            if (!saved) {
+              const [currentMission, currentEscrow] = await Promise.all([store.getMission(missionId), store.getEscrow(missionId)]);
+              if (!currentMission) throw new ApiError(404, 'MISSION_NOT_FOUND', 'Mission not found');
+              if (currentMission?.workflowVersion !== context.mission.workflowVersion) {
+                throw new ApiError(409, 'WORKFLOW_VERSION_CONFLICT', 'The workflow changed while invitations were being created; reload before retrying');
+              }
+              if (!['draft', 'matching'].includes(currentMission.status) || currentEscrow?.status !== 'pending') {
+                throw new ApiError(409, 'WORKFLOW_LOCKED', 'The workflow cannot change after escrow funding starts');
+              }
+              throw new ApiError(409, 'WORKFLOW_OFFERS_ACTIVE', 'Another invitation round already became active; reload the workflow before retrying');
+            }
             const autoAcceptedCount = offers.filter((offer) => offer.status === 'accepted').length;
+            const quoteTotal = Number(offers.reduce((sum, offer) => sum + offer.quote.amount, 0).toFixed(paymentBudgetPrecision(context.mission.paymentMethod)));
             await store.addEvent({
               id: makeId('EVT'), missionId, stageId: null, type: 'workflow.offers_created',
               message: autoAcceptedCount
                 ? `${autoAcceptedCount} 个官方测试 Agent 阶段已自动接单，其余邀请已发送`
                 : `已向 ${offers.length} 个阶段执行者发送接单邀请`,
               actorType: 'requester', actorId: user.id,
-              payload: { offerIds: offers.map((offer) => offer.id), expiresAt, autoAcceptedCount }, createdAt,
+              payload: { offerIds: offers.map((offer) => offer.id), expiresAt, autoAcceptedCount, quoteTotal, pricingVersion: offers[0]?.quote.formulaVersion }, createdAt,
             });
             await Promise.all(offers.map(async (offer) => {
               if (offer.status === 'accepted') return;
@@ -4520,7 +4549,7 @@ export function createApp(dependencies: AppDependencies = {}) {
                 userId: agent.ownerId,
                 category: 'task',
                 title: '新的阶段接单邀请',
-                detail: `${context.mission.title}${stage ? ` · ${stage.name}` : ''}，请在 24 小时内响应。`,
+                detail: `${context.mission.title}${stage ? ` · ${stage.name}` : ''}，报价 ${offer.quote.amount} ${offer.quote.token}，请在 24 小时内响应。`,
                 tone: 'info',
               });
             }));
@@ -4561,7 +4590,7 @@ export function createApp(dependencies: AppDependencies = {}) {
               if (!depositTxHash) throw new ApiError(400, 'DEPOSIT_TX_REQUIRED', 'A verified escrow deposit transaction is required');
               let settlementPlan;
               try {
-                settlementPlan = buildSettlementPlan(context.stages.filter((stage) => stage.nodeType === 'task'), context.agents);
+                settlementPlan = buildSettlementPlan(context.stages.filter((stage) => stage.nodeType === 'task'), context.agents, offers);
               } catch (error) {
                 throw new ApiError(409, 'INVALID_SETTLEMENT_PLAN', error instanceof Error ? error.message : 'The settlement plan is invalid');
               }
@@ -4570,7 +4599,7 @@ export function createApp(dependencies: AppDependencies = {}) {
                 env,
                 depositTxHash,
                 missionId,
-                context.mission.budget,
+                existingEscrow.amount,
                 context.mission.paymentMethod,
                 settlementPlan.payoutHash,
                 user.walletAddress,
@@ -4815,9 +4844,11 @@ export function createApp(dependencies: AppDependencies = {}) {
               if (!releaseTxHash) throw new ApiError(400, 'RELEASE_TX_REQUIRED', 'A verified escrow release transaction is required');
               let settlementPlan;
               try {
+                const settlementOffers = await store.listStageOffers(missionId, now.toISOString());
                 settlementPlan = buildSettlementPlan(
                   context.stages.filter((stage) => stage.nodeType === 'task'),
                   context.agents,
+                  settlementOffers,
                 );
               } catch (error) {
                 throw new ApiError(409, 'INVALID_SETTLEMENT_PLAN', error instanceof Error ? error.message : 'The settlement plan is invalid');
@@ -4829,7 +4860,7 @@ export function createApp(dependencies: AppDependencies = {}) {
                 env,
                 releaseTxHash,
                 missionId,
-                context.mission.budget,
+                escrow.amount,
                 context.mission.paymentMethod,
                 settlementPlan.payoutHash,
                 settlementRequester,
@@ -4957,23 +4988,36 @@ export function createApp(dependencies: AppDependencies = {}) {
               authType: enumValue(body, 'authType', ['none', 'api_key', 'bearer', 'jwt'] as const, 'none'),
               inputSchema: recordValue(body, 'inputSchema'),
               outputSchema: recordValue(body, 'outputSchema'),
-              price: finiteNumber(body, 'price', 0, 1_000_000),
+              price: finiteNumber(body, 'price', 0.01, 1_000_000), priceVersion: 1,
               wallet: evmAddress(body, 'wallet'),
               status: 'trial', version: optionalString(body, 'version', 40) ?? 'v1.0.0',
               trustScore: 0, successRate: 0, responseTime: '待测试', jobs: 0, volume: 0,
               author: user.displayName, official: false, createdAt: now, updatedAt: now,
             };
-            await store.createAgent(agent);
-            return { status: 201, body: agentClientView(request, agent, await store.getAgentQualityStats(agent.id), env.AGENT_QUALITY_GATE_MODE) };
+            const created = await store.createAgent(agent);
+            return { status: 201, body: agentClientView(request, created, await store.getAgentQualityStats(agent.id), env.AGENT_QUALITY_GATE_MODE) };
           });
           return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
         }
 
-        const agentActionMatch = pathname.match(/^\/api\/agents\/([^/]+)\/(trial|status)$/);
+        const agentActionMatch = pathname.match(/^\/api\/agents\/([^/]+)\/(trial|status|price)$/);
         if (agentActionMatch && method === 'POST') {
           const agent = await store.getAgent(decodeURIComponent(agentActionMatch[1]));
           if (!agent) throw new ApiError(404, 'AGENT_NOT_FOUND', 'Agent not found');
           if (agent.ownerId !== user.id && user.role !== 'admin') throw new ApiError(403, 'FORBIDDEN', 'Only the Agent owner can update it');
+          if (agentActionMatch[2] === 'price') {
+            const body = await readObject(request);
+            const result = await runIdempotent(request, store, user, body, async () => {
+              const price = finiteNumber(body, 'price', 0.01, 1_000_000);
+              const updated = await store.updateAgentPrice(agent.id, agent.ownerId, price, now.toISOString(), user.id);
+              if (!updated) throw new ApiError(404, 'AGENT_NOT_FOUND', 'Agent not found');
+              return {
+                status: 200,
+                body: agentClientView(request, updated, await store.getAgentQualityStats(agent.id), env.AGENT_QUALITY_GATE_MODE),
+              };
+            });
+            return success(request, env, requestId, result.body, result.status, { replayed: Boolean(result.replayed) });
+          }
           if (agentActionMatch[2] === 'trial') {
             const trialId = makeId('AGTRIAL');
             const agentVersionId = `AGVER-${agent.id}-${agent.version.replaceAll('.', '-')}`;
@@ -5487,7 +5531,7 @@ export function createApp(dependencies: AppDependencies = {}) {
               const requesterWallet = escrow.requesterWalletAddress ?? (await store.getProfile(mission.requesterId))?.walletAddress;
               if (!requesterWallet) throw new ApiError(409, 'REQUESTER_WALLET_MISSING', 'The verified requester wallet is unavailable for refund verification');
               const verification = status === 'resolved'
-                ? await verifyRefundTransaction(env, resolutionTxHash, mission.id, mission.budget, mission.paymentMethod, user.walletAddress, requesterWallet)
+                ? await verifyRefundTransaction(env, resolutionTxHash, mission.id, escrow.amount, mission.paymentMethod, user.walletAddress, requesterWallet)
                 : await verifyUnfreezeTransaction(env, resolutionTxHash, mission.id, user.walletAddress);
               if (!verification.ok) throw new ApiError(verification.status, verification.code, verification.message);
             } else if (resolutionTxHash) {

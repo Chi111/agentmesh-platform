@@ -62,6 +62,7 @@ import type {
   RewardEpoch,
   RewardEpochComputeResult,
   StageOffer,
+  StageQuote,
   UserContext,
   UserPinmeCredentialRecord,
   UserPreferences,
@@ -93,6 +94,7 @@ import {
   evaluateArbitrationProposal,
 } from './arbitration';
 import { paymentConfig, TEST_TOPUP_AMOUNT } from './payments';
+import { loadMultiplierForActiveAssignments } from './pricing';
 import {
   exportArtifactExpiresAt,
   exportJobExpiresAt,
@@ -401,6 +403,7 @@ function mapAgent(row: Row): Agent {
     inputSchema: parseJson<Record<string, unknown>>(row.input_schema_json, {}),
     outputSchema: parseJson<Record<string, unknown>>(row.output_schema_json, {}),
     price: number(row.price_usdc),
+    priceVersion: Math.max(1, number(row.price_version) || 1),
     wallet: text(row.wallet_address),
     status: text(row.status) as Agent['status'],
     version: text(row.version),
@@ -662,12 +665,31 @@ function mapDispatchOutbox(row: Row): DispatchOutboxItem {
 
 function mapStageOffer(row: Row, now = new Date().toISOString()): StageOffer {
   const storedStatus = text(row.status) as Exclude<StageOffer['status'], 'expired'>;
+  const storedQuote = parseJson<StageQuote | null>(row.pricing_snapshot_json, null);
+  const hasPersistedQuoteAmount = row.quote_amount !== null && row.quote_amount !== undefined;
+  const quoteAmount = number(row.quote_amount);
+  const validStoredQuote = storedQuote
+    && Number.isFinite(storedQuote.amount)
+    && typeof storedQuote.token === 'string'
+    && typeof storedQuote.formulaVersion === 'string';
+  const quote: StageQuote = validStoredQuote
+    ? { ...storedQuote, amount: hasPersistedQuoteAmount ? quoteAmount : storedQuote.amount }
+    : {
+        amount: number(row.stage_budget),
+        token: (['CREDIT', 'mUSDC', 'sETH'].includes(text(row.escrow_token)) ? text(row.escrow_token) : 'CREDIT') as StageQuote['token'],
+        basePriceUsdc: 0,
+        agentPriceVersion: 1,
+        formulaVersion: 'legacy.stage-budget',
+        comparableToBasePrice: false,
+        multipliers: { complexity: 1, urgency: 1, expertise: 1, load: 1 },
+      };
   return {
     id: text(row.id),
     missionId: text(row.mission_id),
     stageId: text(row.stage_id),
     agentId: text(row.agent_id),
     status: storedStatus === 'pending' && Date.parse(text(row.expires_at)) <= Date.parse(now) ? 'expired' : storedStatus,
+    quote,
     expiresAt: text(row.expires_at),
     respondedAt: text(row.responded_at) || null,
     createdAt: text(row.created_at),
@@ -1013,11 +1035,12 @@ function guardedEdgeRuleInsert(db: D1Database, edge: WorkflowEdge, saveToken: st
   );
 }
 
-function stageOfferInsert(db: D1Database, offer: StageOffer): D1Statement {
+function stageOfferInsert(db: D1Database, offer: StageOffer, confirmToken: string): D1Statement {
   return db.prepare(`
     INSERT INTO stage_offers
       (id, mission_id, stage_id, agent_id, status, expires_at, responded_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+    WHERE EXISTS (SELECT 1 FROM missions WHERE id = ? AND workflow_save_token = ?)
   `).bind(
     offer.id,
     offer.missionId,
@@ -1028,7 +1051,18 @@ function stageOfferInsert(db: D1Database, offer: StageOffer): D1Statement {
     offer.respondedAt,
     offer.createdAt,
     offer.updatedAt,
+    offer.missionId,
+    confirmToken,
   );
+}
+
+function stageOfferQuoteInsert(db: D1Database, offer: StageOffer, confirmToken: string): D1Statement {
+  return db.prepare(`
+    INSERT INTO stage_offer_quotes (offer_id, amount, snapshot_json, created_at)
+    SELECT ?, ?, ?, ?
+    WHERE EXISTS (SELECT 1 FROM stage_offers WHERE id = ?)
+      AND EXISTS (SELECT 1 FROM missions WHERE id = ? AND workflow_save_token = ?)
+  `).bind(offer.id, offer.quote.amount, JSON.stringify(offer.quote), offer.createdAt, offer.id, offer.missionId, confirmToken);
 }
 
 function refreshAgentPerformance(
@@ -1175,16 +1209,49 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async listAgents(): Promise<Agent[]> {
-    const { results } = await this.db.prepare('SELECT * FROM agents ORDER BY official DESC, trust_score DESC, created_at DESC LIMIT 200').all<Row>();
+    const { results } = await this.db.prepare(`
+      SELECT agents.*,
+        COALESCE((SELECT MAX(version) FROM agent_price_versions WHERE agent_id = agents.id), 1) AS price_version
+      FROM agents ORDER BY official DESC, trust_score DESC, created_at DESC LIMIT 200
+    `).all<Row>();
     return results.map(mapAgent);
   }
 
   async getAgent(id: string): Promise<Agent | null> {
-    const row = await this.db.prepare('SELECT * FROM agents WHERE id = ?').bind(id).first<Row>();
+    const row = await this.db.prepare(`
+      SELECT agents.*,
+        COALESCE((SELECT MAX(version) FROM agent_price_versions WHERE agent_id = agents.id), 1) AS price_version
+      FROM agents WHERE id = ?
+    `).bind(id).first<Row>();
     return row ? mapAgent(row) : null;
   }
 
+  async getAgentLoadMultipliers(agentIds: string[]): Promise<Map<string, number>> {
+    const uniqueIds = [...new Set(agentIds)];
+    if (uniqueIds.length === 0) return new Map();
+    const placeholders = uniqueIds.map(() => '?').join(', ');
+    const { results } = await this.db.prepare(`
+      SELECT agents.id,
+        COUNT(DISTINCT CASE WHEN missions.id IS NOT NULL THEN stages.id END) AS active_assignments
+      FROM agents
+      LEFT JOIN workflow_stages stages
+        ON stages.agent_id = agents.id
+        AND stages.node_type = 'task'
+        AND stages.status IN ('queued', 'running')
+      LEFT JOIN mission_runtime_controls controls ON controls.mission_id = stages.mission_id
+      LEFT JOIN missions
+        ON missions.id = stages.mission_id
+        AND missions.status = 'running'
+        AND missions.cancelled_at IS NULL
+        AND controls.paused_at IS NULL
+      WHERE agents.id IN (${placeholders})
+      GROUP BY agents.id
+    `).bind(...uniqueIds).all<Row>();
+    return new Map(results.map((row) => [text(row.id), loadMultiplierForActiveAssignments(number(row.active_assignments))]));
+  }
+
   async createAgent(agent: Agent): Promise<Agent> {
+    const created = { ...agent, priceVersion: agent.priceVersion ?? 1 };
     const versionId = `AGVER-${agent.id}-${agent.version.replaceAll('.', '-')}`;
     await this.db.batch([this.db.prepare(`
       INSERT INTO agents
@@ -1203,11 +1270,36 @@ export class D1PlatformStore implements PlatformStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(versionId, agent.id, agent.version, agent.endpoint, agent.authType, JSON.stringify(agent.inputSchema), JSON.stringify(agent.outputSchema), JSON.stringify(agent.tags), agent.createdAt),
     this.db.prepare(`
+      INSERT INTO agent_price_versions (id, agent_id, version, price_usdc, created_by, created_at)
+      VALUES (?, ?, 1, ?, ?, ?)
+    `).bind(`AGPRICE-${agent.id}-v1`, agent.id, agent.price, agent.ownerId, agent.createdAt),
+    this.db.prepare(`
       INSERT INTO agent_stats
         (agent_id, marketplace_status, payout_valid, eligibility_reasons_json, formula_version, updated_at)
       VALUES (?, 'registered', ?, ?, ?, ?)
     `).bind(agent.id, /^0x[a-fA-F0-9]{40}$/.test(agent.wallet) ? 1 : 0, JSON.stringify(['正式 Trial 尚未通过', 'Endpoint 最近 24 小时无健康记录']), AGENT_QUALITY_FORMULA_VERSION, agent.createdAt)]);
-    return agent;
+    return created;
+  }
+
+  async updateAgentPrice(id: string, ownerId: string, price: number, updatedAt: string, changedBy = ownerId): Promise<Agent | null> {
+    const current = await this.getAgent(id);
+    if (!current || current.ownerId !== ownerId) return null;
+    if (current.price === price) return current;
+    const priceHistoryId = `AGPRICE-${id}-${crypto.randomUUID()}`;
+    await this.db.batch([
+      this.db.prepare(`
+        INSERT INTO agent_price_versions (id, agent_id, version, price_usdc, created_by, created_at)
+        SELECT ?, agents.id, COALESCE(MAX(history.version), 1) + 1, ?, ?, ?
+        FROM agents LEFT JOIN agent_price_versions history ON history.agent_id = agents.id
+        WHERE agents.id = ? AND agents.owner_id = ?
+        GROUP BY agents.id
+      `).bind(priceHistoryId, price, changedBy, updatedAt, id, ownerId),
+      this.db.prepare(`
+        UPDATE agents SET price_usdc = ?, updated_at = ?
+        WHERE id = ? AND owner_id = ? AND price_usdc <> ?
+      `).bind(price, updatedAt, id, ownerId, price),
+    ]);
+    return this.getAgent(id);
   }
 
   async updateAgentTrial(id: string, score: number, status: AgentStatus, responseTimeMs: number | null = 1800): Promise<Agent | null> {
@@ -1493,6 +1585,19 @@ export class D1PlatformStore implements PlatformStore {
         AND EXISTS (SELECT 1 FROM escrows WHERE mission_id = missions.id AND status = 'pending')
     `).bind(JSON.stringify(viewport), saveToken, id, expectedVersion),
       this.db.prepare(`
+        INSERT OR IGNORE INTO stage_offer_quote_history
+          (id, mission_id, stage_id, agent_id, status, amount, snapshot_json,
+           expires_at, responded_at, created_at, archived_at)
+        SELECT offers.id, offers.mission_id, offers.stage_id, offers.agent_id, offers.status,
+          COALESCE(quotes.amount, stages.budget_usdc), COALESCE(quotes.snapshot_json, '{}'),
+          offers.expires_at, offers.responded_at, offers.created_at, datetime('now')
+        FROM stage_offers offers
+        LEFT JOIN stage_offer_quotes quotes ON quotes.offer_id = offers.id
+        LEFT JOIN workflow_stages stages ON stages.id = offers.stage_id
+        WHERE offers.mission_id = ?
+          AND EXISTS (SELECT 1 FROM missions WHERE id = ? AND workflow_save_token = ?)
+      `).bind(id, id, saveToken),
+      this.db.prepare(`
         DELETE FROM stage_offers WHERE mission_id = ?
           AND EXISTS (SELECT 1 FROM missions WHERE id = ? AND workflow_save_token = ?)
       `).bind(id, id, saveToken),
@@ -1521,21 +1626,75 @@ export class D1PlatformStore implements PlatformStore {
     return { state: 'saved', mission: (await this.getMission(id))! };
   }
 
-  async confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[]): Promise<Mission | null> {
-    await this.db.batch([
+  async confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[], expectedVersion?: number): Promise<Mission | null> {
+    const mission = await this.getMission(id);
+    const confirmationVersion = expectedVersion ?? mission?.workflowVersion ?? 0;
+    const token = paymentConfig(mission?.paymentMethod ?? 'web2_balance').token;
+    const normalizedOffers = offers.map((offer) => {
+      if (offer.quote) return offer;
+      const stageBudget = stages.find((stage) => stage.id === offer.stageId)?.budget ?? 0;
+      return {
+        ...offer,
+        quote: {
+          amount: stageBudget,
+          token,
+          basePriceUsdc: 0,
+          agentPriceVersion: 1,
+          formulaVersion: 'legacy.stage-budget',
+          comparableToBasePrice: false,
+          multipliers: { complexity: 1, urgency: 1, expertise: 1, load: 1 },
+        },
+      } satisfies StageOffer;
+    });
+    const quotedAmount = Number(normalizedOffers.reduce((sum, offer) => sum + offer.quote.amount, 0).toFixed(6));
+    const pricingUpdatedAt = normalizedOffers[0]?.createdAt ?? new Date().toISOString();
+    const confirmToken = crypto.randomUUID();
+    const results = await this.db.batch([
       this.db.prepare(`
-        UPDATE missions SET team_json = ?, status = 'matching', current_stage = '接单邀请已发送，等待 Agent 确认', updated_at = datetime('now')
-        WHERE id = ? AND status IN ('draft', 'matching')
+        UPDATE missions SET team_json = ?, workflow_save_token = ?, workflow_version = workflow_version + 1,
+          status = 'matching', current_stage = '接单邀请已发送，等待 Agent 确认', updated_at = datetime('now')
+        WHERE id = ? AND workflow_version = ? AND status IN ('draft', 'matching')
           AND EXISTS (SELECT 1 FROM escrows WHERE mission_id = missions.id AND status = 'pending')
-      `).bind(JSON.stringify(team), id),
-      this.db.prepare('DELETE FROM stage_offers WHERE mission_id = ?').bind(id),
+          AND (
+            NOT EXISTS (SELECT 1 FROM stage_offers WHERE mission_id = missions.id)
+            OR EXISTS (
+              SELECT 1 FROM stage_offers
+              WHERE mission_id = missions.id
+                AND (status = 'declined' OR (status = 'pending' AND julianday(expires_at) <= julianday(?)))
+            )
+          )
+      `).bind(JSON.stringify(team), confirmToken, id, confirmationVersion, pricingUpdatedAt),
+      this.db.prepare(`
+        INSERT OR IGNORE INTO stage_offer_quote_history
+          (id, mission_id, stage_id, agent_id, status, amount, snapshot_json,
+           expires_at, responded_at, created_at, archived_at)
+        SELECT offers.id, offers.mission_id, offers.stage_id, offers.agent_id, offers.status,
+          COALESCE(quotes.amount, stages.budget_usdc), COALESCE(quotes.snapshot_json, '{}'),
+          offers.expires_at, offers.responded_at, offers.created_at, ?
+        FROM stage_offers offers
+        LEFT JOIN stage_offer_quotes quotes ON quotes.offer_id = offers.id
+        LEFT JOIN workflow_stages stages ON stages.id = offers.stage_id
+        WHERE offers.mission_id = ?
+          AND EXISTS (SELECT 1 FROM missions WHERE id = ? AND workflow_save_token = ?)
+      `).bind(pricingUpdatedAt, id, id, confirmToken),
+      this.db.prepare(`
+        DELETE FROM stage_offers WHERE mission_id = ?
+          AND EXISTS (SELECT 1 FROM missions WHERE id = ? AND workflow_save_token = ?)
+      `).bind(id, id, confirmToken),
       ...stages.map((stage) => this.db.prepare(`
         UPDATE workflow_stages SET agent_id = ?, updated_at = ?
         WHERE id = ? AND mission_id = ?
           AND EXISTS (SELECT 1 FROM escrows WHERE mission_id = workflow_stages.mission_id AND status = 'pending')
-      `).bind(stage.agentId, stage.updatedAt, stage.id, id)),
-      ...offers.map((offer) => stageOfferInsert(this.db, offer)),
+          AND EXISTS (SELECT 1 FROM missions WHERE id = workflow_stages.mission_id AND workflow_save_token = ?)
+      `).bind(stage.agentId, stage.updatedAt, stage.id, id, confirmToken)),
+      ...normalizedOffers.flatMap((offer) => [stageOfferInsert(this.db, offer, confirmToken), stageOfferQuoteInsert(this.db, offer, confirmToken)]),
+      this.db.prepare(`
+        UPDATE escrows SET amount = CASE WHEN ? > 0 THEN ? ELSE amount END, updated_at = ?
+        WHERE mission_id = ? AND status = 'pending'
+          AND EXISTS (SELECT 1 FROM missions WHERE id = escrows.mission_id AND workflow_save_token = ?)
+      `).bind(quotedAmount, quotedAmount, pricingUpdatedAt, id, confirmToken),
     ]);
+    if (Number(results[0]?.meta?.changes ?? 0) === 0) return null;
     return this.getMission(id);
   }
 
@@ -1549,6 +1708,8 @@ export class D1PlatformStore implements PlatformStore {
   ) {
     const mission = await this.getMission(id);
     if (!mission) return null;
+    const escrow = await this.getEscrow(id);
+    if (!escrow) return null;
     const statements: D1Statement[] = [
       this.db.prepare(`
         UPDATE missions SET status = 'running', progress = CASE WHEN progress < 1 THEN 1 ELSE progress END,
@@ -1572,7 +1733,7 @@ export class D1PlatformStore implements PlatformStore {
         SELECT ?, ?, ?, 'mission_hold', ?, 'CREDIT', ?, ?
         WHERE EXISTS (SELECT 1 FROM missions WHERE id = ? AND status = 'running' AND updated_at = ?)
         ON CONFLICT(settlement_key) DO NOTHING
-      `).bind(crypto.randomUUID(), `${id}:wallet:hold`, requesterId, -mission.budget, id, startedAt, id, startedAt));
+      `).bind(crypto.randomUUID(), `${id}:wallet:hold`, requesterId, -escrow.amount, id, startedAt, id, startedAt));
     }
     statements.push(
       this.db.prepare(`
@@ -1948,8 +2109,13 @@ export class D1PlatformStore implements PlatformStore {
     const escrow = await this.getEscrow(id);
     if (!mission || !escrow) return null;
     const stages = await this.listStages(id);
+    const offers = await this.listStageOffers(id);
     const fee = Number((escrow.amount * escrow.platformFeeRate).toFixed(6));
-    const stageTotal = stages.reduce((sum, stage) => sum + stage.budget, 0) || escrow.amount;
+    const stageWeights = new Map(stages.map((stage) => {
+      const quoteAmount = offers.find((offer) => offer.stageId === stage.id)?.quote?.amount;
+      return [stage.id, Number.isFinite(quoteAmount) && Number(quoteAmount) > 0 ? Number(quoteAmount) : stage.budget];
+    }));
+    const stageTotal = stages.reduce((sum, stage) => sum + (stageWeights.get(stage.id) ?? 0), 0) || escrow.amount;
     const now = new Date().toISOString();
     const statements: D1Statement[] = [
       this.db.prepare(`
@@ -2017,7 +2183,7 @@ export class D1PlatformStore implements PlatformStore {
     const payouts = new Map<string, number>();
     for (const stage of stages) {
       if (!stage.agentId) continue;
-      const gross = escrow.amount * (stage.budget / stageTotal);
+      const gross = escrow.amount * ((stageWeights.get(stage.id) ?? stage.budget) / stageTotal);
       payouts.set(stage.agentId, (payouts.get(stage.agentId) ?? 0) + gross);
     }
     const walletPayouts = new Map<string, number>();
@@ -2257,14 +2423,28 @@ export class D1PlatformStore implements PlatformStore {
   }
 
   async listStageOffers(missionId: string, now = new Date().toISOString()): Promise<StageOffer[]> {
-    const { results } = await this.db.prepare(
-      'SELECT * FROM stage_offers WHERE mission_id = ? ORDER BY created_at ASC, id ASC',
-    ).bind(missionId).all<Row>();
+    const { results } = await this.db.prepare(`
+      SELECT offers.*, quotes.amount AS quote_amount, quotes.snapshot_json AS pricing_snapshot_json,
+        stages.budget_usdc AS stage_budget, escrows.token AS escrow_token
+      FROM stage_offers offers
+      LEFT JOIN stage_offer_quotes quotes ON quotes.offer_id = offers.id
+      LEFT JOIN workflow_stages stages ON stages.id = offers.stage_id
+      LEFT JOIN escrows ON escrows.mission_id = offers.mission_id
+      WHERE offers.mission_id = ? ORDER BY offers.created_at ASC, offers.id ASC
+    `).bind(missionId).all<Row>();
     return results.map((row) => mapStageOffer(row, now));
   }
 
   async getStageOffer(id: string, now = new Date().toISOString()): Promise<StageOffer | null> {
-    const row = await this.db.prepare('SELECT * FROM stage_offers WHERE id = ?').bind(id).first<Row>();
+    const row = await this.db.prepare(`
+      SELECT offers.*, quotes.amount AS quote_amount, quotes.snapshot_json AS pricing_snapshot_json,
+        stages.budget_usdc AS stage_budget, escrows.token AS escrow_token
+      FROM stage_offers offers
+      LEFT JOIN stage_offer_quotes quotes ON quotes.offer_id = offers.id
+      LEFT JOIN workflow_stages stages ON stages.id = offers.stage_id
+      LEFT JOIN escrows ON escrows.mission_id = offers.mission_id
+      WHERE offers.id = ?
+    `).bind(id).first<Row>();
     return row ? mapStageOffer(row, now) : null;
   }
 
@@ -2277,7 +2457,8 @@ export class D1PlatformStore implements PlatformStore {
       RETURNING *
     `).bind(decision, respondedAt, respondedAt, id, respondedAt, ownerId).first<Row>();
     if (!row) return null;
-    const offer = mapStageOffer(row, respondedAt);
+    const offer = await this.getStageOffer(id, respondedAt);
+    if (!offer) return null;
     if (decision === 'declined') {
       await this.db.prepare(`
         UPDATE missions SET current_stage = 'Agent 已拒绝接单，等待重新选择', updated_at = ?

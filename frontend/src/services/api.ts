@@ -311,7 +311,7 @@ export const api = {
     method: 'POST', authenticated: true, idempotencyKey: `workflow-expand-${crypto.randomUUID()}`, body: JSON.stringify(input),
   }),
   getCandidates: (missionId: string) => request<CandidateMatch[]>(`/api/missions/${encodeURIComponent(missionId)}/candidates`, { authenticated: true }),
-  confirmWorkflow: (missionId: string, assignments: Record<string, string>) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[]; offers: StageOffer[] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow`, {
+  confirmWorkflow: (missionId: string, assignments: Record<string, string>) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[]; offers: StageOffer[]; escrow: MissionDetail['escrow'] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ assignments }),
   }),
   respondStageOffer: (missionId: string, offerId: string, decision: 'accepted' | 'declined') => request<StageOffer>(`/api/missions/${encodeURIComponent(missionId)}/offers/${encodeURIComponent(offerId)}`, {
@@ -396,6 +396,9 @@ export const api = {
   }),
   updateAgentStatus: (agentId: string, status: 'active' | 'paused') => request<Agent>(`/api/agents/${encodeURIComponent(agentId)}/status`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ status }),
+  }),
+  updateAgentPrice: (agentId: string, price: number) => request<Agent>(`/api/agents/${encodeURIComponent(agentId)}/price`, {
+    method: 'POST', authenticated: true, idempotencyKey: `agent-price-${crypto.randomUUID()}`, body: JSON.stringify({ price }),
   }),
   getAgentFeedback: (missionId: string, stageId: string) => request<AgentFeedback | null>(`/api/missions/${encodeURIComponent(missionId)}/stages/${encodeURIComponent(stageId)}/feedback`, { authenticated: true }),
   saveAgentFeedback: (missionId: string, stageId: string, input: { deliveryQuality: number; requirementsFit: number; communication: number; onTime: boolean; reuse: boolean; comment: string }) => request<{ feedback: AgentFeedback }>(`/api/missions/${encodeURIComponent(missionId)}/stages/${encodeURIComponent(stageId)}/feedback`, {

@@ -143,6 +143,15 @@ describe('LangGraph workflow compiler', () => {
     expect(complexWorkflow.stages.filter((stage) => stage.nodeType === 'task').reduce((sum, stage) => sum + stage.budget, 0)).toBe(complex.budget);
   });
 
+  it('reserves one payment quantum for every generated task', () => {
+    const tiny = mission({ budget: 0.000002, paymentMethod: 'web3_seth' });
+    const compiled = adaptiveFallbackCompilation(tiny);
+    const taskBudgets = compiled.stages.filter((stage) => stage.nodeType === 'task').map((stage) => stage.budget);
+
+    expect(taskBudgets).toEqual([0.000001, 0.000001]);
+    expect(taskBudgets.reduce((sum, budget) => sum + budget, 0)).toBe(tiny.budget);
+  });
+
   it('repairs one invalid planner result and saves the corrected graph', async () => {
     const target = complexMission();
     const validGraph = JSON.parse(rawCompilation(target)) as { nodes: Array<Record<string, unknown>> };

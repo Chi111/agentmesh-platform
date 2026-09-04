@@ -13,8 +13,9 @@ import {
   type Address,
   type Hex,
 } from 'viem';
-import type { Agent, PaymentMethod, WorkflowStage } from './contracts';
+import type { Agent, PaymentMethod, StageOffer, WorkflowStage } from './contracts';
 import { AGENTMESH_TESTNET_SETTLEMENT, paymentConfig } from './payments';
+import { settlementWeight } from './pricing';
 
 export interface SettlementEnv {
   PROJECT_NAME?: string;
@@ -53,13 +54,13 @@ export interface SettlementPlan {
   payoutHash: Hex;
 }
 
-export function buildSettlementPlan(stages: WorkflowStage[], agents: Agent[]): SettlementPlan {
+export function buildSettlementPlan(stages: WorkflowStage[], agents: Agent[], offers: StageOffer[] = []): SettlementPlan {
   const wallets = new Map(agents.map((agent) => [agent.id, agent.wallet]));
   const aggregated = new Map<string, { address: Address; weight: bigint }>();
   for (const stage of [...stages].sort((left, right) => left.position - right.position)) {
     const wallet = stage.agentId ? wallets.get(stage.agentId) : null;
     if (!wallet || !isViemAddress(wallet, { strict: false })) throw new Error(`Stage ${stage.id} does not have a valid settlement wallet`);
-    const weight = parseUnits(stage.budget.toFixed(6), 6);
+    const weight = parseUnits(settlementWeight(stage, offers).toFixed(6), 6);
     if (weight <= 0n) throw new Error(`Stage ${stage.id} must have a positive settlement weight`);
     const key = wallet.toLocaleLowerCase();
     const current = aggregated.get(key);

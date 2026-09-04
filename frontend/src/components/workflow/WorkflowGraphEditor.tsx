@@ -14,6 +14,7 @@ import {
   type Viewport,
 } from '@xyflow/react';
 import {
+  AlertTriangle,
   Bot,
   CheckCircle2,
   GitBranch,
@@ -88,6 +89,69 @@ interface Props {
 
 const nodeTypes = { workflowNode: WorkflowNodeCard };
 const defaultViewport: WorkflowViewport = { x: 0, y: 0, zoom: 1 };
+const AUTO_MATCH_MIN_SCORE = 80;
+const AUTO_MATCH_MIN_LEAD = 10;
+
+type Candidate = CandidateMatch['candidates'][number];
+
+function candidateQuoteAmount(candidate: Candidate): number {
+  return candidate.quote?.amount ?? candidate.agent.price;
+}
+
+function candidateQuoteComparable(candidate: Candidate, paymentMethod: Mission['paymentMethod']): boolean {
+  return candidate.quote?.comparableToBasePrice ?? paymentMethod !== 'web3_seth';
+}
+
+function normalizedMatchValue(value: string): string {
+  return value.trim().toLocaleLowerCase();
+}
+
+function categoriesMatch(stageCategory: string, agentCategory: string): boolean {
+  const stage = normalizedMatchValue(stageCategory);
+  const agent = normalizedMatchValue(agentCategory);
+  return Boolean(stage && agent && (stage === agent || stage.includes(agent) || agent.includes(stage)));
+}
+
+function automaticRecommendation(
+  stage: WorkflowStage,
+  match: CandidateMatch | null | undefined,
+  paymentMethod: Mission['paymentMethod'],
+): Candidate | null {
+  const candidate = match?.candidates[0];
+  if (!candidate || candidate.agent.status !== 'active' || candidate.score < AUTO_MATCH_MIN_SCORE) return null;
+  const runnerUp = match?.candidates[1];
+  if (runnerUp && candidate.score - runnerUp.score < AUTO_MATCH_MIN_LEAD) return null;
+  if (!categoriesMatch(stage.category, candidate.agent.category)) return null;
+  if (candidateQuoteComparable(candidate, paymentMethod) && candidateQuoteAmount(candidate) > stage.budget) return null;
+  return candidate;
+}
+
+function selectionWarnings(
+  stage: WorkflowStage,
+  match: CandidateMatch | null | undefined,
+  selectedAgent: Agent | undefined,
+  paymentMethod: Mission['paymentMethod'],
+): string[] {
+  if (!selectedAgent) return [];
+  const selectedCandidate = match?.candidates.find((candidate) => candidate.agent.id === selectedAgent.id);
+  const recommendation = match?.candidates[0];
+  const warnings: string[] = [];
+  if (match?.candidates.length && !selectedCandidate) warnings.push('该 Agent 未进入当前节点 Top 5，暂无可比较的候选分数。');
+  if (selectedCandidate && selectedCandidate.score < AUTO_MATCH_MIN_SCORE) {
+    warnings.push(`当前匹配分 ${selectedCandidate.score.toFixed(1)}，低于自动匹配阈值 ${AUTO_MATCH_MIN_SCORE}。`);
+  }
+  if (selectedCandidate && recommendation && recommendation.agent.id !== selectedAgent.id
+    && recommendation.score - selectedCandidate.score >= AUTO_MATCH_MIN_LEAD) {
+    warnings.push(`比系统首选低 ${(recommendation.score - selectedCandidate.score).toFixed(1)} 分。`);
+  }
+  if (!categoriesMatch(stage.category, selectedAgent.category)) {
+    warnings.push(`功能分类“${selectedAgent.category}”与节点分类“${stage.category}”匹配较弱。`);
+  }
+  if (selectedCandidate && candidateQuoteComparable(selectedCandidate, paymentMethod) && candidateQuoteAmount(selectedCandidate) > stage.budget) {
+    warnings.push(`动态报价 ${formatPaymentAmount(candidateQuoteAmount(selectedCandidate), paymentMethod)} 超过节点预算 ${formatPaymentAmount(stage.budget, paymentMethod)}。`);
+  }
+  return warnings;
+}
 
 function normalizeStage(stage: WorkflowStage, index: number): WorkflowStage {
   const position = stage.position ?? index + 1;
@@ -157,6 +221,8 @@ function graphError(nodes: FlowNode[], edges: FlowEdge[], mission: Mission, requ
     if (stage.name.trim().length < 2 || stage.purpose.trim().length < 2) return '每个节点都需要完整的名称和目标说明。';
     if (!Number.isFinite(stage.budget) || stage.budget < 0) return `“${stage.name}”的预算无效。`;
     if (stage.nodeType === 'task') {
+      const minimumBudget = mission.paymentMethod === 'web3_seth' ? 0.000001 : 0.01;
+      if (stage.budget < minimumBudget) return `“${stage.name}”的预算不能低于 ${formatPaymentAmount(minimumBudget, mission.paymentMethod)}。`;
       if (stage.category.trim().length < 2) return `“${stage.name}”需要任务分类。`;
       const mode = String(stage.input?.executionMode ?? 'analyze');
       if (!['analyze', 'implement', 'review'].includes(mode)) return `“${stage.name}”的执行模式无效。`;
@@ -334,6 +400,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const fitAfterNodeAddRef = useRef(false);
   const layoutNextCompilationRef = useRef(false);
   const viewportInteractionRef = useRef(false);
+  const manuallyEditedAgentStagesRef = useRef(new Set<string>());
   const hasStoredViewport = Math.abs(missionViewport.x) > 0.1
     || Math.abs(missionViewport.y) > 0.1
     || Math.abs(missionViewport.zoom - 1) > 0.001;
@@ -364,6 +431,28 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const gateCount = nodes.length - taskNodes.length;
   const assignedCount = taskNodes.filter((node) => node.data.stage.agentId).length;
   const taskBudget = taskNodes.reduce((sum, node) => sum + node.data.stage.budget, 0);
+  const assignmentReviews = taskNodes.flatMap((node) => {
+    const agentId = node.data.stage.agentId;
+    if (!agentId) return [];
+    const agent = agents.find((candidate) => candidate.id === agentId);
+    if (!agent) return [];
+    const match = candidateMatches.find((candidate) => candidate.stageId === node.id);
+    const recommendation = match?.candidates[0];
+    const selectedCandidate = match?.candidates.find((candidate) => candidate.agent.id === agentId);
+    return [{
+      stageId: node.id,
+      stageName: node.data.stage.name,
+      agent,
+      selectedCandidate,
+      recommendation,
+      manuallyAdjusted: Boolean(recommendation && recommendation.agent.id !== agentId),
+      warnings: selectionWarnings(node.data.stage, match, agent, mission.paymentMethod),
+    }];
+  });
+  const selectedReview = assignmentReviews.find((review) => review.stageId === selectedId) ?? null;
+  const selectedAutomaticRecommendation = selected?.data.stage.nodeType === 'task'
+    ? automaticRecommendation(selected.data.stage, selectedMatch, mission.paymentMethod)
+    : null;
 
   useEffect(() => {
     setConditionDraft(selectedConditionJson);
@@ -400,6 +489,33 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
       },
     })));
   }, [agents, setNodes]);
+
+  useEffect(() => {
+    if (locked || offers.length || !candidateMatches.length) return;
+    const assignments = new Map<string, Candidate>();
+    for (const node of nodes) {
+      if (node.data.stage.nodeType !== 'task' || node.data.stage.agentId || manuallyEditedAgentStagesRef.current.has(node.id)) continue;
+      const match = candidateMatches.find((candidate) => candidate.stageId === node.id);
+      const recommendation = automaticRecommendation(node.data.stage, match, mission.paymentMethod);
+      if (recommendation && activeAgentIds.has(recommendation.agent.id)) assignments.set(node.id, recommendation);
+    }
+    if (!assignments.size) return;
+    assignments.forEach((_, stageId) => manuallyEditedAgentStagesRef.current.add(stageId));
+    setNodes((items) => items.map((node) => {
+      const recommendation = assignments.get(node.id);
+      return recommendation ? {
+        ...node,
+        data: {
+          ...node.data,
+          stage: { ...node.data.stage, agentId: recommendation.agent.id },
+          agentName: recommendation.agent.name,
+        },
+      } : node;
+    }));
+    dirtyRef.current = true;
+    setDirty(true);
+    setMessage({ text: `已按评分和功能为 ${assignments.size} 个节点预选高置信度 Agent，可在发送邀请前调整。`, tone: 'success' });
+  }, [activeAgentIds, candidateMatches, locked, mission.paymentMethod, nodes, offers.length, setNodes]);
 
   useEffect(() => {
     if (!instance || hasStoredViewport || !nodes.length || dirtyRef.current) return;
@@ -449,6 +565,12 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
       },
     } : node));
     markDirty();
+  };
+
+  const changeAgent = (agentId: string | null) => {
+    if (!selected) return;
+    manuallyEditedAgentStagesRef.current.add(selected.id);
+    changeStage({ agentId });
   };
 
   const changeEdge = (data: WorkflowEdgeData) => {
@@ -608,6 +730,30 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const confirm = async () => {
     const error = graphError(nodes, edges, mission, true, activeAgentIds);
     if (error) { setMessage({ text: error, tone: 'error' }); return; }
+    const underfunded = assignmentReviews.find((review) => review.selectedCandidate
+      && candidateQuoteComparable(review.selectedCandidate, mission.paymentMethod)
+      && candidateQuoteAmount(review.selectedCandidate) > nodes.find((node) => node.id === review.stageId)!.data.stage.budget);
+    if (underfunded?.selectedCandidate) {
+      const stage = nodes.find((node) => node.id === underfunded.stageId)!.data.stage;
+      setMessage({
+        text: `${stage.name} 的动态报价为 ${formatPaymentAmount(candidateQuoteAmount(underfunded.selectedCandidate), mission.paymentMethod)}，超过节点预算 ${formatPaymentAmount(stage.budget, mission.paymentMethod)}。请调整节点预算或更换 Agent。`,
+        tone: 'error',
+      });
+      return;
+    }
+    const manualAdjustments = assignmentReviews.filter((review) => review.manuallyAdjusted);
+    const riskyAssignments = assignmentReviews.filter((review) => review.warnings.length);
+    if (manualAdjustments.length || riskyAssignments.length) {
+      const adjustmentLines = manualAdjustments.slice(0, 6).map((review) => (
+        `${review.stageName}：${review.recommendation?.agent.name ?? '系统首选'} ${review.recommendation ? `(${review.recommendation.score.toFixed(1)})` : ''} → ${review.agent.name} ${review.selectedCandidate ? `(${review.selectedCandidate.score.toFixed(1)})` : '(无候选分)'}`
+      ));
+      const riskLines = riskyAssignments.slice(0, 6).map((review) => `${review.stageName}：${review.warnings.join(' ')}`);
+      const detail = [
+        manualAdjustments.length ? `人工调整 ${manualAdjustments.length} 个节点：\n${adjustmentLines.join('\n')}` : '',
+        riskyAssignments.length ? `\n需要注意 ${riskyAssignments.length} 个节点：\n${riskLines.join('\n')}` : '',
+      ].filter(Boolean).join('\n');
+      if (!window.confirm(`${detail}\n\n确认按当前分配发送邀请吗？`)) return;
+    }
     if (dirty && !await save()) return;
     try { await onConfirm(); } catch (reason) {
       setMessage({ text: reason instanceof Error ? reason.message : '邀请发送失败。', tone: 'error' });
@@ -779,9 +925,15 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
             <label><span className="field-label !mb-1.5 !text-xs">名称</span><input className="field" value={selected.data.stage.name} onChange={(event) => changeStage({ name: event.target.value })} disabled={locked} /></label>
             <label><span className="field-label !mb-1.5 !text-xs">目标 / 审批说明</span><textarea className="field min-h-24 resize-none" value={selected.data.stage.purpose} onChange={(event) => changeStage({ purpose: event.target.value })} disabled={locked} /></label>
             {selected.data.stage.nodeType === 'task' ? <>
-              <div className="grid grid-cols-2 gap-3"><label><span className="field-label !mb-1.5 !text-xs">分类</span><input className="field" value={selected.data.stage.category} onChange={(event) => changeStage({ category: event.target.value })} disabled={locked} /></label><label><span className="field-label !mb-1.5 !text-xs">预算</span><input className="field font-mono" type="number" min="0" step="0.000001" value={selected.data.stage.budget} onChange={(event) => changeStage({ budget: Number(event.target.value) })} disabled={locked} /></label></div>
-              <label><span className="field-label !mb-1.5 !text-xs">Agent（不自动选择）</span><select className="field" value={selected.data.stage.agentId ?? ''} onChange={(event) => changeStage({ agentId: event.target.value || null })} disabled={locked}><option value="">请选择 Agent</option>{agentOptions.map((agent) => <option value={agent.id} key={agent.id}>{agent.name} · {agent.category}</option>)}</select></label>
-              {selectedMatch?.candidates.length ? <div><p className="field-label !mb-1.5 !text-xs">候选建议（需手动选择）</p><div className="space-y-2">{selectedMatch.candidates.slice(0, 3).map((candidate) => <button type="button" className={`w-full rounded-xl border p-3 text-left text-xs transition ${selected.data.stage.agentId === candidate.agent.id ? 'border-cyan bg-cyan/5' : 'border-line hover:border-cyan/40'}`} onClick={() => changeStage({ agentId: candidate.agent.id })} disabled={locked || candidate.agent.status !== 'active'} key={candidate.agent.id}><span className="flex items-center justify-between gap-2"><strong>{candidate.agent.name}</strong><span className="font-mono text-cyan">{candidate.score}</span></span><span className="mt-1 block line-clamp-2 text-[10px] leading-4 text-muted">{candidate.reasons.join(' · ')}</span></button>)}</div></div> : null}
+              <div className="grid grid-cols-2 gap-3"><label><span className="field-label !mb-1.5 !text-xs">分类</span><input className="field" value={selected.data.stage.category} onChange={(event) => changeStage({ category: event.target.value })} disabled={locked} /></label><label><span className="field-label !mb-1.5 !text-xs">预算</span><input className="field font-mono" type="number" min={mission.paymentMethod === 'web3_seth' ? 0.000001 : 0.01} step="0.000001" value={selected.data.stage.budget} onChange={(event) => changeStage({ budget: Number(event.target.value) })} disabled={locked} /></label></div>
+              <label><span className="field-label !mb-1.5 !text-xs">Agent（系统推荐，可手动调整）</span><select className="field" value={selected.data.stage.agentId ?? ''} onChange={(event) => changeAgent(event.target.value || null)} disabled={locked}><option value="">请选择 Agent</option>{agentOptions.map((agent) => <option value={agent.id} key={agent.id}>{agent.name} · {agent.category}</option>)}</select></label>
+              {selectedReview?.manuallyAdjusted ? <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800"><div className="flex items-center gap-2 font-semibold"><AlertTriangle size={14} />已手动调整</div><p className="mt-1 text-[10px] leading-4">系统首选 {selectedReview.recommendation?.agent.name}（{selectedReview.recommendation?.score.toFixed(1)} 分），当前为 {selectedReview.agent.name}{selectedReview.selectedCandidate ? `（${selectedReview.selectedCandidate.score.toFixed(1)} 分）` : '（无候选分）'}。</p></div> : selectedAutomaticRecommendation && selected.data.stage.agentId === selectedAutomaticRecommendation.agent.id ? <p className="rounded-xl border border-lime/40 bg-lime/10 p-3 text-xs font-semibold text-lime-700"><CheckCircle2 className="mr-1.5 inline" size={14} />已采用系统高置信度推荐 · {selectedAutomaticRecommendation.score.toFixed(1)} 分</p> : null}
+              {selectedReview?.warnings.length ? <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-[10px] leading-4 text-amber-800" role="alert"><p className="font-semibold">发送邀请前请确认</p><ul className="mt-1 list-disc space-y-1 pl-4">{selectedReview.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div> : null}
+              {selectedMatch?.candidates.length ? <div><div className="mb-1.5 flex items-center justify-between gap-2"><p className="field-label !mb-0 !text-xs">候选建议</p><span className="text-[9px] text-muted">自动阈值 {AUTO_MATCH_MIN_SCORE} · 领先 {AUTO_MATCH_MIN_LEAD}</span></div><div className="space-y-2">{selectedMatch.candidates.slice(0, 3).map((candidate, index) => {
+                const recommended = index === 0;
+                const automaticallyEligible = recommended && Boolean(automaticRecommendation(selected.data.stage, selectedMatch, mission.paymentMethod));
+                return <button type="button" className={`w-full rounded-xl border p-3 text-left text-xs transition ${selected.data.stage.agentId === candidate.agent.id ? 'border-cyan bg-cyan/5' : 'border-line hover:border-cyan/40'}`} onClick={() => changeAgent(candidate.agent.id)} disabled={locked || candidate.agent.status !== 'active'} key={candidate.agent.id}><span className="flex items-center justify-between gap-2"><span className="min-w-0"><strong>{candidate.agent.name}</strong>{recommended ? <span className={`ml-2 rounded px-1.5 py-0.5 text-[8px] font-semibold ${automaticallyEligible ? 'bg-lime/15 text-lime-700' : 'bg-canvas text-muted'}`}>{automaticallyEligible ? '系统推荐' : '候选首位'}</span> : null}{selected.data.stage.agentId === candidate.agent.id ? <span className="ml-1 rounded bg-cyan/10 px-1.5 py-0.5 text-[8px] font-semibold text-cyan">当前</span> : null}</span><span className="text-right"><span className="block font-mono text-cyan">{candidate.score.toFixed(1)}</span><span className="block font-mono text-[9px] text-muted">报价 {formatPaymentAmount(candidateQuoteAmount(candidate), mission.paymentMethod)}</span></span></span><span className="mt-1 block line-clamp-2 text-[10px] leading-4 text-muted">{candidate.reasons.join(' · ')}</span></button>;
+              })}</div></div> : null}
               <label><span className="field-label !mb-1.5 !text-xs">执行模式</span><select className="field" value={String(selectedInput.executionMode ?? 'analyze')} onChange={(event) => changeStage({ input: { ...selectedInput, executionMode: event.target.value } })} disabled={locked}><option value="analyze">Analyze</option><option value="implement">Implement</option><option value="review">Review</option></select></label>
               <label><span className="field-label !mb-1.5 !text-xs">输入契约</span><textarea className="field min-h-20 resize-none font-mono text-xs" value={String(selectedInput.inputContract ?? '')} onChange={(event) => changeStage({ input: { ...selectedInput, inputContract: event.target.value } })} disabled={locked} placeholder="描述直接上游需提供的字段或制品" /></label>
               <label><span className="field-label !mb-1.5 !text-xs">输出契约</span><textarea className="field min-h-20 resize-none font-mono text-xs" value={String(selectedInput.outputContract ?? '')} onChange={(event) => changeStage({ input: { ...selectedInput, outputContract: event.target.value } })} disabled={locked} placeholder="描述交接摘要与 artifact reference" /></label>

@@ -112,6 +112,8 @@ export function AcceptancePage() {
   const [dossier, setDossier] = useState<ReviewDossierResponse | null>(null);
   const usesWeb3 = mission ? isWeb3Payment(mission.paymentMethod) : false;
   const token = mission ? paymentToken(mission.paymentMethod) : 'CREDIT';
+  const escrowAmount = detail?.escrow?.amount ?? mission?.budget ?? 0;
+  const offerByStage = new Map((detail?.offers ?? []).map((offer) => [offer.stageId, offer]));
 
   useEffect(() => {
     if (!missionId || detail) return;
@@ -227,7 +229,8 @@ export function AcceptancePage() {
         for (const stage of stages) {
           const wallet = stage.agentId ? walletsByAgent.get(stage.agentId) : undefined;
           if (!wallet) throw new Error(`“${stage.name}”对应 Agent 尚未配置结算钱包。`);
-          weights.set(wallet, (weights.get(wallet) ?? 0) + stage.budget);
+          const quotedWeight = offerByStage.get(stage.id)?.quote?.amount;
+          weights.set(wallet, (weights.get(wallet) ?? 0) + (quotedWeight && quotedWeight > 0 ? quotedWeight : stage.budget));
         }
         releaseTxHash = await releaseEscrow(
           mission.id,
@@ -286,7 +289,7 @@ export function AcceptancePage() {
     <div className="space-y-5">
       <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="flex items-start gap-3"><Link to="/missions" className="mt-1 rounded-lg p-2 text-muted hover:bg-white hover:text-ink" aria-label="返回任务列表"><ArrowLeft size={18} /></Link><div><div className="flex flex-wrap items-center gap-2"><span className="mono-chip">{mission.id}</span><StatusBadge tone={statusDisplay.tone}>{statusDisplay.label}</StatusBadge></div><h1 className="mt-2 text-2xl font-semibold tracking-tight">{mission.title}</h1><p className="mt-2 text-sm text-muted">{mission.status === 'review' || mission.status === 'completed' ? '核对交付物、执行证据和分账计划后完成结算。' : '此页面仅展示已有交付证据；任务尚未达到验收条件。'}</p></div></div>
-        <div className="flex flex-wrap gap-3">{canRequestRework ? <Link className="btn-secondary" to={`/missions/${mission.id}/execution`}><Wrench size={16} />查看执行与请求返工</Link> : null}<button type="button" className="btn-primary" onClick={() => setReleaseOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled' || !canAccept}><Check size={16} />{mission.status === 'completed' ? '已完成结算' : mission.status === 'cancelled' ? '任务已退款终止' : !canManageAcceptance ? '仅任务方可确认验收' : mission.status !== 'review' ? '等待 Agent 完成执行' : !hasAcceptableOutput ? '等待可验收输出' : `确认交付并释放 ${formatPaymentAmount(mission.budget, mission.paymentMethod)}`}</button></div>
+        <div className="flex flex-wrap gap-3">{canRequestRework ? <Link className="btn-secondary" to={`/missions/${mission.id}/execution`}><Wrench size={16} />查看执行与请求返工</Link> : null}<button type="button" className="btn-primary" onClick={() => setReleaseOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled' || !canAccept}><Check size={16} />{mission.status === 'completed' ? '已完成结算' : mission.status === 'cancelled' ? '任务已退款终止' : !canManageAcceptance ? '仅任务方可确认验收' : mission.status !== 'review' ? '等待 Agent 完成执行' : !hasAcceptableOutput ? '等待可验收输出' : `确认交付并释放 ${formatPaymentAmount(escrowAmount, mission.paymentMethod)}`}</button></div>
       </header>
 
       {mission.status !== 'review' && mission.status !== 'completed' && mission.status !== 'cancelled' ? <section className="flex flex-col gap-3 rounded-xl border border-warning/30 bg-warning/10 p-4 sm:flex-row sm:items-center sm:justify-between"><div><p className="flex items-center gap-2 text-sm font-semibold text-warning"><AlertTriangle size={16} />任务尚未进入验收阶段</p><p className="mt-1 text-xs leading-5 text-muted">缺失的工程制品必须由执行节点重新提交，分析文字不能替代可下载 artifact。</p></div><Link className="btn-secondary shrink-0" to={`/missions/${mission.id}/execution`}>返回执行页</Link></section> : null}
@@ -314,8 +317,8 @@ export function AcceptancePage() {
 
           <aside className="p-5 md:p-6">
             <div className="flex items-center gap-2"><CircleDollarSign size={18} /><h2 className="font-semibold">验收与结算</h2></div>
-            <div className="mt-5 rounded-xl bg-canvas p-5 text-center"><p className="text-xs text-muted">托管总额</p><p className="mt-2 font-mono text-3xl font-semibold text-cyan">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</p></div>
-            <dl className="mt-5 space-y-3 text-sm">{stages.map((stage) => <div className="flex justify-between" key={stage.id}><dt className="text-muted">{stage.name}</dt><dd className="font-mono text-xs font-semibold">{formatPaymentAmount(stage.budget, mission.paymentMethod)}</dd></div>)}</dl>
+            <div className="mt-5 rounded-xl bg-canvas p-5 text-center"><p className="text-xs text-muted">实际托管总额</p><p className="mt-2 font-mono text-3xl font-semibold text-cyan">{formatPaymentAmount(escrowAmount, mission.paymentMethod)}</p><p className="mt-2 text-[10px] text-muted">预算上限 {formatPaymentAmount(mission.budget, mission.paymentMethod)}</p></div>
+            <dl className="mt-5 space-y-3 text-sm">{stages.map((stage) => { const quote = offerByStage.get(stage.id)?.quote?.amount; return <div className="flex justify-between" key={stage.id}><dt className="text-muted">{stage.name}</dt><dd className="font-mono text-xs font-semibold">{formatPaymentAmount(quote && quote > 0 ? quote : stage.budget, mission.paymentMethod)}</dd></div>; })}</dl>
             <div className="mt-5 rounded-xl border border-cyan/20 bg-cyan/[0.06] p-4"><p className="flex items-center gap-2 text-sm font-semibold"><LockKeyhole size={16} className="text-cyan" />{detail?.escrow?.status === 'released' ? '结算账本已释放' : detail?.escrow?.status === 'frozen' ? '争议期间账本冻结' : '等待验收确认'}</p><ul className="mt-3 space-y-2 text-xs text-muted"><li className="flex items-center gap-2"><Check size={13} />验收后生成分阶段账目</li><li className="flex items-center gap-2"><Check size={13} />URI、哈希和事件可追溯</li></ul></div>
             {mission.reviewDueAt && mission.status === 'review' ? <div className="mt-4 rounded-xl border border-warning/25 bg-warning/10 p-4"><p className="flex items-center gap-2 text-sm font-semibold text-warning"><Clock3 size={16} />验收截止时间</p><p className="mt-2 font-mono text-xs">{new Date(mission.reviewDueAt).toLocaleString('zh-CN', { hour12: false })}</p><p className="mt-2 text-xs leading-5 text-muted">当前版本记录并展示 7 天验收窗口；到期不会自动释放链上资金，仍需任务方确认或发起争议。</p></div> : null}
             <button type="button" className="btn-secondary mt-5 w-full text-danger" onClick={() => setDisputeOpen(true)} disabled={mission.status === 'completed' || mission.status === 'cancelled' || activeDispute}><Scale size={16} />{activeDispute ? '已有争议处理中' : '发起争议'}</button>
@@ -338,7 +341,7 @@ export function AcceptancePage() {
       {mission.status === 'completed' && role === 'requester' && !detail?.disputes.some((item) => item.status === 'resolved') ? <section className="panel p-5 md:p-6"><div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-xl bg-cyan/10 text-cyan"><MessageSquareText size={18} /></span><div><h2 className="font-semibold">Agent 结构化反馈</h2><p className="mt-1 text-xs text-muted">每个已结算任务节点可评价一次；更新会版本化，退款或有效争议不会进入信誉分。</p></div></div><div className="mt-5 grid gap-4 xl:grid-cols-2">{stages.filter((stage) => stage.nodeType === 'task' && stage.status === 'done' && stage.agentId).map((stage) => <StageFeedbackCard missionId={mission.id} stageId={stage.id} stageName={stage.name} agentName={agents.find((agent) => agent.id === stage.agentId)?.name ?? stage.agentId!} key={stage.id} />)}</div></section> : null}
 
       <Modal open={releaseOpen} onClose={() => setReleaseOpen(false)} title="确认交付并释放资金" description={usesWeb3 ? `钱包将调用 Sepolia 托管合约完成 ${token} 分账；Worker 验证释放事件后更新任务状态。` : '确认后会从 Web2 托管余额结算给开发者，并生成平台费账目。'}>
-        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {currentDeliverables.length} 个当前 attempt URI 交付物 · {completedStageOutputs.length} 个签名阶段输出</div></div>
+        <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(escrowAmount, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {currentDeliverables.length} 个当前 attempt URI 交付物 · {completedStageOutputs.length} 个签名阶段输出</div></div>
         <div className="mt-5 flex justify-end gap-3"><button type="button" className="btn-secondary" onClick={() => setReleaseOpen(false)}>取消</button><button type="button" className="btn-primary" onClick={() => void confirmRelease()} disabled={busy || (usesWeb3 && !onchainSettlement)}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : null}{usesWeb3 ? `链上释放 ${token}` : '余额结算并验收'}</button></div>
         {error ? <p className="mt-3 rounded-xl border border-danger/25 bg-danger/10 p-3 text-sm text-danger" role="alert">{error}</p> : null}
       </Modal>

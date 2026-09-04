@@ -332,7 +332,7 @@ export function ExecutionPage() {
           <div><div className="flex items-center justify-between"><h2 className="font-semibold">Mission Status</h2><span className="font-mono text-2xl font-semibold text-cyan">{mission.progress}%</span></div><div className="mt-3 h-3 overflow-hidden rounded-full bg-canvas"><span className="block h-full rounded-full bg-cyan" style={{ width: `${mission.progress}%` }} /></div></div>
           <div><p className="text-xs text-muted">工作流阶段</p><p className="mt-1 font-mono text-lg font-semibold">{stages.length}</p></div>
           <div><p className="text-xs text-muted">证据事件</p><p className="mt-1 font-mono text-lg font-semibold">{evidenceCount}</p></div>
-          <div><p className="text-xs text-muted">托管账本</p><p className="mt-1 font-mono text-lg font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</p></div>
+          <div><p className="text-xs text-muted">实际托管</p><p className="mt-1 font-mono text-lg font-semibold">{formatPaymentAmount(detail?.escrow?.amount ?? mission.budget, mission.paymentMethod)}</p></div>
         </div>
       </section>
 

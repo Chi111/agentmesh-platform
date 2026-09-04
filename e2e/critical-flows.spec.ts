@@ -646,7 +646,7 @@ test('requester invitations and developer acceptance unlock funding only after e
   };
   const agents = ['one', 'two', 'three'].map((suffix, index) => ({
     id: `agent-${suffix}`, ownerId: profile.id, name: `Agent ${index + 1}`, category: '商业研究', summary: '用于浏览器验收的已激活 Agent。', tags: ['研究'],
-    status: 'active', trustScore: 9, successRate: 90, responseTime: '1.0s', price: 100, jobs: 0, volume: 0, author: profile.displayName,
+    status: 'active', trustScore: 9, successRate: 90, responseTime: '1.0s', price: 90, priceVersion: 1, jobs: 0, volume: 0, author: profile.displayName,
     version: 'v1.0.0', official: false, accent: index === 0 ? 'cyan' : index === 1 ? 'lime' : 'amber', wallet: `0x${String(index + 1).padStart(40, '0')}`,
   }));
   const stages = agents.map((agent, index) => ({
@@ -658,6 +658,7 @@ test('requester invitations and developer acceptance unlock funding only after e
     id: `edge-${index + 1}`, missionId: mission.id, sourceStageId: stages[index].id, targetStageId: stage.id,
   }));
   let offers: Array<Record<string, unknown>> = [];
+  let escrowAmount = mission.budget;
   const token = [
     Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
     Buffer.from(JSON.stringify({ sub: profile.id, email: profile.email, iat: 1_787_200_000, exp: 1_818_736_000 })).toString('base64url'),
@@ -683,10 +684,18 @@ test('requester invitations and developer acceptance unlock funding only after e
       profile.role = (request.postDataJSON() as { role: 'requester' | 'developer' }).role;
       return fulfill(profile);
     }
-    if (path === `/api/missions/${mission.id}`) return fulfill({ mission, stages, edges, offers, events: [], deliverables: [], escrow: { status: 'pending', amount: mission.budget, token: 'CREDIT', network: 'agentmesh' }, disputes: [] });
+    if (path === `/api/missions/${mission.id}`) return fulfill({ mission, stages, edges, offers, events: [], deliverables: [], escrow: { status: 'pending', amount: escrowAmount, token: 'CREDIT', network: 'agentmesh' }, disputes: [] });
     if (path === `/api/missions/${mission.id}/workflow` && request.method() === 'POST') {
-      offers = stages.map((stage, index) => ({ id: `offer-${index + 1}`, missionId: mission.id, stageId: stage.id, agentId: stage.agentId, status: 'pending', expiresAt: '2026-08-21T00:00:00.000Z', respondedAt: null, createdAt: '2026-08-20T00:00:00.000Z', updatedAt: '2026-08-20T00:00:00.000Z' }));
-      return fulfill({ mission, stages, edges, offers });
+      offers = stages.map((stage, index) => ({
+        id: `offer-${index + 1}`, missionId: mission.id, stageId: stage.id, agentId: stage.agentId, status: 'pending',
+        quote: {
+          amount: 93.15, token: 'CREDIT', basePriceUsdc: 90, agentPriceVersion: 1, formulaVersion: 'agentmesh.quote.v1',
+          comparableToBasePrice: true, multipliers: { complexity: 1, urgency: 1.15, expertise: 1, load: 0.9 },
+        },
+        expiresAt: '2026-08-21T00:00:00.000Z', respondedAt: null, createdAt: '2026-08-20T00:00:00.000Z', updatedAt: '2026-08-20T00:00:00.000Z',
+      }));
+      escrowAmount = 279.45;
+      return fulfill({ mission, stages, edges, offers, escrow: { status: 'pending', amount: escrowAmount, token: 'CREDIT', network: 'agentmesh' } });
     }
     const offerMatch = path.match(new RegExp(`^/api/missions/${mission.id}/offers/(.+)$`));
     if (offerMatch && request.method() === 'POST') {
@@ -707,6 +716,7 @@ test('requester invitations and developer acceptance unlock funding only after e
 
   await page.getByRole('button', { name: '发送邀请' }).click();
   await expect(page.getByText('已接单 0/3')).toBeVisible();
+  await expect(page.getByText('当前锁定报价 279.45 CREDIT')).toBeVisible();
   await expect(page.getByRole('button', { name: '邀请已发送' })).toBeDisabled();
 
   const developerRoleButton = page.locator('header').getByRole('button', { name: '开发者' });
@@ -752,6 +762,7 @@ test('requester invitations and developer acceptance unlock funding only after e
 
   await page.goto('/#/developer/jobs');
   await expect(page.getByRole('heading', { name: '接单记录' })).toBeVisible();
+  await expect(page.getByText('93.15 CREDIT', { exact: true }).first()).toBeVisible();
   const previousViewport = page.viewportSize();
   await page.setViewportSize({ width: 390, height: 844 });
   const jobStatusBadge = page.locator('table tbody [data-status-badge]').first();

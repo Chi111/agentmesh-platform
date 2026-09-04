@@ -66,6 +66,12 @@ export function WorkflowPage() {
   const web3PaymentMethod = isWeb3Payment(mission.paymentMethod) ? mission.paymentMethod : null;
   const usesWeb3 = web3PaymentMethod !== null;
   const token = paymentToken(mission.paymentMethod);
+  const fundingAmount = detail.escrow?.amount ?? mission.budget;
+  const platformFeeRate = detail.escrow?.platformFeeRate ?? 0.004;
+  const quoteTotal = Number(detail.offers.reduce((sum, offer) => {
+    const stage = taskStages.find((candidate) => candidate.id === offer.stageId);
+    return sum + ((offer.quote?.amount ?? 0) > 0 ? offer.quote!.amount : stage?.budget ?? 0);
+  }, 0).toFixed(mission.paymentMethod === 'web3_seth' ? 6 : 2));
 
   const execute = async (action: () => Promise<void>) => {
     setBusy(true);
@@ -136,10 +142,11 @@ export function WorkflowPage() {
       const recipients = web3PaymentMethod ? taskStages.map((stage) => {
         const wallet = agents.find((agent) => agent.id === stage.agentId)?.wallet;
         if (!wallet) throw new Error(`“${stage.name}”对应 Agent 尚未配置结算钱包。`);
-        return { address: wallet, weight: stage.budget };
+        const quote = offerByStage.get(stage.id)?.quote?.amount;
+        return { address: wallet, weight: quote && quote > 0 ? quote : stage.budget };
       }) : [];
       const depositTxHash = web3PaymentMethod
-        ? await depositEscrow(mission.id, mission.budget, web3PaymentMethod, recipients)
+        ? await depositEscrow(mission.id, fundingAmount, web3PaymentMethod, recipients)
         : null;
       await startMission(mission.id, depositTxHash);
       setStartOpen(false);
@@ -190,7 +197,7 @@ export function WorkflowPage() {
       <section className="panel flex shrink-0 items-center gap-3 px-3 py-2.5 sm:px-4">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2"><h2 className="text-xs font-semibold sm:text-sm">邀请与托管</h2><StatusBadge tone={allAccepted ? 'success' : detail.offers.length ? 'warning' : 'neutral'}>{allAccepted ? '全部接单' : detail.offers.length ? `已接单 ${acceptedCount}/${taskStages.length}` : '尚未发送'}</StatusBadge></div>
-          <p className="mt-1 truncate text-[10px] text-muted sm:text-xs">任务节点预算 {formatPaymentAmount(mission.budget, mission.paymentMethod)}；Gate 不参与分账，任务 Agent 接单后启动并行调度。</p>
+          <p className="mt-1 truncate text-[10px] text-muted sm:text-xs">预算上限 {formatPaymentAmount(mission.budget, mission.paymentMethod)}{detail.offers.length ? `；当前锁定报价 ${formatPaymentAmount(quoteTotal, mission.paymentMethod)}` : '；确认邀请后锁定动态报价'}。</p>
         </div>
         {detail.offers.length && !allAccepted ? <button type="button" className="flex size-9 shrink-0 items-center justify-center rounded-xl border border-line text-muted transition hover:bg-canvas hover:text-ink" aria-label="刷新接单状态" onClick={() => void refresh()} disabled={refreshing}>{refreshing ? <LoaderCircle size={14} className="animate-spin" /> : <RefreshCw size={14} />}</button> : null}
         <button type="button" className="btn-primary !min-h-9 shrink-0 !px-3 !py-1.5 !text-xs" disabled={!allAccepted || locked} onClick={() => setStartOpen(true)}><span className="hidden sm:inline">确认托管并启动</span><span className="sm:hidden">启动</span><ArrowRight size={15} /></button>
@@ -199,8 +206,9 @@ export function WorkflowPage() {
       <Modal open={startOpen} onClose={() => setStartOpen(false)} title="确认托管并启动 DAG" description={usesWeb3 ? `钱包将把 ${token} 存入 Sepolia 托管合约；根节点会并行派发。` : '平台将锁定 Web2 余额；所有就绪根节点会写入派发队列。'}>
         <div className="rounded-xl border border-line bg-canvas p-4">
           <div className="flex items-center justify-between"><span className="inline-flex min-w-0 items-center gap-2 text-sm font-semibold">{usesWeb3 ? <WalletCards className="shrink-0" size={17} /> : <Database className="shrink-0" size={17} />}<span className="truncate">{usesWeb3 ? walletAddress ? ensName ?? shortWalletAddress(walletAddress) : linkedWalletAddress ? ensName ? `${ensName} · 钱包连接已中断` : '钱包连接已中断' : '需要关联 EVM 钱包' : 'Web2 充值余额'}</span></span><span className="mono-chip">{usesWeb3 ? 'SEPOLIA' : 'BALANCE'}</span></div>
-          <p className="mt-3 font-mono text-xl font-semibold">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</p>
-          <p className="mt-3 text-xs leading-5 text-muted"><LockKeyhole size={14} className="mr-1.5 inline text-cyan" />启动后节点、连线、预算和 Agent 全部锁定。</p>
+          <p className="mt-3 font-mono text-xl font-semibold">{formatPaymentAmount(fundingAmount, mission.paymentMethod)}</p>
+          <dl className="mt-3 space-y-2 border-t border-line pt-3 text-xs"><div className="flex justify-between"><dt className="text-muted">原预算上限</dt><dd className="font-mono">{formatPaymentAmount(mission.budget, mission.paymentMethod)}</dd></div><div className="flex justify-between"><dt className="text-muted">内含协议费</dt><dd className="font-mono">{formatPaymentAmount(fundingAmount * platformFeeRate, mission.paymentMethod)}</dd></div><div className="flex justify-between"><dt className="text-muted">未锁定余额</dt><dd className="font-mono">{formatPaymentAmount(Math.max(0, mission.budget - fundingAmount), mission.paymentMethod)}</dd></div></dl>
+          <p className="mt-3 text-xs leading-5 text-muted"><LockKeyhole size={14} className="mr-1.5 inline text-cyan" />只锁定已接受报价；启动后节点、报价版本、预算和 Agent 全部固定。</p>
           {!usesWeb3 ? <Link className="mt-3 inline-flex text-xs font-semibold text-cyan" to="/wallet/test-funds">余额不足？领取测试充值</Link> : null}
         </div>
         <div className="mt-5 flex justify-end gap-3"><button type="button" className="btn-secondary" onClick={() => setStartOpen(false)}>取消</button>{usesWeb3 && !walletAddress && !linkedWalletAddress ? <button type="button" className="btn-signal" onClick={openWalletLink}>关联钱包</button> : <button type="button" className="btn-primary" onClick={() => void confirmEscrow().catch(() => undefined)} disabled={busy || (usesWeb3 && !onchainSettlement)}>{busy ? <LoaderCircle size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}{usesWeb3 ? `托管 ${token} 并启动` : '余额扣款并启动'}</button>}</div>

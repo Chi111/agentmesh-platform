@@ -1,5 +1,6 @@
 import type { Agent, CandidateMatch, Mission, UserContext, WorkflowEdge, WorkflowStage } from './contracts';
-import { paymentBudgetPrecision } from './payments';
+import { allocatePaymentBudget } from './payments';
+import { quoteStage } from './pricing';
 import { linearEdges } from './workflowGraph';
 
 export function makeId(prefix: string): string {
@@ -63,8 +64,8 @@ export function parseLlmCompilation(content: string, mission: Mission): Workflow
     const value = Number(stage.budget ?? 0);
     return Number.isFinite(value) && value > 0 ? value : mission.budget / taskRows.length;
   });
-  const requestedTotal = requestedBudgets.reduce((sum, value) => sum + value, 0) || 1;
-  const precision = paymentBudgetPrecision(mission.paymentMethod);
+  const allocatedBudgets = allocatePaymentBudget(requestedBudgets, mission.budget, mission.paymentMethod);
+  if (!allocatedBudgets) return null;
   let taskIndex = 0;
   const externalIds = new Map<string, string>();
   const stages: WorkflowStage[] = rawStages.map((stage, index) => {
@@ -72,7 +73,7 @@ export function parseLlmCompilation(content: string, mission: Mission): Workflow
     const externalId = typeof stage.id === 'string' && stage.id.trim() ? stage.id.trim() : String(index + 1);
     externalIds.set(externalId, id);
     const nodeType = stage.nodeType === 'approval' ? 'approval' : 'task';
-    const requestedBudget = nodeType === 'task' ? requestedBudgets[taskIndex++] : 0;
+    const allocatedBudget = nodeType === 'task' ? allocatedBudgets[taskIndex++] : 0;
     return {
     id,
     missionId: mission.id,
@@ -84,7 +85,7 @@ export function parseLlmCompilation(content: string, mission: Mission): Workflow
     name: typeof stage.name === 'string' && stage.name.trim() ? stage.name.trim().slice(0, 120) : `执行阶段 ${index + 1}`,
     purpose: typeof stage.purpose === 'string' ? stage.purpose.trim().slice(0, 600) : '',
     category: typeof stage.category === 'string' && stage.category.trim() ? stage.category.trim().slice(0, 80) : mission.category,
-    budget: nodeType === 'task' ? Number((mission.budget * (requestedBudget / requestedTotal)).toFixed(precision)) : 0,
+    budget: allocatedBudget,
     status: 'queued',
     agentId: null,
     input: (() => {
@@ -114,10 +115,8 @@ export function parseLlmCompilation(content: string, mission: Mission): Workflow
     createdAt: now,
     updatedAt: now,
   }; });
-  const allocated = stages.reduce((sum, stage) => sum + stage.budget, 0);
   const finalTask = [...stages].reverse().find((stage) => stage.nodeType === 'task');
   if (!finalTask) return null;
-  finalTask.budget = Number((finalTask.budget + mission.budget - allocated).toFixed(precision));
   const rawEdges = Array.isArray(parsed.edges) ? parsed.edges as Array<Record<string, unknown>> : [];
   const edges = rawEdges.flatMap((edge) => {
     const source = externalIds.get(String(edge.source ?? edge.sourceStageId ?? ''));
@@ -142,7 +141,12 @@ export function parseLlmCompilation(content: string, mission: Mission): Workflow
   };
 }
 
-export function matchCandidates(mission: Mission, stages: WorkflowStage[], agents: Agent[]): CandidateMatch[] {
+export function matchCandidates(
+  mission: Mission,
+  stages: WorkflowStage[],
+  agents: Agent[],
+  loadMultiplierByAgent = new Map<string, number>(),
+): CandidateMatch[] {
   const activeAgents = agents.filter((agent) => agent.status === 'active');
   const missionTags = mission.tags.map(normalize);
   return stages.filter((stage) => stage.nodeType === 'task').map((stage) => {
@@ -157,9 +161,10 @@ export function matchCandidates(mission: Mission, stages: WorkflowStage[], agent
       const reputation = agent.quality?.reputation;
       const trustScore = Math.min(20, reputation === undefined ? agent.trustScore * 2 : reputation / 5);
       const qualityScore = Math.min(10, agent.quality ? agent.quality.breakdown.quality / 3 : agent.successRate / 10);
-      const hasComparableReferencePrice = mission.paymentMethod !== 'web3_seth';
+      const quote = quoteStage(mission, stage, agent, loadMultiplierByAgent.get(agent.id) ?? 1);
+      const hasComparableReferencePrice = quote.comparableToBasePrice;
       const priceScore = hasComparableReferencePrice
-        ? agent.price <= stage.budget ? 10 : Math.max(0, 10 - ((agent.price - stage.budget) / Math.max(stage.budget, 1)) * 10)
+        ? quote.amount <= stage.budget ? 10 : Math.max(0, 10 - ((quote.amount - stage.budget) / Math.max(stage.budget, 1)) * 10)
         : 5;
       const fairness = stableNoise(`${mission.id}:${stage.id}:${agent.id}`) * 2;
       const exposureAdjustment = agent.quality?.newAgent ? -6 : agent.quality?.premium ? 2 : 0;
@@ -171,12 +176,17 @@ export function matchCandidates(mission: Mission, stages: WorkflowStage[], agent
           ? `信誉 ${agent.quality.reputation.toFixed(1)} · ${agent.quality.confidence === 'low' ? '低' : agent.quality.confidence === 'medium' ? '中' : '高'}置信度`
           : `信任分 ${agent.trustScore.toFixed(1)} · 成功率 ${agent.successRate.toFixed(1)}%`,
         hasComparableReferencePrice
-          ? agent.price <= stage.budget ? '报价处于阶段预算内' : '报价高于阶段预算'
+          ? quote.amount <= stage.budget ? `动态报价 ${quote.amount} 处于阶段预算内` : `动态报价 ${quote.amount} 高于阶段预算`
           : 'sETH 任务不与法币参考价直接比较',
         agent.quality?.newAgent ? '新 Agent 低置信度限量曝光' : agent.quality?.premium ? '高质量历史获得稳定曝光' : '使用标准公平曝光权重',
       ];
-      return { agent, score, reasons };
-    }).sort((left, right) => right.score - left.score || left.agent.id.localeCompare(right.agent.id));
+      return { agent, score, reasons, quote };
+    }).sort((left, right) => {
+      const leftOverBudget = left.quote.comparableToBasePrice && left.quote.amount > stage.budget;
+      const rightOverBudget = right.quote.comparableToBasePrice && right.quote.amount > stage.budget;
+      if (leftOverBudget !== rightOverBudget) return leftOverBudget ? 1 : -1;
+      return right.score - left.score || left.agent.id.localeCompare(right.agent.id);
+    });
     return { stageId: stage.id, stageName: stage.name, candidates: ranked.slice(0, 5) };
   });
 }

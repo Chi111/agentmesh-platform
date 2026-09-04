@@ -40,3 +40,33 @@ export function isWeb3Payment(method: PaymentMethod): method is Web3PaymentMetho
 export function paymentBudgetPrecision(method: PaymentMethod): number {
   return method === 'web3_seth' ? 6 : 2;
 }
+
+export function minimumPaymentAmount(method: PaymentMethod): number {
+  return 10 ** -paymentBudgetPrecision(method);
+}
+
+export function hasValidPaymentPrecision(amount: number, method: PaymentMethod): boolean {
+  const scale = 10 ** paymentBudgetPrecision(method);
+  const units = Math.round(amount * scale);
+  return Math.abs(units / scale - amount) <= Number.EPSILON * Math.max(1, amount) * 8;
+}
+
+/** Allocate a rounded total while reserving one billable unit per task. */
+export function allocatePaymentBudget(weights: number[], budget: number, method: PaymentMethod): number[] | null {
+  if (weights.length === 0) return null;
+  const precision = paymentBudgetPrecision(method);
+  const scale = 10 ** precision;
+  const totalUnits = Math.round(budget * scale);
+  if (!hasValidPaymentPrecision(budget, method) || totalUnits < weights.length) return null;
+  const normalizedWeights = weights.map((weight) => Number.isFinite(weight) && weight > 0 ? weight : 1);
+  const totalWeight = normalizedWeights.reduce((sum, weight) => sum + weight, 0);
+  const distributableUnits = totalUnits - weights.length;
+  const rawExtras = normalizedWeights.map((weight) => distributableUnits * weight / totalWeight);
+  const units = rawExtras.map((value) => Math.floor(value) + 1);
+  let remainder = totalUnits - units.reduce((sum, value) => sum + value, 0);
+  const remainderOrder = rawExtras
+    .map((value, index) => ({ index, fraction: value - Math.floor(value) }))
+    .sort((left, right) => right.fraction - left.fraction || left.index - right.index);
+  for (let index = 0; index < remainder; index += 1) units[remainderOrder[index % remainderOrder.length].index] += 1;
+  return units.map((value) => value / scale);
+}
