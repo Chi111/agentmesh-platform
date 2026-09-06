@@ -1,4 +1,6 @@
-import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, Download, ExternalLink, FileCheck2, FileQuestion, Fingerprint, Link2, LoaderCircle, LockKeyhole, MessageSquareText, RefreshCw, Scale, ShieldCheck, Wrench } from 'lucide-react';
+import { hasCurrentOutcomePackage } from '../../../shared/outcomePackage';
+import { CollaborationPanel } from '../components/CollaborationPanel';
+import { AlertTriangle, ArrowLeft, Check, CircleDollarSign, Clock3, Download, ExternalLink, FileCheck2, FileQuestion, Fingerprint, Link2, LoaderCircle, LockKeyhole, RefreshCw, Scale, ShieldCheck, Wrench } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
@@ -13,42 +15,6 @@ import { artifactBelongsToCurrentAttempt, deliveryReadiness, isClientReadyArtifa
 import { missionStatusMeta } from '../utils/missionState';
 import { api } from '../services/api';
 import type { Deliverable, ReviewDossierResponse } from '../types/domain';
-
-function StageFeedbackCard({ missionId, stageId, stageName, agentName }: { missionId: string; stageId: string; stageName: string; agentName: string }) {
-  const [deliveryQuality, setDeliveryQuality] = useState(5);
-  const [requirementsFit, setRequirementsFit] = useState(5);
-  const [communication, setCommunication] = useState(5);
-  const [onTime, setOnTime] = useState(true);
-  const [reuse, setReuse] = useState(true);
-  const [comment, setComment] = useState('');
-  const [version, setVersion] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    let cancelled = false;
-    void api.getAgentFeedback(missionId, stageId).then((feedback) => {
-      if (cancelled || !feedback) return;
-      setDeliveryQuality(feedback.deliveryQuality); setRequirementsFit(feedback.requirementsFit); setCommunication(feedback.communication);
-      setOnTime(feedback.onTime); setReuse(feedback.reuse); setComment(feedback.comment); setVersion(feedback.version);
-    }).catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [missionId, stageId]);
-
-  const submit = async () => {
-    setBusy(true); setError('');
-    try {
-      const result = await api.saveAgentFeedback(missionId, stageId, { deliveryQuality, requirementsFit, communication, onTime, reuse, comment });
-      setVersion(result.feedback.version);
-    } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : '反馈保存失败。');
-    } finally { setBusy(false); }
-  };
-
-  return <article className="rounded-2xl border border-line bg-canvas/35 p-5"><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{stageName}</p><p className="mt-1 text-xs text-muted">{agentName} · 仅已结算反馈进入信誉分</p></div>{version ? <StatusBadge tone="success">已保存 V{version}</StatusBadge> : <StatusBadge tone="neutral">待评价</StatusBadge>}</div><div className="mt-4 grid gap-3 sm:grid-cols-3">{[
-    ['交付质量', deliveryQuality, setDeliveryQuality], ['需求符合度', requirementsFit, setRequirementsFit], ['沟通质量', communication, setCommunication],
-  ].map(([label, value, setter]) => <label key={String(label)}><span className="field-label">{String(label)}</span><select className="field" value={Number(value)} onChange={(event) => (setter as (next: number) => void)(Number(event.target.value))}>{[5, 4, 3, 2, 1].map((score) => <option value={score} key={score}>{score} / 5</option>)}</select></label>)}</div><div className="mt-4 flex flex-wrap gap-5 text-xs"><label className="inline-flex items-center gap-2"><input type="checkbox" checked={onTime} onChange={(event) => setOnTime(event.target.checked)} />准时交付</label><label className="inline-flex items-center gap-2"><input type="checkbox" checked={reuse} onChange={(event) => setReuse(event.target.checked)} />愿意再次使用</label></div><label className="mt-4 block"><span className="field-label">公开说明（可选）</span><textarea className="field min-h-24" value={comment} maxLength={1000} onChange={(event) => setComment(event.target.value)} placeholder="说明交付亮点、偏差或改进建议；不要填写密钥和隐私信息。" /></label><div className="mt-4 flex items-center justify-between gap-3">{error ? <p className="text-xs text-danger">{error}</p> : <p className="text-[10px] text-muted">修改会生成新版本，旧版本保留在审计历史中。</p>}<button type="button" className="btn-secondary shrink-0" disabled={busy} onClick={() => void submit()}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <MessageSquareText size={14} />}{version ? '更新反馈' : '提交反馈'}</button></div></article>;
-}
 
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -134,7 +100,8 @@ export function AcceptancePage() {
   const historicalDeliverables = deliverables.filter((deliverable) => !currentDeliverableIds.has(deliverable.id));
   const stagesWithOutgoingEdges = new Set((detail?.edges ?? []).map((edge) => edge.sourceStageId));
   const terminalStageIds = new Set(stages.filter((stage) => stage.nodeType === 'task' && !stagesWithOutgoingEdges.has(stage.id)).map((stage) => stage.id));
-  const preferredDeliverable = [...currentDeliverables].reverse().find((item) => item.stageId && terminalStageIds.has(item.stageId))
+  const verifiedOutcome = mission?.deliveryPolicy === 'outcome_v1' ? [...currentDeliverables].reverse().find(item => hasCurrentOutcomePackage(mission,stages,[item])) : undefined;
+  const preferredDeliverable = verifiedOutcome ?? [...currentDeliverables].reverse().find((item) => item.stageId && terminalStageIds.has(item.stageId))
     ?? [...currentDeliverables].reverse().find((item) => {
     const stage = item.stageId ? stagesById.get(item.stageId) : null;
     return stage?.input?.executionMode === 'implement';
@@ -152,7 +119,7 @@ export function AcceptancePage() {
     ? selectedStageOutputRecord.source
     : null;
   const selectedStageIsFallback = selectedStageSource === 'deterministic-fallback';
-  const selectedIsMissionPackage = Boolean(selectedDeliverable?.stageId && terminalStageIds.has(selectedDeliverable.stageId));
+  const selectedIsMissionPackage = Boolean(selectedDeliverable?.ipfsEvidence?.manifest.outcomePackage || (mission?.deliveryPolicy !== 'outcome_v1' && selectedDeliverable?.stageId && terminalStageIds.has(selectedDeliverable.stageId)));
   const selectedPackageFileCount = selectedDeliverable?.ipfsEvidence?.manifest.files.length ?? 0;
   const selectedPackageWorkstreamCount = selectedDeliverable?.ipfsEvidence?.manifest.files.filter((file) => file.path.startsWith('workstreams/')).length ?? 0;
   const selectedPackageSections = selectedIsMissionPackage ? stages
@@ -182,7 +149,7 @@ export function AcceptancePage() {
   const finalStageResult = objectValue(finalStageOutput)?.result;
   const finalDeliverable = objectValue(finalStageResult)?.deliverable ?? finalStageOutput;
   const finalDeliverableText = deliverableText(finalDeliverable);
-  const readiness = deliveryReadiness(stages, deliverables);
+  const readiness = deliveryReadiness(stages, deliverables, mission);
   const hasAcceptableOutput = readiness.ready;
   const evidenceCount = detail?.events.length ?? 0;
   const activeDispute = detail?.disputes.some((item) => item.status === 'open' || item.status === 'reviewing') ?? false;
@@ -309,9 +276,10 @@ export function AcceptancePage() {
               {selectedDeliverable.ipfsEvidence.supersedesDeliverableId ? <p className="mt-3 break-all text-[10px] text-white/45">父版本 {selectedDeliverable.ipfsEvidence.supersedesDeliverableId} · {selectedDeliverable.ipfsEvidence.manifest.supersedesRootCid}</p> : <p className="mt-3 text-[10px] text-white/45">该 scope 的首个版本</p>}
               {selectedManifestDiff && parentDeliverable ? <div className="mt-3 grid grid-cols-3 gap-2 text-center text-[10px]"><div className="rounded-lg bg-white/5 p-2"><p className="font-mono text-lime">+{selectedManifestDiff.added.length}</p><p className="mt-1 text-white/40">新增文件</p></div><div className="rounded-lg bg-white/5 p-2"><p className="font-mono text-warning">~{selectedManifestDiff.changed.length}</p><p className="mt-1 text-white/40">内容变化</p></div><div className="rounded-lg bg-white/5 p-2"><p className="font-mono text-danger">-{selectedManifestDiff.removed.length}</p><p className="mt-1 text-white/40">删除文件</p></div><details className="col-span-3 text-left"><summary className="cursor-pointer font-semibold text-cyan">查看 Manifest 文件差异</summary><div className="mt-2 space-y-1 font-mono text-[9px] text-white/55">{selectedManifestDiff.added.map((path) => <p key={`add-${path}`}>+ {path}</p>)}{selectedManifestDiff.changed.map((path) => <p key={`change-${path}`}>~ {path}</p>)}{selectedManifestDiff.removed.map((path) => <p key={`remove-${path}`}>- {path}</p>)}{selectedManifestDiff.added.length + selectedManifestDiff.changed.length + selectedManifestDiff.removed.length === 0 ? <p>文件清单没有变化</p> : null}</div></details></div> : null}
               {selectedDeliverable.ipfsEvidence.lastVerificationError ? <p className="mt-2 text-[10px] text-warning">{selectedDeliverable.ipfsEvidence.lastVerificationError}</p> : null}
-            </div> : <div className="mt-4 rounded-xl border border-warning/20 bg-warning/10 p-3 text-xs text-white/50">Legacy URI 交付：可继续验收，但不具备 PinMe CID 版本与 Gateway Manifest 验证。</div>}
-            {currentDeliverables.length > 1 ? <div className="mt-4 flex flex-wrap gap-2">{currentDeliverables.map((item) => <button type="button" className={`rounded-lg border px-3 py-2 text-xs transition ${selectedDeliverable?.id === item.id ? 'border-cyan bg-cyan/10 text-white' : 'border-white/10 text-white/45 hover:text-white'}`} onClick={() => setSelectedDeliverableId(item.id)} key={item.id}>{item.stageId && terminalStageIds.has(item.stageId) ? '完整成果包' : item.name}{item.ipfsEvidence ? ` · v${item.ipfsEvidence.versionNo}` : ''}</button>)}</div> : null}
+            </div> : <div className="mt-4 rounded-xl border border-warning/20 bg-warning/10 p-3 text-xs text-white/50">Legacy URI 阶段交付：不具备 PinMe CID 版本与 Gateway Manifest 验证；是否可验收以任务交付策略为准。</div>}
+            {currentDeliverables.length > 1 ? <div className="mt-4 flex flex-wrap gap-2">{currentDeliverables.map((item) => <button type="button" className={`rounded-lg border px-3 py-2 text-xs transition ${selectedDeliverable?.id === item.id ? 'border-cyan bg-cyan/10 text-white' : 'border-white/10 text-white/45 hover:text-white'}`} onClick={() => setSelectedDeliverableId(item.id)} key={item.id}>{item.ipfsEvidence?.manifest.outcomePackage ? '完整成果包' : item.name}{item.ipfsEvidence ? ` · v${item.ipfsEvidence.versionNo}` : ''}</button>)}</div> : null}
             {historicalDeliverables.length > 0 ? <p className="mt-4 text-xs leading-5 text-white/45">{historicalDeliverables.length} 个历史 attempt 或已拒绝制品已保留，仅供审计，不参与当前验收。</p> : null}
+            {readiness.missingOutcomePackage ? <div className="mt-4 rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-warning">尚缺当前版本的完整成果包，或其 Manifest 尚未验证。请提交包含主报告、验收报告、制品索引和全部节点版本记录的成果包，再执行证据验证。</div> : null}
             {readiness.missingArtifactStages.length > 0 ? <div className="mt-4 rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-warning"><p className="font-semibold">缺少真实工程制品，暂不可验收</p><p className="mt-1 text-xs leading-5 text-white/55">以下 Implement 节点尚未提交可下载 artifact：{readiness.missingArtifactStages.map((stage) => stage.name).join('、')}</p></div> : null}
           </div>
 
@@ -338,7 +306,7 @@ export function AcceptancePage() {
         <div className="mt-6 grid gap-4 md:grid-cols-3">{stages.map((stage, index) => <article className="rounded-xl border border-line bg-canvas/40 p-4" key={stage.id}><div className="flex items-center justify-between"><span className={`flex size-8 items-center justify-center rounded-full ${stage.status === 'done' ? 'bg-lime/20 text-lime-700' : stage.status === 'running' ? 'bg-cyan/15 text-cyan' : stage.status === 'failed' ? 'bg-danger/10 text-danger' : 'bg-canvas text-muted'}`}><ShieldCheck size={16} /></span><StatusBadge tone={stage.status === 'done' ? 'success' : stage.status === 'running' ? 'info' : stage.status === 'failed' ? 'danger' : 'neutral'}>{stage.status === 'done' ? '完成' : stage.status === 'running' ? '执行中' : stage.status === 'failed' ? '失败' : '等待'}</StatusBadge></div><p className="mt-3 font-mono text-[9px] text-muted">STAGE {String(index + 1).padStart(2, '0')}</p><h3 className="mt-2 text-sm font-semibold">{stage.name}</h3><p className="mt-2 text-xs leading-5 text-muted">{stage.status === 'done' ? stage.output ? 'Agent 输出与阶段状态已写入证据链。' : '阶段已完成，等待或已提交最终交付。' : stage.status === 'running' ? 'Agent 正在执行，等待签名回调。' : stage.status === 'failed' ? '节点未产生有效交付，等待任务方处理后重试。' : '等待上游依赖满足后派发。'}</p><span className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-cyan"><Link2 size={13} />{detail?.events.filter((event) => event.stageId === stage.id).length ?? 0} 个阶段事件</span></article>)}</div>
       </section>
 
-      {mission.status === 'completed' && role === 'requester' && !detail?.disputes.some((item) => item.status === 'resolved') ? <section className="panel p-5 md:p-6"><div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-xl bg-cyan/10 text-cyan"><MessageSquareText size={18} /></span><div><h2 className="font-semibold">Agent 结构化反馈</h2><p className="mt-1 text-xs text-muted">每个已结算任务节点可评价一次；更新会版本化，退款或有效争议不会进入信誉分。</p></div></div><div className="mt-5 grid gap-4 xl:grid-cols-2">{stages.filter((stage) => stage.nodeType === 'task' && stage.status === 'done' && stage.agentId).map((stage) => <StageFeedbackCard missionId={mission.id} stageId={stage.id} stageName={stage.name} agentName={agents.find((agent) => agent.id === stage.agentId)?.name ?? stage.agentId!} key={stage.id} />)}</div></section> : null}
+      <CollaborationPanel missionId={mission.id} />
 
       <Modal open={releaseOpen} onClose={() => setReleaseOpen(false)} title="确认交付并释放资金" description={usesWeb3 ? `钱包将调用 Sepolia 托管合约完成 ${token} 分账；Worker 验证释放事件后更新任务状态。` : '确认后会从 Web2 托管余额结算给开发者，并生成平台费账目。'}>
         <div className="rounded-xl border border-line bg-canvas p-4"><div className="flex items-center justify-between"><span className="text-sm text-muted">释放总额</span><span className="font-mono text-lg font-semibold">{formatPaymentAmount(escrowAmount, mission.paymentMethod)}</span></div><div className="mt-3 flex items-center gap-2 text-xs text-muted"><ShieldCheck size={14} className="text-lime" />{evidenceCount} 个事件 · {currentDeliverables.length} 个当前 attempt URI 交付物 · {completedStageOutputs.length} 个签名阶段输出</div></div>

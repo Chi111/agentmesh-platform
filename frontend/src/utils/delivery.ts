@@ -1,3 +1,5 @@
+import { hasCurrentOutcomePackage } from '../../../shared/outcomePackage';
+import type { Mission } from '../types/domain';
 import type { Deliverable, MissionChangeRequest, WorkflowStage } from '../types/domain';
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -54,7 +56,7 @@ export function missionDeliverableBelongsToCurrentVersion(
   return Number.isFinite(deliveredAt) && Number.isFinite(latestChangeAt) && deliveredAt >= latestChangeAt;
 }
 
-export function deliveryReadiness(stages: WorkflowStage[], deliverables: Deliverable[]) {
+export function deliveryReadiness(stages: WorkflowStage[], deliverables: Deliverable[], mission?: Mission) {
   const taskStages = stages.filter((stage) => stage.nodeType === 'task').sort((left, right) => (
     (left.position ?? 0) - (right.position ?? 0)
   ));
@@ -69,7 +71,8 @@ export function deliveryReadiness(stages: WorkflowStage[], deliverables: Deliver
   )));
   const invalidOutputStages = stages.filter((stage) => !meaningfulOutput(stage));
   return {
-    ready: stages.length > 0 && invalidOutputStages.length === 0 && missingArtifactStages.length === 0,
+    missingOutcomePackage: Boolean(mission && !hasCurrentOutcomePackage(mission, stages, deliverables)),
+    ready: (!mission || hasCurrentOutcomePackage(mission, stages, deliverables)) && stages.length > 0 && invalidOutputStages.length === 0 && missingArtifactStages.length === 0,
     missingArtifactStages,
     invalidOutputStages,
   };

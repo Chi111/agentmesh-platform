@@ -1,3 +1,4 @@
+import { ArbitrationCollaboration, ArbitrationOperations } from '../components/ArbitrationCollaboration';
 import {
   AlertTriangle,
   ArrowRight,
@@ -279,6 +280,8 @@ export function ArbitrationPage() {
         actions={<span className="mono-chip">SNAPSHOT · APPEAL · QUEUE</span>}
       />
 
+      <ArbitrationOperations />
+      {selectedCase && <ArbitrationCollaboration key={selectedCase.id} disputeId={selectedCase.id} revision={`${governance?.votes.length}:${governance?.proposal?.status}`} />}
       <section className="grid gap-3 sm:grid-cols-3">
         {metrics.map(({ Icon, value, label }) => (
           <article className="panel flex items-center gap-4 p-4" key={label}>

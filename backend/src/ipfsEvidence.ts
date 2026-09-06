@@ -167,12 +167,25 @@ export async function parseIpfsEvidence(
   if (totalBytes > MAX_TOTAL_BYTES) throw new IpfsEvidenceError('INVALID_MANIFEST', 'Manifest totalBytes exceeds the v1 limit');
   const supersedesRootCidRaw = nullableString(source.supersedesRootCid);
   const supersedesRootCid = supersedesRootCidRaw ? normalizeCid(supersedesRootCidRaw) : null;
+  let outcomePackage: DeliverableManifest['outcomePackage'];
+  if (source.outcomePackage !== undefined) {
+    const proof = source.outcomePackage as Record<string, unknown>;
+    if (!proof || proof.schema !== 'agentmesh.mission-outcome.v1' || !Number.isInteger(proof.workflowVersion) || Number(proof.workflowVersion) < 1
+      || !Array.isArray(proof.stages) || !proof.stages.length || proof.stages.length > 200
+      || proof.stages.some(p => !p || typeof p.stageId !== 'string' || !p.stageId || !Number.isInteger(p.attemptNo) || p.attemptNo < 1)
+      || new Set(proof.stages.map(p => p.stageId)).size !== proof.stages.length) {
+      throw new IpfsEvidenceError('INVALID_MANIFEST', 'Invalid outcome package version or stage coverage');
+    }
+    outcomePackage = { schema: 'agentmesh.mission-outcome.v1', workflowVersion: Number(proof.workflowVersion),
+      stages: proof.stages.map(p => ({ stageId: p.stageId, attemptNo: p.attemptNo })) };
+  }
   const manifest: DeliverableManifest = {
     schema: 'agentmesh.deliverable-manifest.v1', missionId: expected.missionId, stageId: expected.stageId,
     attemptNo: expected.attemptNo, agentId: expected.agentId, logicalName: expected.logicalName, versionNo,
     supersedesRootCid, acceptanceCriteriaSha256: expected.acceptanceCriteriaSha256,
     ...(hasEncryptionFingerprint ? { encryptionKeyFingerprint } : {}), createdAt,
     generator: stringField(source, 'generator', 120), files,
+    ...(outcomePackage ? { outcomePackage } : {}),
   };
   return {
     provider: 'pinme_ipfs', rootCid, manifestPath: '/manifest.json', manifestSha256, manifest,

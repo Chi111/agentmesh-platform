@@ -1,3 +1,5 @@
+import type { MatchPlan, MatchPreference } from '../../../../shared/matching';
+import { meetsRequiredCapabilities, parseRequiredCapabilities } from '../../../../shared/agentRequirements';
 import '@xyflow/react/dist/style.css';
 import {
   Background,
@@ -82,6 +84,7 @@ interface Props {
   offers: StageOffer[];
   locked: boolean;
   busy: boolean;
+  onMatch?: (locks:Record<string,string>, preference:MatchPreference) => Promise<MatchPlan>;
   onCompile: () => Promise<void>;
   onSave: (stages: WorkflowStage[], edges: WorkflowEdge[], viewport: WorkflowViewport) => Promise<void>;
   onConfirm: () => Promise<void>;
@@ -119,6 +122,7 @@ function automaticRecommendation(
 ): Candidate | null {
   const candidate = match?.candidates[0];
   if (!candidate || candidate.agent.status !== 'active' || candidate.score < AUTO_MATCH_MIN_SCORE) return null;
+  if (!meetsRequiredCapabilities(candidate.agent, stage.input?.requiredCapabilities)) return null;
   const runnerUp = match?.candidates[1];
   if (runnerUp && candidate.score - runnerUp.score < AUTO_MATCH_MIN_LEAD) return null;
   if (!categoriesMatch(stage.category, candidate.agent.category)) return null;
@@ -136,6 +140,7 @@ function selectionWarnings(
   const selectedCandidate = match?.candidates.find((candidate) => candidate.agent.id === selectedAgent.id);
   const recommendation = match?.candidates[0];
   const warnings: string[] = [];
+  if (!meetsRequiredCapabilities(selectedAgent, stage.input?.requiredCapabilities)) warnings.push('该 Agent 缺少节点必需能力标签，不能发送邀请。');
   if (match?.candidates.length && !selectedCandidate) warnings.push('该 Agent 未进入当前节点 Top 5，暂无可比较的候选分数。');
   if (selectedCandidate && selectedCandidate.score < AUTO_MATCH_MIN_SCORE) {
     warnings.push(`当前匹配分 ${selectedCandidate.score.toFixed(1)}，低于自动匹配阈值 ${AUTO_MATCH_MIN_SCORE}。`);
@@ -224,6 +229,7 @@ function graphError(nodes: FlowNode[], edges: FlowEdge[], mission: Mission, requ
       const minimumBudget = mission.paymentMethod === 'web3_seth' ? 0.000001 : 0.01;
       if (stage.budget < minimumBudget) return `“${stage.name}”的预算不能低于 ${formatPaymentAmount(minimumBudget, mission.paymentMethod)}。`;
       if (stage.category.trim().length < 2) return `“${stage.name}”需要任务分类。`;
+      if (parseRequiredCapabilities(stage.input?.requiredCapabilities) === null) return `“${stage.name}”的必需能力标签无效，最多选择 20 项。`;
       const mode = String(stage.input?.executionMode ?? 'analyze');
       if (!['analyze', 'implement', 'review'].includes(mode)) return `“${stage.name}”的执行模式无效。`;
       for (const key of ['inputContract', 'outputContract'] as const) {
@@ -375,7 +381,7 @@ function parseConditionDraft(value: string): WorkflowCondition {
   return visit(parsed);
 }
 
-export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agents, candidateMatches, offers, locked, busy, onCompile, onSave, onConfirm }: Props) {
+export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agents, candidateMatches, offers, locked, busy, onMatch, onCompile, onSave, onConfirm }: Props) {
   const missionViewport = mission.workflowViewport ?? defaultViewport;
   const resolvedEdges = useMemo(() => resolveEdges(mission.id, stages, storedEdges), [mission.id, stages, storedEdges]);
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>(stages.map((stage, index) => stageNode(stage, agents, index)));
@@ -387,6 +393,15 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   const [history, setHistory] = useState<Snapshot[]>([]);
   const [future, setFuture] = useState<Snapshot[]>([]);
   const [dirty, setDirty] = useState(false);
+  const [matchPlan,setMatchPlan]=useState<MatchPlan|null>(null);
+  const [matchingBusy,setMatchingBusy]=useState(false);
+  const [preference,setPreference]=useState<MatchPreference>('balanced');
+  const matchingRef=useRef(false);
+  const mountedMatching=useRef(false);
+  const autoMatchedVersions=useRef(new Set<string>());
+  useEffect(()=>{mountedMatching.current=true;return()=>{mountedMatching.current=false;};},[]);
+  const latestVersion=useRef(mission.workflowVersion);
+  latestVersion.current=mission.workflowVersion;
   const [message, setMessage] = useState<{ text: string; tone: 'error' | 'success' } | null>(null);
   const [conditionDraft, setConditionDraft] = useState('');
   const [conditionDraftError, setConditionDraftError] = useState('');
@@ -419,6 +434,11 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
     && !edges.some((edge) => edge.source === selectedEdgeTarget.id),
   );
   const selectedInput = selected?.data.stage.input ?? {};
+  const selectedCapabilities = parseRequiredCapabilities(selectedInput.requiredCapabilities) ?? [];
+  const capabilityOptions = [...new Set([
+    ...agents.flatMap((agent) => [agent.category, ...agent.tags]).map((value) => value.trim().toLowerCase()).filter((value) => value.length > 0 && value.length <= 80),
+    ...selectedCapabilities,
+  ])].sort();
   const offerByStage = useMemo(() => new Map(offers.map((offer) => [offer.stageId, offer])), [offers]);
   const canReissueOffers = offers.some((offer) => offer.status === 'declined' || offer.status === 'expired');
   const selectedMatch = candidateMatches.find((match) => match.stageId === selectedId) ?? null;
@@ -462,6 +482,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   useEffect(() => {
     const workflowKey = `${mission.id}:${mission.workflowVersion}`;
     const serverVersionChanged = syncedWorkflowRef.current !== workflowKey;
+    if (serverVersionChanged) setMatchPlan(null);
     // Offer/candidate refreshes can replace the detail object without changing
     // the graph version. Do not let those background updates erase local edits.
     if (dirtyRef.current && !serverVersionChanged) return;
@@ -491,31 +512,16 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
   }, [agents, setNodes]);
 
   useEffect(() => {
-    if (locked || offers.length || !candidateMatches.length) return;
-    const assignments = new Map<string, Candidate>();
-    for (const node of nodes) {
-      if (node.data.stage.nodeType !== 'task' || node.data.stage.agentId || manuallyEditedAgentStagesRef.current.has(node.id)) continue;
-      const match = candidateMatches.find((candidate) => candidate.stageId === node.id);
-      const recommendation = automaticRecommendation(node.data.stage, match, mission.paymentMethod);
-      if (recommendation && activeAgentIds.has(recommendation.agent.id)) assignments.set(node.id, recommendation);
-    }
-    if (!assignments.size) return;
-    assignments.forEach((_, stageId) => manuallyEditedAgentStagesRef.current.add(stageId));
-    setNodes((items) => items.map((node) => {
-      const recommendation = assignments.get(node.id);
-      return recommendation ? {
-        ...node,
-        data: {
-          ...node.data,
-          stage: { ...node.data.stage, agentId: recommendation.agent.id },
-          agentName: recommendation.agent.name,
-        },
-      } : node;
-    }));
-    dirtyRef.current = true;
-    setDirty(true);
-    setMessage({ text: `已按评分和功能为 ${assignments.size} 个节点预选高置信度 Agent，可在发送邀请前调整。`, tone: 'success' });
-  }, [activeAgentIds, candidateMatches, locked, mission.paymentMethod, nodes, offers.length, setNodes]);
+    const versionKey=`${mission.id}:${mission.workflowVersion}`;
+    if(!onMatch || locked || offers.length || dirtyRef.current || nodes.some((node)=>node.data.stage.agentId) || matchingRef.current || autoMatchedVersions.current.has(versionKey)) return;
+    autoMatchedVersions.current.add(versionKey);
+    matchingRef.current=true; setMatchingBusy(true);
+    void onMatch({},preference).then((plan)=>{
+      if(!mountedMatching.current || dirtyRef.current || latestVersion.current!==plan.workflowVersion) return;
+      applyMatchPlan(plan);
+    }).catch(()=>{ /* Manual matching remains available when automatic planning is unavailable. */ })
+      .finally(()=>{matchingRef.current=false;setMatchingBusy(false);});
+  },[mission.id,mission.workflowVersion,matchingBusy]);
 
   useEffect(() => {
     if (!instance || hasStoredViewport || !nodes.length || dirtyRef.current) return;
@@ -711,6 +717,27 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
     })),
   });
 
+  const applyMatchPlan=(plan:MatchPlan)=>{
+    setMatchPlan(plan);
+    if(plan.status!=='ready') {setMessage({text:'暂未找到完整可行方案。选择节点可查看缺少的能力证据或容量条件。',tone:'error'});return;}
+    remember();
+    const assignments=new Map(plan.assignments.map((row)=>[row.stageId,row.agentId]));
+    setNodes((items)=>items.map((node)=>assignments.has(node.id)?{...node,data:{...node.data,stage:{...node.data.stage,agentId:assignments.get(node.id)!,input:{...node.data.stage.input,matchingPlanId:plan.id}},agentName:agents.find((agent)=>agent.id===assignments.get(node.id))?.name??null}}:node));
+    markDirty();
+    setMessage({text:'已生成整组方案。保存后可发送邀请；报价、证据和容量将在发送前再次校验。',tone:'success'});
+  };
+  const matchTeam=async()=>{
+    if(!onMatch||matchingRef.current||locked||offers.length) return;
+    matchingRef.current=true;setMatchingBusy(true);
+    try {
+      if(dirty && !await save()) return;
+      const locks=Object.fromEntries(nodes.filter((node)=>manuallyEditedAgentStagesRef.current.has(node.id)&&node.data.stage.agentId).map((node)=>[node.id,node.data.stage.agentId!]));
+      const plan=await onMatch(locks,preference);
+      if(!dirtyRef.current && latestVersion.current===plan.workflowVersion) applyMatchPlan(plan);
+    } catch(error) {setMessage({text:error instanceof Error?error.message:'自动组队失败',tone:'error'});}
+    finally {matchingRef.current=false;setMatchingBusy(false);}
+  };
+
   const save = async () => {
     const error = graphError(nodes, edges, mission, false, activeAgentIds);
     if (error) { setMessage({ text: error, tone: 'error' }); return false; }
@@ -823,6 +850,7 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           <button type="button" className="hidden size-9 items-center justify-center rounded-lg border border-line text-muted transition hover:bg-canvas hover:text-ink xl:inline-flex" onClick={() => setInspectorOpen((open) => !open)} aria-label={inspectorOpen ? '收起配置侧栏' : '展开配置侧栏'}>{inspectorOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}</button>
+          {onMatch ? <><select aria-label="组队偏好" className="field !w-auto !py-1.5 !text-xs" value={preference} onChange={(event)=>setPreference(event.target.value as MatchPreference)} disabled={locked||matchingBusy}><option value="balanced">均衡</option><option value="speed">速度优先</option><option value="cost">成本优先</option></select><button type="button" className="btn-secondary !min-h-9 !px-3 !text-xs" onClick={()=>void matchTeam()} disabled={locked||busy||matchingBusy||offers.length>0}>{matchingBusy?<LoaderCircle size={14} className="animate-spin"/>:<Sparkles size={14}/>}自动组队</button></> : null}
           <button type="button" className="btn-secondary hidden !min-h-9 !rounded-lg !px-3 !py-1.5 !text-xs lg:inline-flex" onClick={validate}><CheckCircle2 size={14} />校验</button>
           <button type="button" className="btn-secondary !min-h-9 !rounded-lg !px-2.5 !py-1.5 !text-xs sm:!px-3" aria-label="保存" onClick={() => void save()} disabled={busy || locked || !dirty}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <Save size={14} />}<span className="hidden sm:inline">保存</span></button>
           <button type="button" className="btn-primary !min-h-9 !rounded-lg !px-2.5 !py-1.5 !text-xs sm:!px-3" onClick={() => void confirm()} disabled={busy || locked || (offers.length > 0 && !canReissueOffers)}>{busy ? <LoaderCircle size={14} className="animate-spin" /> : <Send size={14} />}<span className="hidden sm:inline">{canReissueOffers ? '重新发送邀请' : offers.length ? '邀请已发送' : '发送邀请'}</span><span className="sm:hidden">邀请</span></button>
@@ -926,15 +954,18 @@ export function WorkflowGraphEditor({ mission, stages, edges: storedEdges, agent
             <label><span className="field-label !mb-1.5 !text-xs">目标 / 审批说明</span><textarea className="field min-h-24 resize-none" value={selected.data.stage.purpose} onChange={(event) => changeStage({ purpose: event.target.value })} disabled={locked} /></label>
             {selected.data.stage.nodeType === 'task' ? <>
               <div className="grid grid-cols-2 gap-3"><label><span className="field-label !mb-1.5 !text-xs">分类</span><input className="field" value={selected.data.stage.category} onChange={(event) => changeStage({ category: event.target.value })} disabled={locked} /></label><label><span className="field-label !mb-1.5 !text-xs">预算</span><input className="field font-mono" type="number" min={mission.paymentMethod === 'web3_seth' ? 0.000001 : 0.01} step="0.000001" value={selected.data.stage.budget} onChange={(event) => changeStage({ budget: Number(event.target.value) })} disabled={locked} /></label></div>
+              <fieldset><legend className="field-label !mb-1.5 !text-xs">必需能力标签（可选）</legend><p className="mb-2 text-[10px] text-muted">Agent 必须声明全部所选标签。标签是开发者声明，实际能力仍需 Trial 与验收核实。修改后保存以刷新候选。</p><div className="max-h-32 space-y-1 overflow-y-auto rounded-xl border border-line p-2">{capabilityOptions.map((capability) => <label key={capability} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={selectedCapabilities.includes(capability)} disabled={locked || (!selectedCapabilities.includes(capability) && selectedCapabilities.length >= 20)} onChange={(event) => changeStage({ input: { ...selectedInput, requiredCapabilities: event.target.checked ? [...selectedCapabilities, capability] : selectedCapabilities.filter((value) => value !== capability) } })} />{capability}</label>)}</div></fieldset>
               <label><span className="field-label !mb-1.5 !text-xs">Agent（系统推荐，可手动调整）</span><select className="field" value={selected.data.stage.agentId ?? ''} onChange={(event) => changeAgent(event.target.value || null)} disabled={locked}><option value="">请选择 Agent</option>{agentOptions.map((agent) => <option value={agent.id} key={agent.id}>{agent.name} · {agent.category}</option>)}</select></label>
+              {matchPlan ? <section className="rounded-xl border border-cyan/30 bg-cyan/5 p-3 text-xs" aria-label="自动组队方案"><p className="font-semibold">{matchPlan.status==='ready'?'整组方案已生成':'暂未找到完整可行方案'}</p><p className="mt-1">方案总价 {formatPaymentAmount(matchPlan.totalQuote,mission.paymentMethod)} · {matchPlan.makespanSeconds===null?'工期需确认':`预计 ${Math.ceil(matchPlan.makespanSeconds/60)} 分钟`}</p><p className="mt-1 text-[10px] text-muted">方案有效至 {new Date(matchPlan.expiresAt).toLocaleTimeString()}；推荐不预留容量。</p>{matchPlan.assignments.find((row)=>row.stageId===selected.id)?.reasons.map((reason)=><p className="mt-1" key={reason}>{reason}</p>)}{matchPlan.status==='needs_review'?(matchPlan.excluded[selected.id]??[]).slice(0,4).map((row)=><p className="mt-1 text-amber-800" key={row.agentId}>{agents.find((agent)=>agent.id===row.agentId)?.name??row.agentId}：{row.reasons.join('；')}</p>):null}{matchPlan.warnings.map((warning)=><p className="mt-1 text-amber-800" key={warning}>{warning}</p>)}</section>:null}
               {selectedReview?.manuallyAdjusted ? <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800"><div className="flex items-center gap-2 font-semibold"><AlertTriangle size={14} />已手动调整</div><p className="mt-1 text-[10px] leading-4">系统首选 {selectedReview.recommendation?.agent.name}（{selectedReview.recommendation?.score.toFixed(1)} 分），当前为 {selectedReview.agent.name}{selectedReview.selectedCandidate ? `（${selectedReview.selectedCandidate.score.toFixed(1)} 分）` : '（无候选分）'}。</p></div> : selectedAutomaticRecommendation && selected.data.stage.agentId === selectedAutomaticRecommendation.agent.id ? <p className="rounded-xl border border-lime/40 bg-lime/10 p-3 text-xs font-semibold text-lime-700"><CheckCircle2 className="mr-1.5 inline" size={14} />已采用系统高置信度推荐 · {selectedAutomaticRecommendation.score.toFixed(1)} 分</p> : null}
               {selectedReview?.warnings.length ? <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-[10px] leading-4 text-amber-800" role="alert"><p className="font-semibold">发送邀请前请确认</p><ul className="mt-1 list-disc space-y-1 pl-4">{selectedReview.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div> : null}
               {selectedMatch?.candidates.length ? <div><div className="mb-1.5 flex items-center justify-between gap-2"><p className="field-label !mb-0 !text-xs">候选建议</p><span className="text-[9px] text-muted">自动阈值 {AUTO_MATCH_MIN_SCORE} · 领先 {AUTO_MATCH_MIN_LEAD}</span></div><div className="space-y-2">{selectedMatch.candidates.slice(0, 3).map((candidate, index) => {
                 const recommended = index === 0;
                 const automaticallyEligible = recommended && Boolean(automaticRecommendation(selected.data.stage, selectedMatch, mission.paymentMethod));
                 return <button type="button" className={`w-full rounded-xl border p-3 text-left text-xs transition ${selected.data.stage.agentId === candidate.agent.id ? 'border-cyan bg-cyan/5' : 'border-line hover:border-cyan/40'}`} onClick={() => changeAgent(candidate.agent.id)} disabled={locked || candidate.agent.status !== 'active'} key={candidate.agent.id}><span className="flex items-center justify-between gap-2"><span className="min-w-0"><strong>{candidate.agent.name}</strong>{recommended ? <span className={`ml-2 rounded px-1.5 py-0.5 text-[8px] font-semibold ${automaticallyEligible ? 'bg-lime/15 text-lime-700' : 'bg-canvas text-muted'}`}>{automaticallyEligible ? '系统推荐' : '候选首位'}</span> : null}{selected.data.stage.agentId === candidate.agent.id ? <span className="ml-1 rounded bg-cyan/10 px-1.5 py-0.5 text-[8px] font-semibold text-cyan">当前</span> : null}</span><span className="text-right"><span className="block font-mono text-cyan">{candidate.score.toFixed(1)}</span><span className="block font-mono text-[9px] text-muted">报价 {formatPaymentAmount(candidateQuoteAmount(candidate), mission.paymentMethod)}</span></span></span><span className="mt-1 block line-clamp-2 text-[10px] leading-4 text-muted">{candidate.reasons.join(' · ')}</span></button>;
-              })}</div></div> : null}
+              })}</div></div> : selectedMatch ? <p className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800" role="status">当前已保存的节点条件下没有合格候选。请检查必需能力标签、预算或 Agent 上架状态；调整后保存以刷新候选。</p> : null}
               <label><span className="field-label !mb-1.5 !text-xs">执行模式</span><select className="field" value={String(selectedInput.executionMode ?? 'analyze')} onChange={(event) => changeStage({ input: { ...selectedInput, executionMode: event.target.value } })} disabled={locked}><option value="analyze">Analyze</option><option value="implement">Implement</option><option value="review">Review</option></select></label>
+              <div className="grid grid-cols-2 gap-3"><label><span className="field-label !mb-1.5 !text-xs">输入类型</span><input className="field" value={String(selectedInput.inputType??'')} onChange={(event)=>changeStage({input:{...selectedInput,inputType:event.target.value}})} disabled={locked} placeholder="如 json.v1"/></label><label><span className="field-label !mb-1.5 !text-xs">输出类型</span><input className="field" value={String(selectedInput.outputType??'')} onChange={(event)=>changeStage({input:{...selectedInput,outputType:event.target.value}})} disabled={locked} placeholder="如 html.v1"/></label></div>
               <label><span className="field-label !mb-1.5 !text-xs">输入契约</span><textarea className="field min-h-20 resize-none font-mono text-xs" value={String(selectedInput.inputContract ?? '')} onChange={(event) => changeStage({ input: { ...selectedInput, inputContract: event.target.value } })} disabled={locked} placeholder="描述直接上游需提供的字段或制品" /></label>
               <label><span className="field-label !mb-1.5 !text-xs">输出契约</span><textarea className="field min-h-20 resize-none font-mono text-xs" value={String(selectedInput.outputContract ?? '')} onChange={(event) => changeStage({ input: { ...selectedInput, outputContract: event.target.value } })} disabled={locked} placeholder="描述交接摘要与 artifact reference" /></label>
             </> : <><label><span className="field-label !mb-1.5 !text-xs">审批标准</span><textarea className="field min-h-28 resize-none" value={String(selectedInput.approvalCriteria ?? '')} onChange={(event) => changeStage({ input: { ...selectedInput, approvalCriteria: event.target.value } })} disabled={locked} /></label><div><p className="field-label !mb-1.5 !text-xs">直接上游节点</p><div className="max-h-48 space-y-2 overflow-y-auto rounded-xl border border-line p-3">{nodes.filter((node) => node.id !== selected.id).map((node) => { const checked = edges.some((edge) => edge.source === node.id && edge.target === selected.id); return <label className="flex items-start gap-2 text-xs" key={node.id}><input type="checkbox" className="mt-0.5" checked={checked} onChange={(event) => toggleGateUpstream(node.id, event.target.checked)} disabled={locked} /><span><strong className="block text-ink">{node.data.stage.name}</strong><span className="text-[10px] text-muted">{node.data.stage.nodeType === 'approval' ? 'Gate' : '任务节点'}</span></span></label>; })}</div><p className="mt-2 text-[10px] leading-4 text-muted">Gate 会等待这里勾选的所有直接上游完成。</p></div></>}

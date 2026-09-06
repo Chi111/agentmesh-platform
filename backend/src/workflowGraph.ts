@@ -1,3 +1,4 @@
+import { parseRequiredCapabilities } from '../../shared/agentRequirements';
 import type { Agent, Mission, WorkflowEdge, WorkflowStage, WorkflowViewport } from './contracts';
 import { paymentBudgetPrecision } from './payments';
 import {
@@ -194,6 +195,9 @@ export function validateWorkflowGraph(input: {
         throw new WorkflowValidationError('INVALID_NODE_BUDGET', `Task node budgets must be at least ${minimumBudget}`);
       }
       if (stage.category.trim().length < 2 || stage.category.length > 80) throw new WorkflowValidationError('INVALID_NODE', 'Task nodes require a bounded category');
+      if (parseRequiredCapabilities(stage.input.requiredCapabilities) === null) {
+        throw new WorkflowValidationError('INVALID_REQUIRED_CAPABILITIES', 'Required capabilities must be at most 20 non-empty strings of at most 80 characters');
+      }
       const executionMode = stage.input.executionMode;
       if (executionMode !== undefined && !['analyze', 'implement', 'review'].includes(String(executionMode))) {
         throw new WorkflowValidationError('INVALID_EXECUTION_MODE', 'Task execution mode must be analyze, implement, or review');

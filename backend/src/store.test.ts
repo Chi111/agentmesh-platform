@@ -1,3 +1,4 @@
+import type { CapacityLease } from '../../shared/matching';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -31,6 +32,7 @@ class SqliteStatement implements D1Statement {
 }
 
 class SqliteD1 implements D1Database {
+  private pendingBatch:Promise<void>=Promise.resolve();
   constructor(readonly db: DatabaseSync) {}
 
   prepare(query: string): D1Statement {
@@ -38,6 +40,11 @@ class SqliteD1 implements D1Database {
   }
 
   async batch(statements: D1Statement[]): Promise<Array<{ meta?: { changes?: number } }>> {
+    const result=this.pendingBatch.then(()=>this.executeBatch(statements));
+    this.pendingBatch=result.then(()=>undefined,()=>undefined);
+    return result;
+  }
+  private async executeBatch(statements: D1Statement[]): Promise<Array<{ meta?: { changes?: number } }>> {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const results: Array<{ meta?: { changes?: number } }> = [];
@@ -132,6 +139,53 @@ describe('D1PlatformStore concurrency invariants', () => {
   beforeEach(() => {
     database = migratedDatabase();
     store = new D1PlatformStore(database);
+  });
+
+  it('reschedules atomically, archives accepted offers and preserves policy through draft saves',async()=>{
+    expect(await store.listMissionsAwaitingOutcome(80)).toEqual([]);
+    const id='TASK-2026-0815';
+    database.db.prepare("UPDATE missions SET status='matching' WHERE id=?").run(id);
+    database.db.prepare("UPDATE escrows SET status='pending' WHERE mission_id=?").run(id);
+    const stages=await store.listStages(id);const stage=stages.find(s=>s.agentId)!;
+    database.db.prepare(`INSERT INTO stage_offers (id,mission_id,stage_id,agent_id,status,expires_at,created_at,updated_at) VALUES ('reschedule-offer',?,?,?,'accepted','2027-01-01','2026-09-05','2026-09-05')`).run(id,stage.id,stage.agentId);
+    database.db.prepare("INSERT INTO mission_delivery_policies VALUES (?,'outcome_v1')").run(id);
+    const mission=(await store.getMission(id))!;
+    const results=await Promise.all([store.rescheduleMission(id,mission.requesterId,'2027-01-01T00:00:00Z',mission.workflowVersion,'2026-09-05T00:00:00Z'),store.rescheduleMission(id,mission.requesterId,'2027-02-01T00:00:00Z',mission.workflowVersion,'2026-09-05T00:00:00Z')]);
+    expect(results.map(r=>r.state).sort()).toEqual(['saved','version_conflict']);
+    expect(await store.listStageOffers(id)).toHaveLength(0);
+    expect(database.db.prepare("SELECT COUNT(*) AS n FROM stage_offer_quote_history WHERE id='reschedule-offer'").get()).toMatchObject({n:1});
+    const updated=(await store.getMission(id))!;
+    expect(updated.deliveryPolicy).toBe('outcome_v1');
+    expect((await store.listStages(id)).map(s=>s.id)).toEqual(stages.map(s=>s.id));
+    database.db.prepare("UPDATE escrows SET status='held' WHERE mission_id=?").run(id);
+    expect((await store.rescheduleMission(id,mission.requesterId,'2027-03-01T00:00:00Z',updated.workflowVersion,'2026-09-05T00:00:00Z')).state).toBe('locked');
+    expect((await store.getMission(id))!.deadline).toBe(updated.deadline);
+  });
+
+  const capacityLease=(runId:string, stageId='stage-visual', agentId='visionboard'):CapacityLease=>({runId,stageId,agentId,agentVersion:'v1.0.0',missionId:'TASK-2026-0815',pool:`demo-developer:${agentId}`,status:'active',claimToken:runId,createdAt:'2026-08-18T12:00:00.000Z',expiresAt:'2026-08-18T14:00:00.000Z'});
+  it('atomically limits shared execution capacity and preserves unknown remote runs',async()=>{
+    for(const agentId of ['visionboard','motioncraft']) await store.matching.saveProfile({agentId,agentVersion:'v1.0.0',revision:1,pool:'shared',maxConcurrency:1,poolConcurrency:1,updatedAt:'2026-08-18T12:00:00.000Z'});
+    const results=await Promise.all([store.matching.acquire(capacityLease('r1')),store.matching.acquire(capacityLease('r2','stage-motion','motioncraft'))]);
+    expect(results).toEqual([true,false]);
+    await store.matching.finish('r1','quarantined');
+    expect(await store.matching.acquire(capacityLease('r2','stage-motion','motioncraft'))).toBe(false);
+    await store.matching.finish('r1','released');
+    expect(await store.matching.acquire(capacityLease('r2','stage-motion','motioncraft'))).toBe(true);
+  });
+  it('recovers a pre-contact interruption with a new fence and cannot recover after contacting remote',async()=>{
+    const lease=capacityLease('fenced');expect(await store.matching.acquire(lease)).toBe(true);
+    const replacement={...lease,claimToken:'replacement',createdAt:'2026-08-18T12:06:00.000Z'};
+    expect(await store.matching.acquire(replacement)).toBe(true);
+    expect(await store.matching.contact(lease.runId,lease.claimToken!,replacement.createdAt)).toBe(false);
+    expect(await store.matching.contact(lease.runId,replacement.claimToken,replacement.createdAt)).toBe(true);
+    expect(await store.matching.acquire({...replacement,claimToken:'third',createdAt:'2026-08-18T12:12:00.000Z'})).toBe(false);
+    await store.matching.finish(lease.runId,'released',lease.claimToken);
+    expect((await store.matching.load()).leases[0].status).toBe('active');
+  });
+  it('does not permit changing a shared pool while another endpoint is active',async()=>{
+    await store.matching.saveProfile({agentId:'visionboard',agentVersion:'v1.0.0',revision:1,pool:'shared',maxConcurrency:1,poolConcurrency:1,updatedAt:'2026-08-18T12:00:00.000Z'});
+    expect(await store.matching.acquire(capacityLease('active'))).toBe(true);
+    await expect(store.matching.saveProfile({agentId:'motioncraft',agentVersion:'v1.0.0',revision:1,pool:'shared',maxConcurrency:10,poolConcurrency:10,updatedAt:'2026-08-18T12:00:00.000Z'})).rejects.toThrow('CAPACITY_IN_USE');
   });
 
   it('replays pricing migrations without losing a newer price version', () => {
@@ -726,10 +780,12 @@ describe('D1PlatformStore concurrency invariants', () => {
       },
     };
 
+    expect(await store.matching.acquire({...capacityLease(runId),expiresAt})).toBe(true);
     const first = await store.applyAgentCallback(update);
     const duplicate = await store.applyAgentCallback(update);
 
     expect(first.state).toBe('applied');
+    expect((await store.matching.load()).leases.find((row)=>row.runId===runId)?.status).toBe('released');
     expect(duplicate.state).toBe('duplicate');
     expect((await store.listStages(update.missionId)).find((stage) => stage.id === update.stageId)?.status).toBe('done');
     expect(database.db.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE id = ?').get(update.event.id)).toEqual({ count: 1 });

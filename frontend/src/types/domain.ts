@@ -1,3 +1,4 @@
+import type { OutcomePackage } from '../../../shared/outcomePackage';
 export type UserRole = 'requester' | 'developer';
 
 export interface UserProfile {
@@ -132,6 +133,7 @@ export interface AgentReputationSnapshot {
 }
 
 export interface AgentQualityPublicDetail {
+  bilateralReviews?: Array<{id:string;ratings:number[];comment:string;publishedAt:string|null;eligible:boolean;caseStatus:string;responses?:Array<{body:string;createdAt:string;role:string}>}>;
   agent: Agent;
   feedback: AgentFeedback[];
   snapshots: AgentReputationSnapshot[];
@@ -157,6 +159,7 @@ export interface AdminAgentQualityRow {
 }
 
 export interface Mission {
+  deliveryPolicy?: 'legacy' | 'outcome_v1';
   id: string;
   requesterId: string;
   title: string;
@@ -376,6 +379,7 @@ export type IpfsVerificationStatus = 'declared' | 'verified' | 'unavailable' | '
 
 export interface DeliverableManifest {
   schema: 'agentmesh.deliverable-manifest.v1';
+  outcomePackage?: OutcomePackage;
   missionId: string;
   stageId: string | null;
   attemptNo: number | null;

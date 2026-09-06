@@ -3,7 +3,7 @@ import type { Mission } from '../types/domain';
 type MissionSummary = Pick<Mission, 'id' | 'status' | 'team' | 'currentStage'>;
 
 export function routeForMission(mission: Pick<MissionSummary, 'id' | 'status' | 'team'>) {
-  if (mission.status === 'matching') {
+  if (mission.status === 'draft' || mission.status === 'matching') {
     return `/missions/${mission.id}/workflow`;
   }
   if (mission.status === 'review' || mission.status === 'completed' || mission.status === 'cancelled') {

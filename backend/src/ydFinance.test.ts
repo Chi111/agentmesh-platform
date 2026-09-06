@@ -101,3 +101,21 @@ describe('ecosystem governance', () => {
     expect(evaluateEcosystemProposal({ ...proposal, forPower: '25', againstPower: '25' }, '2026-08-05T00:00:00.000Z', 2, 3).status).toBe('defeated');
   });
 });
+
+describe('fixed arbitration compensation', () => {
+  const fixed = { ...activity('user-a', 1), role: 'arbitrator' as const, detail: { source: 'reviewed_arbitration_work', fixedRewardUnits: '30' } };
+  const input = {epochNumber:1,chainId:11155111,distributorAddress:distributor,totalRewardUnits:101n,accountScoreCap:1000,wallets:new Map([['user-a',walletA],['user-b',walletB]])};
+  it('honors the fixed amount before distributing variable rewards and deduplicates fixed work', () => {
+    const result=allocateRewardEpoch({...input,activities:[fixed,fixed,activity('user-b',100)]});
+    expect(result.allocations.find(a=>a.userId==='user-a')?.amountUnits).toBe('30');
+    expect(result.allocations.find(a=>a.userId==='user-b')?.amountUnits).toBe('71');
+    for(const a of result.allocations)expect(verifyRewardProof(a.leafHash,a.proof,result.merkleRoot)).toBe(true);
+  });
+  it('does not inflate a fixed-only fee to consume the whole epoch budget', () => {
+    expect(allocateRewardEpoch({...input,activities:[fixed]}).allocations[0].amountUnits).toBe('30');
+  });
+  it('refuses to haircut promised fees or silently discard an unlinked wallet', () => {
+    expect(()=>allocateRewardEpoch({...input,totalRewardUnits:29n,activities:[fixed]})).toThrow('FIXED_REWARD_POOL_INSUFFICIENT');
+    expect(()=>allocateRewardEpoch({...input,wallets:new Map(),activities:[fixed]})).toThrow('FIXED_REWARD_WALLET_REQUIRED');
+  });
+});

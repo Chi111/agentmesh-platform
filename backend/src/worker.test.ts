@@ -1,11 +1,14 @@
+import { calculateAgentQuality } from './agentQuality';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { exportSPKI, generateKeyPair, SignJWT } from 'jose';
 import type { Agent, CandidateMatch, Deliverable, Mission, PaymentMethod, RewardActivity, UserContext, WorkflowEdge, WorkflowStage, WorkflowTransitionCheckpoint } from './contracts';
 import { MemoryPlatformStore } from './memoryStore';
 import { buildSettlementPlan, settlementDescriptor } from './chain';
 import { looksLikePrivyToken, verifyPrivyIdentityToken, verifyPrivyToken } from './privy';
-import { createApp, resolveWorkflowTransitions } from './worker';
-import { sha256Json } from './ipfsEvidence';
+import { createApp, resolveWorkflowTransitions, assembleCompletedBuiltinOutcome } from './worker';
+import { sha256Json, parseIpfsEvidence } from './ipfsEvidence';
+import { stageRequiresArtifact } from './deliveryPolicy';
+import { buildClientDeliveryBundle } from './clientDelivery';
 
 type JsonBody = Record<string, any>;
 
@@ -186,6 +189,20 @@ async function createFundedMission(): Promise<{ mission: Mission; stages: Workfl
   return { mission: detail.body.data.mission, stages: detail.body.data.stages };
 }
 
+async function addOutcomeFixture(missionId: string) {
+  const mission=(await store.getMission(missionId))!, stages=await store.listStages(missionId);
+  const stage=stages.filter(s=>s.nodeType==='task').at(-1)!;
+  const evidenceContext=await api(`/api/missions/${missionId}/evidence/context?stageId=${encodeURIComponent(stage.id)}`,{},requester.id);
+  const name='完整任务成果包测试';
+  const bundle=await buildClientDeliveryBundle({missionId,missionTitle:mission.title,stageId:stage.id,stageName:stage.name,attemptNo:stage.attemptNo,agentId:stage.agentId!,agentName:'Test',logicalName:name,title:name,deliverableMarkdown:'# 完整成果\n\n可直接使用的任务成果。',acceptanceCriteriaSha256:evidenceContext.body.data.acceptanceCriteriaSha256,
+    outcomePackage:{schema:'agentmesh.mission-outcome.v1',workflowVersion:mission.workflowVersion,stages:stages.map(s=>({stageId:s.id,attemptNo:s.attemptNo}))},versionNo:1,supersedesRootCid:null,createdAt:currentNow});
+  const ipfsEvidence=await parseIpfsEvidence({rootCid:'bafybeie5nqv6kd3qnfjuprw2scvucpip5xwh3yluiopmqcktiamcu54bdm',manifest:bundle.manifest,manifestSha256:bundle.manifestSha256,visibility:'public'}, {missionId,stageId:stage.id,attemptNo:stage.attemptNo,agentId:stage.agentId,logicalName:name,acceptanceCriteriaSha256:bundle.manifest.acceptanceCriteriaSha256});
+  ipfsEvidence.verificationStatus='verified';
+  const deliverable:Deliverable={id:`OUTCOME-${crypto.randomUUID()}`,missionId,stageId:stage.id,attemptNo:stage.attemptNo,agentId:stage.agentId,name,uri:'ipfs://'+ipfsEvidence.rootCid,mimeType:'text/html',contentHash:bundle.manifestSha256,status:'submitted',createdAt:currentNow,ipfsEvidence};
+  await store.addDeliverable(deliverable);
+  return {deliverable,bundle};
+}
+
 async function completePausedWorkflow(missionId: string, stages: WorkflowStage[]) {
   const completedAt = '2026-08-16T00:05:00.000Z';
   for (const stage of stages) {
@@ -201,6 +218,7 @@ async function completePausedWorkflow(missionId: string, stages: WorkflowStage[]
     };
     await store.addDeliverable(deliverable);
   }
+  await addOutcomeFixture(missionId);
 }
 
 beforeEach(() => {
@@ -341,6 +359,51 @@ beforeEach(() => {
 });
 
 describe('AgentMesh Worker', () => {
+  async function prepareMatching() {
+    const {mission,stages}=await createMission();
+    const selected=store.agents.get('research-agent')!;
+    selected.price=1;
+    store.agentQualityStats.set(selected.id,{...calculateAgentQuality(selected,[],currentNow),marketplaceStatus:'listed',reputation:90,trialPassed:true,endpointHealthy:true,payoutValid:true,unresolvedSevereRisks:0});
+    await store.matching.saveProfile({agentId:selected.id,agentVersion:selected.version,revision:1,pool:selected.id,maxConcurrency:1,poolConcurrency:1,updatedAt:currentNow});
+    for(const stage of stages) {
+      stage.input={executionMode:'analyze'};
+      await store.matching.saveEvidence({id:`e-${stage.id}`,agentId:selected.id,agentVersion:selected.version,family:stage.category.toLowerCase(),mode:'analyze',taskDescription:stage.purpose,capabilities:[],tools:[],inputTypes:[],outputTypes:[],durationSeconds:60,quality:90,sourceId:'test-trial',verifiedBy:admin.id,verifiedAt:currentNow,expiresAt:'2026-08-17T00:00:00.000Z'});
+    }
+    store.stages.set(mission.id,stages);
+    return {mission,stages,selected};
+  }
+  it('generates and confirms a versioned evidence-based team without dispatching during matching',async()=>{
+    const {mission,stages}=await prepareMatching();
+    const result=await api(`/api/missions/${mission.id}/match-plan`,{method:'POST',body:JSON.stringify({workflowVersion:mission.workflowVersion})},requester.id);
+    expect(result.response.status).toBe(200);expect(result.body.data.status).toBe('ready');
+    expect(result.body.data.assignments).toHaveLength(stages.length);expect(dispatchCalls).toBe(0);
+    expect(await store.listStageOffers(mission.id)).toHaveLength(0);
+    const plan=result.body.data;
+    const assigned=stages.map((stage)=>({...stage,agentId:plan.assignments.find((row:JsonBody)=>row.stageId===stage.id).agentId,input:{...stage.input,matchingPlanId:plan.id}}));
+    await store.saveWorkflowDraft(mission.id,assigned,await store.listEdges(mission.id),mission.workflowViewport,mission.workflowVersion);
+    const confirmation=await api(`/api/missions/${mission.id}/workflow`,{method:'POST',body:'{}'},requester.id);
+    expect(confirmation.response.status).toBe(200);
+  });
+  it('rejects an unchanged plan when its evidence expires before plan TTL',async()=>{
+    const {mission,stages}=await prepareMatching();
+    for(const [id,evidence] of store.matching.evidence) store.matching.evidence.set(id,{...evidence,expiresAt:'2026-08-16T00:01:00.000Z'});
+    const result=await api(`/api/missions/${mission.id}/match-plan`,{method:'POST',body:JSON.stringify({workflowVersion:mission.workflowVersion})},requester.id);
+    const plan=result.body.data;expect(plan.status).toBe('ready');
+    store.stages.set(mission.id,stages.map((stage)=>({...stage,agentId:plan.assignments.find((row:JsonBody)=>row.stageId===stage.id).agentId,input:{...stage.input,matchingPlanId:plan.id}})));
+    currentNow='2026-08-16T00:02:00.000Z';
+    const confirmation=await api(`/api/missions/${mission.id}/workflow`,{method:'POST',body:'{}'},requester.id);
+    expect(confirmation.response.status).toBe(409);expect(confirmation.body.error.code).toBe('MATCH_PLAN_STALE');
+    expect(await store.listStageOffers(mission.id)).toHaveLength(0);
+  });
+  it('requires owner authorization for capacity and admin verification for evidence',async()=>{
+    const id='research-agent';
+    const denied=await api(`/api/agents/${id}/execution-profile`,{method:'PUT',body:JSON.stringify({maxConcurrency:1,pool:'test',poolConcurrency:1})},requester.id);
+    expect(denied.response.status).toBe(403);
+    expect((await api(`/api/agents/${id}/execution-profile`,{method:'PUT',body:JSON.stringify({maxConcurrency:1,pool:'test',poolConcurrency:1})},developer.id)).response.status).toBe(200);
+    expect((await api(`/api/agents/${id}/matching-evidence`,{method:'POST',body:'{}'},developer.id)).response.status).toBe(403);
+    expect((await api(`/api/agents/${id}/matching-evidence`,{method:'POST',body:JSON.stringify({sourceId:'invented'})},admin.id)).response.status).toBe(409);
+  });
+
   it('runs the YD reward, claim, staking and Power-governance workflow without touching escrow', async () => {
     const linkedWallet = '0x7100000000000000000000000000000000008f2c';
     store.profiles.set(requester.id, { ...requester, walletAddress: linkedWallet });
@@ -2135,7 +2198,11 @@ describe('AgentMesh Worker', () => {
       method: 'POST', body: JSON.stringify({ decision: 'approved', feedback: '集成结果通过' }),
     }, requester.id);
     expect(approved.response.status).toBe(200);
-    expect(approved.body.data.mission.status).toBe('review');
+    expect(approved.body.data.mission.status).toBe('running');
+    const finished=await store.listStages(mission.id);
+    for(const stage of finished.filter(s=>stageRequiresArtifact(s,finished))) await store.addDeliverable({id:`GATE-ART-${stage.id}`,missionId:mission.id,stageId:stage.id,attemptNo:stage.attemptNo,agentId:stage.agentId,name:'返工后当前制品',uri:'ipfs://bafycurrentartifact',contentHash:`sha256:${'d'.repeat(64)}`,mimeType:'text/markdown',status:'submitted',createdAt:currentNow});
+    await addOutcomeFixture(mission.id);
+    expect((await api(`/api/missions/${mission.id}/review`,{method:'POST',body:'{}'},developer.id)).body.error).toBeUndefined();
     expect(approved.body.data.stages.every((stage: JsonBody) => stage.status === 'done')).toBe(true);
   });
 
@@ -2289,6 +2356,26 @@ describe('AgentMesh Worker', () => {
       expect(activeOfferIds).toEqual((response.body.data.offers as Array<{ id: string }>).map((offer) => offer.id).sort());
     }
     expect((await store.listEvents(mission.id)).filter((event) => event.type === 'workflow.offers_created')).toHaveLength(1);
+  });
+
+  it('filters mandatory capabilities and rejects a manually assigned incompatible agent without creating offers', async () => {
+    const { mission } = await createMission();
+    const initial = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    const matches = initial.body.data as CandidateMatch[];
+    const assignments = Object.fromEntries(matches.map((match) => [match.stageId, match.candidates[0].agent.id]));
+    store.stages.set(mission.id, (await store.listStages(mission.id)).map((stage) => ({
+      ...stage, input: { ...stage.input, requiredCapabilities: ['unavailable-specialist'] },
+    })));
+    const candidates = await api(`/api/missions/${mission.id}/candidates`, {}, requester.id);
+    expect(candidates.response.status).toBe(200);
+    expect((candidates.body.data as CandidateMatch[]).every((match) => match.candidates.length === 0)).toBe(true);
+    const workflow = await api(`/api/missions/${mission.id}/workflow`, {
+      method: 'POST', body: JSON.stringify({ assignments }),
+    }, requester.id);
+    expect(workflow.response.status).toBe(409);
+    expect(workflow.body.error.code).toBe('AGENT_CAPABILITY_MISMATCH');
+    expect(await store.listStageOffers(mission.id)).toHaveLength(0);
+    expect((await store.getEscrow(mission.id))?.status).toBe('pending');
   });
 
   it('rejects workflow confirmation when an authoritative stage quote exceeds its budget', async () => {
@@ -2738,6 +2825,10 @@ describe('AgentMesh Worker', () => {
     expect((await store.listStages(mission.id)).find((stage) => stage.id === originalStageId)).toMatchObject({ status: 'queued' });
     expect(await store.recoverExpiredStageDispatches(mission.id, currentNow)).toEqual([]);
 
+    expect((await api(`/api/missions/${mission.id}/dispatch`, { method: 'POST', body: '{}' }, requester.id)).response.status).toBe(409);
+    const lease=store.matching.leases.get(originalRunId)!;
+    expect((await api(`/api/agents/${lease.agentId}/capacity-leases`, {method:'POST',body:JSON.stringify({runId:originalRunId,confirmedStopped:true})},developer.id)).response.status).toBe(200);
+    currentNow='2026-08-16T03:01:00.000Z';
     expect((await api(`/api/missions/${mission.id}/dispatch`, { method: 'POST', body: '{}' }, requester.id)).response.status).toBe(202);
     expect(dispatchedBody?.callback.runId).toBe(refreshed.runId);
     expect(dispatchCalls).toBe(2);
@@ -2885,7 +2976,10 @@ describe('AgentMesh Worker', () => {
     expect(await store.listDeliverables(mission.id)).toEqual([
       expect.objectContaining({ name: 'Implementation source archive', mimeType: 'application/zip' }),
     ]);
-    expect((await store.getMission(mission.id))?.status).toBe('review');
+    expect((await store.getMission(mission.id))?.status).toBe('running');
+    expect((await api(`/api/missions/${mission.id}/review`, {method:'POST',body:'{}'},developer.id)).body.error.code).toBe('OUTCOME_PACKAGE_REQUIRED');
+    await addOutcomeFixture(mission.id);
+    expect((await api(`/api/missions/${mission.id}/review`, {method:'POST',body:'{}'},developer.id)).response.status).toBe(200);
     const accepted = await api(`/api/missions/${mission.id}/accept`, { method: 'POST', body: '{}' }, requester.id);
     expect(accepted.response.status).toBe(200);
     expect(accepted.body.data.mission.status).toBe('completed');
@@ -3283,6 +3377,7 @@ describe('AgentMesh Worker', () => {
         verified: true,
       });
     }
+    await addOutcomeFixture(mission.id);
     const review = await api(`/api/missions/${mission.id}/review`, { method: 'POST', body: '{}' }, developer.id);
     expect(review.body.data.status).toBe('review');
     expect(review.body.data.reviewDueAt).toBe('2026-08-23T00:00:00.000Z');
@@ -3349,6 +3444,7 @@ describe('AgentMesh Worker', () => {
         verified: true,
       });
     }
+    await addOutcomeFixture(mission.id);
     await api(`/api/missions/${mission.id}/review`, { method: 'POST', body: '{}' }, developer.id);
 
     const accepted = await Promise.all([
@@ -3512,31 +3608,18 @@ describe('AgentMesh Worker', () => {
     expect(await store.listAgentHealthChecks('research-agent')).toHaveLength(0);
   });
 
-  it('accepts only versioned requester feedback for completed and released task stages', async () => {
+  it('keeps historical feedback readable but routes new submissions to sealed bilateral reviews', async () => {
     const { mission, stages } = await createMission();
-    const task = { ...stages[0], status: 'done' as const, agentId: 'research-agent', output: { summary: 'verified' } };
+    const task = { ...stages[0], status: 'done' as const, agentId: 'research-agent' };
     store.stages.set(mission.id, [task]);
-    store.missions.set(mission.id, { ...mission, status: 'completed', progress: 100, currentStage: '已结算' });
-    const escrow = store.escrows.get(mission.id)!;
-    store.escrows.set(mission.id, { ...escrow, status: 'released', releasedAt: currentNow });
-    const input = { deliveryQuality: 5, requirementsFit: 4, communication: 5, onTime: true, reuse: true, comment: '交付完整，证据清晰，符合任务验收标准。' };
-    const headers = { 'Idempotency-Key': 'quality-feedback-v1' };
-    const first = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers, body: JSON.stringify(input) }, requester.id);
-    const replay = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers, body: JSON.stringify(input) }, requester.id);
-    expect(first.response.status, JSON.stringify(first.body)).toBe(200);
-    expect(first.body.data.feedback.version).toBe(1);
-    expect(replay.body.data.feedback.id).toBe(first.body.data.feedback.id);
-    const forbidden = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers: { 'Idempotency-Key': 'quality-feedback-forbidden' }, body: JSON.stringify(input) }, developer.id);
+    const input = { deliveryQuality: 5, requirementsFit: 4, communication: 5, onTime: true, reuse: true, comment: '旧入口不得绕过七天双盲互评。' };
+    const denied = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', body: JSON.stringify(input) }, requester.id);
+    expect(denied.response.status).toBe(409);
+    expect(denied.body.error.code).toBe('BILATERAL_REVIEW_REQUIRED');
+    const forbidden = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', body: JSON.stringify(input) }, developer.id);
     expect(forbidden.response.status).toBe(403);
-    const updated = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, { method: 'PUT', headers: { 'Idempotency-Key': 'quality-feedback-v2' }, body: JSON.stringify({ ...input, deliveryQuality: 4 }) }, requester.id);
-    expect(updated.body.data.feedback.version).toBe(2);
-    expect(await store.listAgentFeedback('research-agent')).toHaveLength(1);
-    const sensitive = await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, {
-      method: 'PUT', headers: { 'Idempotency-Key': 'quality-feedback-sensitive' },
-      body: JSON.stringify({ ...input, comment: 'Bearer sensitive-token-value-must-not-be-public' }),
-    }, requester.id);
-    expect(sensitive.response.status).toBe(400);
-    expect(sensitive.body.error.code).toBe('SENSITIVE_CONTENT_REJECTED');
+    expect((await api(`/api/missions/${mission.id}/stages/${task.id}/feedback`, {}, requester.id)).body.data).toBeNull();
+    expect(await store.listAgentMetricEvents('research-agent')).toHaveLength(0);
   });
 
   it('reports a missing Worker credential instead of masking it as an unreachable Agent', async () => {
@@ -4059,6 +4142,7 @@ describe('AgentMesh Worker', () => {
     expect(initialDispatch.response.status).toBe(202);
     const oldDispatchBody = structuredClone(dispatchedBody!);
     await store.updateStage(mission.id, target.id, 'done', { summary: '原始交付', evidence: ['v1'] });
+    await store.matching.finish(oldDispatchBody.callback.runId,'released'); // Fixture simulates a completed remote execution.
     expect((await api(`/api/missions/${mission.id}/pause`, {
       method: 'POST', body: JSON.stringify({ reason: '需要根据新证据返工已完成节点。' }),
     }, requester.id)).response.status).toBe(200);
@@ -4129,5 +4213,104 @@ describe('AgentMesh Worker', () => {
     expect(result.response.status).toBe(400);
     expect(result.body.error.code).toBe('VALIDATION_ERROR');
     expect(store.missions.size).toBe(0);
+  });
+});
+
+describe('mission creation deadline boundary', () => {
+  it.each([
+    ['2026-02-30T12:00:00Z', 400],
+    ['2026-09-01T12:00:00', 400],
+    ['2026-08-16T00:00:00Z', 400],
+    ['2026-08-15T23:59:59Z', 400],
+    ['2026-09-01T12:00:00+08:00', 201],
+    ['2026-09-01', 201],
+  ])('validates %s before creating a mission', async (deadline, status) => {
+    const result = await api('/api/missions', {
+      method: 'POST',
+      body: JSON.stringify({ title: '创建一个有明确截止时间的任务', description: '核对用户设定的交付时间并形成可验证的任务成果报告。', category: '商业研究', tags: [], budget: 300, deadline }),
+    }, requester.id);
+    expect(result.response.status).toBe(status);
+    if (status === 201) expect(result.body.data.mission.deadline).toBe(deadline);
+    else expect(store.missions.size).toBe(0);
+  });
+});
+
+describe('pending mission rescheduling',()=>{
+  it('invalidates offers and stale plans, rejects concurrent edits and funding afterward requires fresh offers',async()=>{
+    const {mission}=await createMission();
+    const candidates=(await api(`/api/missions/${mission.id}/candidates`,{},requester.id)).body.data as CandidateMatch[];
+    await api(`/api/missions/${mission.id}/workflow`,{method:'POST',body:JSON.stringify({assignments:Object.fromEntries(candidates.map(c=>[c.stageId,c.candidates[0].agent.id]))})},requester.id);
+    await acceptAllStageOffers(mission.id);
+    const version=(await store.getMission(mission.id))!.workflowVersion;
+    const offers=await store.listStageOffers(mission.id);
+    expect(offers.length).toBeGreaterThan(0);
+    const body=JSON.stringify({deadline:'2026-10-01T18:00:00+08:00',workflowVersion:version});
+    expect((await api(`/api/missions/${mission.id}/deadline`,{method:'PATCH',body},developer.id)).response.status).toBe(403);
+    const results=await Promise.all([api(`/api/missions/${mission.id}/deadline`,{method:'PATCH',body},requester.id),api(`/api/missions/${mission.id}/deadline`,{method:'PATCH',body},requester.id)]);
+    expect(results.map(r=>r.response.status).sort()).toEqual([200,409]);
+    expect(await store.listStageOffers(mission.id)).toHaveLength(0);
+    expect(store.stageOfferHistory.size).toBeGreaterThanOrEqual(offers.length);
+    expect((await store.getMission(mission.id))!.workflowVersion).toBe(version+1);
+    expect((await api(`/api/missions/${mission.id}/start`,{method:'POST',body:'{}'},requester.id)).response.status).toBe(409);
+  });
+  it('rejects rescheduling funded tasks without changing their deadline',async()=>{
+    const {mission}=await createFundedMission();
+    const response=await api(`/api/missions/${mission.id}/deadline`,{method:'PATCH',body:JSON.stringify({deadline:'2026-10-01T00:00:00Z',workflowVersion:mission.workflowVersion})},requester.id);
+    expect(response.response.status).toBe(409);
+    expect((await store.getMission(mission.id))!.deadline).toBe(mission.deadline);
+  });
+});
+
+
+describe('official completion aggregation',()=>{
+  it('cron retries assembly failures after dispatch work has drained',async()=>{
+    const {mission,stages}=await createFundedMission();
+    const official={...agent('official-evidence-scout','研究',10),official:true,endpoint:'agentmesh://builtin/research'};
+    store.agents.set(official.id,official);
+    store.stages.set(mission.id,stages.map(s=>({...s,agentId:official.id,status:'done',input:{executionMode:'analyze'},output:{summary:'实际结果',deliverable:'完成的报告正文。'}})));
+    store.edges.set(mission.id,[]);store.dispatchOutbox.clear();
+    const control=store.missionControls.get(mission.id)!;control.schedulerState='clean';
+    let fails=true;let calls=0;
+    const cronApp=createApp({storeFactory:()=>store,now:()=>new Date(currentNow),pinmeUploader:async()=>{calls++;if(fails)throw new Error('Temporary upload failure');return {rootCid:'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3bn5o2viwzgr4c6a3b6pydf4y',publicUrl:'https://delivery.example.test',shortUrl:null,pinmeUrl:null,dnsUrl:null};},endpointValidator:async()=>undefined});
+    const tick=async()=>{const waits:Promise<unknown>[]=[];await cronApp.scheduled(null,testEnv,{waitUntil(p){waits.push(p);}});await Promise.all(waits);};
+    await tick();expect((await store.getMission(mission.id))!.status).toBe('running');expect(calls).toBe(1);
+    fails=false;await tick();expect((await store.getMission(mission.id))!.status).toBe('review');expect(calls).toBe(2);
+    await tick();expect(calls).toBe(2);
+  });
+  it.each(['parallel','approval'])('assembles complete %s DAGs after the final state is available',async topology=>{
+    const {mission,stages}=await createFundedMission();
+    const official={...agent('official-evidence-scout','研究',10),official:true,endpoint:'agentmesh://builtin/research'};
+    store.agents.set(official.id,official);
+    const completed=stages.map((s,i)=>({...s,agentId:official.id,nodeType:topology==='approval'&&i===stages.length-1?'approval' as const:'task' as const,status:'done' as const,input:{executionMode:'analyze'},output:{summary:'实际工作结果',deliverable:'# 已完成报告\n\n事实与结论。'}}));
+    store.stages.set(mission.id,completed);store.edges.set(mission.id,[]);store.deliverables.set(mission.id,[]);
+    const published:Array<string[]>=[];
+    const deps={pinmeUploader:async(_env:unknown,input:{files:Array<{path:string}>})=>{published.push(input.files.map(f=>f.path));return {rootCid:'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3bn5o2viwzgr4c6a3b6pydf4y',publicUrl:'https://delivery.example.test',shortUrl:null,pinmeUrl:null,dnsUrl:null};}};
+    await assembleCompletedBuiltinOutcome(store,testEnv,deps,mission);
+    await assembleCompletedBuiltinOutcome(store,testEnv,deps,mission);
+    expect(published).toHaveLength(1);
+    const outcomes=await store.listDeliverables(mission.id);
+    expect(outcomes).toHaveLength(1);expect(outcomes[0].stageId).toBeNull();
+    expect(outcomes[0].ipfsEvidence!.manifest.outcomePackage!.stages).toHaveLength(completed.length);
+    expect(published[0]).toContain('acceptance-report.md');
+    expect((await api(`/api/missions/${mission.id}/review`,{method:'POST',body:'{}'},developer.id)).response.status).toBe(200);
+  });
+});
+
+
+describe('outcome file verification',()=>{
+  it('rejects mismatched report bytes and only accepts after every mandatory file matches',async()=>{
+    const {mission,stages}=await createFundedMission();
+    for(const stage of stages)await store.updateStage(mission.id,stage.id,'done',{summary:'实际结果',verified:true});
+    const {deliverable,bundle}=await addOutcomeFixture(mission.id);
+    store.deliverables.get(mission.id)!.find(d=>d.id===deliverable.id)!.ipfsEvidence!.verificationStatus='declared';
+    let requestNo=0;
+    ipfsResponder=()=>new Response(requestNo++===0?JSON.stringify(bundle.manifest):'wrong bytes');
+    const failed=await api(`/api/missions/${mission.id}/deliverables/${deliverable.id}/verify`,{method:'POST',body:'{}'},developer.id);
+    expect(failed.body.data.ipfsEvidence.verificationStatus).toBe('hash_mismatch');
+    requestNo=0;
+    const paths=['deliverable.md','index.html','acceptance-report.md','artifact-index.md'];
+    ipfsResponder=()=>new Response(requestNo++===0?JSON.stringify(bundle.manifest):String(bundle.files.find(f=>f.path===paths[requestNo-2])!.content));
+    const verified=await api(`/api/missions/${mission.id}/deliverables/${deliverable.id}/verify`,{method:'POST',body:'{}'},developer.id);
+    expect(verified.body.data.ipfsEvidence.verificationStatus).toBe('verified');expect(requestNo).toBe(5);
   });
 });

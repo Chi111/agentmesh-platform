@@ -1,3 +1,4 @@
+import { matchCandidates } from './logic';
 import { describe, expect, it } from 'vitest';
 import type { Agent, Mission, WorkflowStage } from './contracts';
 import { loadMultiplierForActiveAssignments, PRICING_FORMULA_VERSION, quoteStage, settlementWeight } from './pricing';
@@ -67,5 +68,46 @@ describe('stage pricing', () => {
   it('falls back to legacy stage weights when a quote snapshot is unavailable', () => {
     expect(settlementWeight(stage, [])).toBe(50);
     expect(settlementWeight(stage, [{ stageId: stage.id, quote: { ...quoteStage(mission, stage, agent), amount: 31.74 } }])).toBe(31.74);
+  });
+});
+
+
+describe('candidate eligibility before ranking', () => {
+  it('excludes an over-budget high-reputation agent instead of keeping it as fallback', () => {
+    const matches = matchCandidates(mission, [stage], [agent, { ...agent, id: 'expensive', price: 1000, trustScore: 10 }]);
+    expect(matches[0].candidates.map((candidate) => candidate.agent.id)).toEqual([agent.id]);
+    expect(matchCandidates(mission, [stage], [{ ...agent, price: 1000 }])[0].candidates).toEqual([]);
+  });
+
+  it('accepts the exact quote boundary and applies the current load factor', () => {
+    const pricedStage = { ...stage, budget: quoteStage(mission, stage, agent).amount };
+    expect(matchCandidates(mission, [pricedStage], [agent])[0].candidates).toHaveLength(1);
+    expect(matchCandidates(mission, [pricedStage], [agent], new Map([[agent.id, 1.2]]))[0].candidates).toEqual([]);
+  });
+
+  it('requires every explicit capability, matching whole tags case-insensitively', () => {
+    const requiredStage = { ...stage, input: { ...stage.input, requiredCapabilities: [' React ', '软件开发'] } };
+    const capable = { ...agent, tags: ['react'] };
+    const partial = { ...agent, id: 'partial', tags: ['react-native'] };
+    expect(matchCandidates(mission, [requiredStage], [agent, partial, capable])[0].candidates.map((candidate) => candidate.agent.id)).toEqual([agent.id]);
+    expect(matchCandidates(mission, [requiredStage], [{ ...capable, status: 'paused' } as Agent])[0].candidates).toEqual([]);
+  });
+
+  it('fails closed for malformed capability requirements', () => {
+    for (const requiredCapabilities of ['react', [null], [''], Array(21).fill('react'), ['x'.repeat(81)]]) {
+      expect(matchCandidates(mission, [{ ...stage, input: { requiredCapabilities } }], [agent])[0].candidates).toEqual([]);
+    }
+  });
+
+  it('preserves legacy dynamic categories without claiming cross-domain ability', () => {
+    const candidates = matchCandidates(mission, [{ ...stage, category: '质量验证' }], [agent])[0].candidates;
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].reasons).toContain('分类未匹配，需核实执行能力');
+  });
+
+  it('does not compare native-token budgets to USDC base prices', () => {
+    const matches = matchCandidates({ ...mission, paymentMethod: 'web3_seth' }, [{ ...stage, budget: 0.001 }], [{ ...agent, price: 1000 }]);
+    expect(matches[0].candidates).toHaveLength(1);
+    expect(matches[0].candidates[0].quote?.token).toBe('sETH');
   });
 });

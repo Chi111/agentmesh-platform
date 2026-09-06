@@ -1,3 +1,4 @@
+import { meetsRequiredCapabilities } from '../../shared/agentRequirements';
 import type { Agent, CandidateMatch, Mission, UserContext, WorkflowEdge, WorkflowStage } from './contracts';
 import { allocatePaymentBudget } from './payments';
 import { quoteStage } from './pricing';
@@ -151,7 +152,7 @@ export function matchCandidates(
   const missionTags = mission.tags.map(normalize);
   return stages.filter((stage) => stage.nodeType === 'task').map((stage) => {
     const stageCategory = normalize(stage.category);
-    const ranked = activeAgents.map((agent) => {
+    const ranked = activeAgents.filter((agent) => meetsRequiredCapabilities(agent, stage.input?.requiredCapabilities)).flatMap((agent) => {
       const agentTags = agent.tags.map(normalize);
       const exactCategory = normalize(agent.category) === stageCategory;
       const fuzzyCategory = normalize(agent.category).includes(stageCategory) || stageCategory.includes(normalize(agent.category));
@@ -163,30 +164,26 @@ export function matchCandidates(
       const qualityScore = Math.min(10, agent.quality ? agent.quality.breakdown.quality / 3 : agent.successRate / 10);
       const quote = quoteStage(mission, stage, agent, loadMultiplierByAgent.get(agent.id) ?? 1);
       const hasComparableReferencePrice = quote.comparableToBasePrice;
+      if (hasComparableReferencePrice && quote.amount > stage.budget) return [];
       const priceScore = hasComparableReferencePrice
-        ? quote.amount <= stage.budget ? 10 : Math.max(0, 10 - ((quote.amount - stage.budget) / Math.max(stage.budget, 1)) * 10)
+        ? 10
         : 5;
       const fairness = stableNoise(`${mission.id}:${stage.id}:${agent.id}`) * 2;
       const exposureAdjustment = agent.quality?.newAgent ? -6 : agent.quality?.premium ? 2 : 0;
       const score = Number(Math.max(0, Math.min(100, categoryScore + tagScore + trustScore + qualityScore + priceScore + fairness + exposureAdjustment)).toFixed(1));
       const reasons = [
-        exactCategory ? '专业分类完全匹配' : fuzzyCategory ? '专业分类相近' : '具备跨领域执行能力',
+        exactCategory ? '专业分类完全匹配' : fuzzyCategory ? '专业分类相近' : '分类未匹配，需核实执行能力',
         tagHits ? `命中 ${tagHits} 个任务标签` : '依据历史质量进入候选池',
         agent.quality
           ? `信誉 ${agent.quality.reputation.toFixed(1)} · ${agent.quality.confidence === 'low' ? '低' : agent.quality.confidence === 'medium' ? '中' : '高'}置信度`
           : `信任分 ${agent.trustScore.toFixed(1)} · 成功率 ${agent.successRate.toFixed(1)}%`,
         hasComparableReferencePrice
-          ? quote.amount <= stage.budget ? `动态报价 ${quote.amount} 处于阶段预算内` : `动态报价 ${quote.amount} 高于阶段预算`
+          ? `动态报价 ${quote.amount} 处于阶段预算内`
           : 'sETH 任务不与法币参考价直接比较',
         agent.quality?.newAgent ? '新 Agent 低置信度限量曝光' : agent.quality?.premium ? '高质量历史获得稳定曝光' : '使用标准公平曝光权重',
       ];
-      return { agent, score, reasons, quote };
-    }).sort((left, right) => {
-      const leftOverBudget = left.quote.comparableToBasePrice && left.quote.amount > stage.budget;
-      const rightOverBudget = right.quote.comparableToBasePrice && right.quote.amount > stage.budget;
-      if (leftOverBudget !== rightOverBudget) return leftOverBudget ? 1 : -1;
-      return right.score - left.score || left.agent.id.localeCompare(right.agent.id);
-    });
+      return [{ agent, score, reasons, quote }];
+    }).sort((left, right) => right.score - left.score || left.agent.id.localeCompare(right.agent.id));
     return { stageId: stage.id, stageName: stage.name, candidates: ranked.slice(0, 5) };
   });
 }

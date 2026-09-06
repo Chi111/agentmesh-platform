@@ -109,28 +109,40 @@ export function allocateRewardEpoch(input: {
 }): { merkleRoot: Hex; manifestHash: Hex; allocations: RewardMerkleAllocation[] } {
   if (input.totalRewardUnits <= 0n) throw new Error('INVALID_REWARD_POOL');
   const scores = new Map<string, number>();
+  const fixed = new Map<string, bigint>();
+  const sources = new Set<string>();
   for (const activity of input.activities) {
     if (!activity.eligible || activity.scoreMicros <= 0) continue;
+    const fixedUnits = activity.detail.source === 'reviewed_arbitration_work' ? activity.detail.fixedRewardUnits : null;
     const wallet = input.wallets.get(activity.userId);
-    if (!wallet) continue;
-    scores.set(activity.userId, Math.min(input.accountScoreCap, (scores.get(activity.userId) ?? 0) + activity.scoreMicros));
+    if (fixedUnits !== null) {
+      if (sources.has(activity.sourceKey)) continue;
+      sources.add(activity.sourceKey);
+      if (activity.role !== 'arbitrator' || typeof fixedUnits !== 'string' || !/^[1-9][0-9]*$/.test(fixedUnits)) throw new Error('INVALID_FIXED_REWARD');
+      if (!wallet) throw new Error('FIXED_REWARD_WALLET_REQUIRED');
+      fixed.set(activity.userId, (fixed.get(activity.userId) ?? 0n) + BigInt(fixedUnits));
+    } else if (wallet) {
+      scores.set(activity.userId, Math.min(input.accountScoreCap, (scores.get(activity.userId) ?? 0) + activity.scoreMicros));
+    }
   }
-  const accounts = [...scores.entries()]
-    .map(([userId, effectiveScore]) => ({ userId, walletAddress: input.wallets.get(userId)!, effectiveScore }))
-    .filter((item) => item.effectiveScore > 0)
+  const accounts = [...new Set([...scores.keys(), ...fixed.keys()])]
+    .map(userId => ({ userId, walletAddress: input.wallets.get(userId)!, effectiveScore: scores.get(userId) ?? 0 }))
     .sort((left, right) => left.walletAddress.toLocaleLowerCase().localeCompare(right.walletAddress.toLocaleLowerCase()));
   if (accounts.length === 0) throw new Error('NO_ELIGIBLE_REWARD_ACCOUNTS');
-
+  const fixedTotal = [...fixed.values()].reduce((sum, value) => sum + value, 0n);
+  if (fixedTotal > input.totalRewardUnits) throw new Error('FIXED_REWARD_POOL_INSUFFICIENT');
+  const variablePool = input.totalRewardUnits - fixedTotal;
   const totalScore = accounts.reduce((sum, account) => sum + BigInt(account.effectiveScore), 0n);
-  const amounts = accounts.map((account) => input.totalRewardUnits * BigInt(account.effectiveScore) / totalScore);
-  let remainder = input.totalRewardUnits - amounts.reduce((sum, amount) => sum + amount, 0n);
-  const remainderOrder = accounts
-    .map((account, index) => ({ index, account }))
+  const variableAmounts = accounts.map(account => totalScore ? variablePool * BigInt(account.effectiveScore) / totalScore : 0n);
+  let remainder = totalScore ? variablePool - variableAmounts.reduce((sum, amount) => sum + amount, 0n) : 0n;
+  const remainderOrder = accounts.map((account, index) => ({ index, account })).filter(item => item.account.effectiveScore > 0)
     .sort((left, right) => right.account.effectiveScore - left.account.effectiveScore || left.account.userId.localeCompare(right.account.userId));
   for (let cursor = 0; remainder > 0n; cursor += 1) {
-    amounts[remainderOrder[cursor % remainderOrder.length].index] += 1n;
+    variableAmounts[remainderOrder[cursor % remainderOrder.length].index] += 1n;
     remainder -= 1n;
   }
+  // A fixed-only epoch leaves surplus unallocated for the existing expiry/reclaim flow.
+  const amounts = accounts.map((account, index) => variableAmounts[index] + (fixed.get(account.userId) ?? 0n));
 
   const fundedAccounts = accounts
     .map((account, index) => ({ account, amount: amounts[index] }))
@@ -146,6 +158,8 @@ export function allocateRewardEpoch(input: {
   const merkleRoot = layers.at(-1)![0];
   const allocations = fundedAccounts.map(({ account, amount }, index) => ({
     ...account,
+    // Existing allocation schema requires a positive score; fixed fees do not use this sentinel for proportional allocation.
+    effectiveScore: Math.max(1, account.effectiveScore),
     amountUnits: amount.toString(),
     leafHash: leaves[index],
     proof: proofFor(layers, index),

@@ -1,362 +1,186 @@
 import { layoutWithLines, prepareWithSegments } from '@chenglou/pretext';
-import { useEffect, useRef, type RefObject } from 'react';
+import { useEffect, useRef } from 'react';
 
-interface PretextSignalFieldProps {
-  heroRef: RefObject<HTMLElement | null>;
-  titleLines: readonly [string, string];
-  description: string;
-}
-
-type GlyphTone = 'headline-primary' | 'headline-accent' | 'body';
-
-interface SignalGlyph {
+interface Glyph {
   char: string;
   font: string;
-  homeX: number;
-  homeY: number;
-  startX: number;
-  startY: number;
-  phase: number;
-  colorMix: number;
-  hero: boolean;
-  tone: GlyphTone;
+  x: number;
+  y: number;
+  progress: number;
+  color: string;
 }
 
-function clamp(value: number) {
-  return Math.min(1, Math.max(0, value));
-}
-
-function smoothstep(start: number, end: number, value: number) {
-  const normalized = clamp((value - start) / (end - start));
-  return normalized * normalized * (3 - 2 * normalized);
-}
-
-function seededRandom(seed = 0x7f4a7c15) {
-  let value = seed >>> 0;
-  return () => {
-    value = (value * 1664525 + 1013904223) >>> 0;
-    return value / 4294967296;
-  };
-}
-
-function easeOutExpo(value: number) {
-  return value >= 1 ? 1 : 1 - 2 ** (-10 * value);
-}
-
-export function PretextSignalField({ heroRef, titleLines: heroTitleLines, description: heroDescription }: PretextSignalFieldProps) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-
+/** Pretext maps intact characters and wrapped lines into two coordinated scan effects. */
+export function PretextSignalField({ text, variant = 'title' }: {
+  text: string | readonly [string, string];
+  variant?: 'title' | 'subtitle';
+}) {
+  const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const container = containerRef.current;
-    const context = canvas?.getContext('2d', { alpha: true });
-    if (!canvas || !container || !context) return;
-
-    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const navigatorWithMemory = navigator as Navigator & { deviceMemory?: number };
-    const constrainedDevice = (navigator.hardwareConcurrency || 8) <= 4
-      || (navigatorWithMemory.deviceMemory ?? 8) <= 4;
-    const random = seededRandom();
+    const canvas = ref.current;
+    const title = canvas?.parentElement;
+    const context = canvas?.getContext('2d');
+    if (!canvas || !title || !context) return;
+    const motion = matchMedia('(prefers-reduced-motion: reduce)');
+    const inset = 8;
+    let glyphs: Glyph[] = [];
+    let scanLines: { left: number; right: number; y: number; delay: number }[] = [];
     let width = 0;
     let height = 0;
-    let glyphs: SignalGlyph[] = [];
-    let animationFrame = 0;
-    let visible = true;
+    let frame = 0;
     let disposed = false;
-    let pointerX = -10_000;
-    let pointerY = -10_000;
-    let lastFrameAt = 0;
-    let lastDrawAt = 0;
-    let frameSamples: number[] = [];
-    let renderSamples: number[] = [];
-    let adaptiveLow = constrainedDevice;
-    let layoutScrollY = window.scrollY;
-    let textBounds = { left: 0, top: 0, right: 0, bottom: 0 };
+    let visible = false;
+    let ready = false;
+    let lastTime = 0;
+    let lastDraw = 0;
+    let elapsed = variant === 'subtitle' ? 1400 : 800;
 
-    const layoutGlyphs = () => {
-      const rect = container.getBoundingClientRect();
-      width = Math.max(1, Math.round(rect.width));
-      height = Math.max(1, Math.round(rect.height));
-      const mobile = width < 700;
-      const pixelRatioCap = adaptiveLow || mobile ? 1 : 1.25;
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, pixelRatioCap);
-      canvas.width = Math.round(width * pixelRatio);
-      canvas.height = Math.round(height * pixelRatio);
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-      context.textBaseline = 'middle';
-
-      const nextGlyphs: SignalGlyph[] = [];
-      const rootRect = container.getBoundingClientRect();
-      const addBlock = (
-        text: string,
-        font: string,
-        maxWidth: number,
-        lineHeight: number,
-        originX: number,
-        originY: number,
-        letterSpacing: number,
-        hero: boolean,
-        tone: GlyphTone,
-        align: 'left' | 'center',
-      ) => {
-        const prepared = prepareWithSegments(text, font, {
-          letterSpacing,
-          whiteSpace: 'pre-wrap',
-        });
-        const { lines } = layoutWithLines(prepared, maxWidth, lineHeight);
+    const restore = () => {
+      title.removeAttribute('data-pretext-active');
+      context.clearRect(0, 0, width, height);
+    };
+    const layout = () => {
+      restore();
+      width = title.clientWidth + inset * 2;
+      height = title.clientHeight + inset * 2;
+      const ratio = Math.min(devicePixelRatio || 1, 2);
+      canvas.width = Math.round(width * ratio);
+      canvas.height = Math.round(height * ratio);
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      glyphs = [];
+      scanLines = [];
+      const sources = title.querySelectorAll<HTMLElement>('[data-pretext-source]');
+      const blocks = typeof text === 'string' ? [text] : text;
+      sources.forEach((source, row) => {
+        const style = getComputedStyle(source);
+        const font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+        const letterSpacing = parseFloat(style.letterSpacing) || 0;
+        const lineHeight = parseFloat(style.lineHeight);
+        const prepared = prepareWithSegments(blocks[row], font, { letterSpacing, whiteSpace: 'pre-wrap' });
+        const { lines } = layoutWithLines(prepared, source.clientWidth, lineHeight);
         context.font = font;
+        context.letterSpacing = `${letterSpacing}px`;
+        const metrics = context.measureText(blocks[row]);
+        const baseline = (lineHeight + metrics.fontBoundingBoxAscent - metrics.fontBoundingBoxDescent) / 2;
         lines.forEach((line, lineIndex) => {
-          let cursorX = align === 'center' ? originX + (maxWidth - line.width) / 2 : originX;
-          const lineY = originY + lineIndex * lineHeight;
-          for (const char of Array.from(line.text)) {
-            const charWidth = context.measureText(char).width + letterSpacing;
-            if (char.trim()) {
-              const homeX = cursorX + charWidth / 2;
-              const homeY = lineY;
-              const angle = random() * Math.PI * 2;
-              const scatter = (hero ? 180 : 80) + random() * (hero ? 260 : 160);
-              nextGlyphs.push({
-                char,
-                font,
-                homeX,
-                homeY,
-                startX: homeX + Math.cos(angle) * scatter,
-                startY: homeY + Math.sin(angle) * scatter,
-                phase: random() * Math.PI * 2,
-                colorMix: clamp((homeX - originX) / Math.max(1, maxWidth)),
-                hero,
-                tone,
-              });
-            }
-            cursorX += charWidth;
-          }
+          const lineWidth = context.measureText(line.text).width;
+          const origin = inset + source.offsetLeft + (style.textAlign === 'center' ? (source.clientWidth - lineWidth) / 2 : 0);
+          scanLines.push({ left: origin, right: origin + lineWidth,
+            y: inset + source.offsetTop + lineIndex * lineHeight + baseline + 6,
+            delay: lineIndex * .22 + row * .1 });
+          let prefix = '';
+          Array.from(line.text).forEach((char, index) => {
+            prefix += char;
+            const x = origin + context.measureText(prefix).width - context.measureText(char).width;
+            if (!char.trim()) return;
+            glyphs.push({ char, font, x,
+              y: inset + source.offsetTop + lineIndex * lineHeight + baseline,
+              progress: (x - inset) / Math.max(1, title.clientWidth) + lineIndex * .22 + row * .1,
+              color: variant === 'subtitle' ? '#eaf1ec' : row ? `hsl(${180 - index / Math.max(1, line.text.length - 1) * 65} 72% 75%)` : '#f4f9f7',
+            });
+          });
         });
-      };
-
-      const title = heroRef.current?.querySelector<HTMLElement>('.contract-hero__headline-source');
-      const titleLines = title?.querySelectorAll<HTMLElement>('.contract-hero__line');
-      const description = heroRef.current?.querySelector<HTMLElement>('.contract-hero__description-source');
-
-      if (title && titleLines?.length === heroTitleLines.length && description) {
-        const titleStyle = window.getComputedStyle(title);
-        const titleFont = `${titleStyle.fontWeight} ${titleStyle.fontSize} ${titleStyle.fontFamily}`;
-        const titleLetterSpacing = Number.parseFloat(titleStyle.letterSpacing) || 0;
-        const titleAlign = titleStyle.textAlign === 'center' ? 'center' : 'left';
-        const measuredTitleLines = Array.from(titleLines).map((line) => line.getBoundingClientRect());
-
-        measuredTitleLines.forEach((lineRect, index) => {
-          addBlock(
-            heroTitleLines[index],
-            titleFont,
-            lineRect.width,
-            Number.parseFloat(titleStyle.lineHeight) || lineRect.height,
-            lineRect.left - rootRect.left,
-            lineRect.top - rootRect.top + lineRect.height / 2,
-            titleLetterSpacing,
-            true,
-            index === 0 ? 'headline-primary' : 'headline-accent',
-            titleAlign,
-          );
-        });
-
-        const descriptionRect = description.getBoundingClientRect();
-        const descriptionStyle = window.getComputedStyle(description);
-        const descriptionLineHeight = Number.parseFloat(descriptionStyle.lineHeight)
-          || Number.parseFloat(descriptionStyle.fontSize) * 1.7;
-        addBlock(
-          heroDescription,
-          `${descriptionStyle.fontWeight} ${descriptionStyle.fontSize} ${descriptionStyle.fontFamily}`,
-          descriptionRect.width,
-          descriptionLineHeight,
-          descriptionRect.left - rootRect.left,
-          descriptionRect.top - rootRect.top + descriptionLineHeight / 2,
-          Number.parseFloat(descriptionStyle.letterSpacing) || 0,
-          false,
-          'body',
-          descriptionStyle.textAlign === 'center' ? 'center' : 'left',
-        );
-
-        textBounds = {
-          left: Math.min(...measuredTitleLines.map((line) => line.left), descriptionRect.left) - rootRect.left,
-          top: Math.min(...measuredTitleLines.map((line) => line.top)) - rootRect.top,
-          right: Math.max(...measuredTitleLines.map((line) => line.right), descriptionRect.right) - rootRect.left,
-          bottom: descriptionRect.bottom - rootRect.top,
-        };
-      }
-
-      glyphs = nextGlyphs;
-      layoutScrollY = window.scrollY;
-      container.dataset.quality = adaptiveLow ? 'economy' : 'high';
-      container.dataset.glyphs = String(glyphs.length);
-      container.dataset.ready = 'true';
+      });
+      canvas.dataset.glyphs = String(glyphs.length);
+      canvas.dataset.ready = String(glyphs.length > 0);
     };
 
-    const resize = () => layoutGlyphs();
-    const resizeObserver = new ResizeObserver(resize);
-    resizeObserver.observe(container);
-
-    const handlePointerMove = (event: PointerEvent) => {
-      if (width < 900 || reducedMotion || adaptiveLow) return;
-      pointerX = event.clientX;
-      pointerY = event.clientY;
-    };
-    const handlePointerLeave = () => {
-      pointerX = -10_000;
-      pointerY = -10_000;
-    };
-    window.addEventListener('pointermove', handlePointerMove, { passive: true });
-    document.documentElement.addEventListener('pointerleave', handlePointerLeave);
-
-    const intersectionObserver = new IntersectionObserver(([entry]) => {
-      visible = entry?.isIntersecting ?? true;
-    }, { rootMargin: '15% 0px' });
-    intersectionObserver.observe(container);
-
-    const startedAt = performance.now();
     const draw = (now: number) => {
-      if (disposed) return;
-      animationFrame = window.requestAnimationFrame(draw);
-      if (!visible || document.hidden || !glyphs.length) {
-        lastFrameAt = now;
+      frame = 0;
+      if (disposed || !ready) return;
+      if (motion.matches) {
+        restore();
+        canvas.dataset.phase = 'static';
         return;
       }
-
-      const frameDelta = lastFrameAt ? now - lastFrameAt : 16.7;
-      lastFrameAt = now;
-      if (frameDelta < 120) frameSamples.push(frameDelta);
-      const mobile = width < 700;
-      const targetFrameMs = adaptiveLow ? 50 : mobile ? 41 : 33;
-      if (!reducedMotion && now - lastDrawAt < targetFrameMs) return;
-      lastDrawAt = now;
-
-      const renderStartedAt = performance.now();
+      if (!visible || document.hidden) return;
+      // Keep the rhythm stable even when the background scene drops frames.
+      elapsed += lastTime ? now - lastTime : 0;
+      lastTime = now;
+      frame = requestAnimationFrame(draw);
+      if (now - lastDraw < 32) return;
+      lastDraw = now;
+      const duration = variant === 'subtitle' ? 6500 : 5000;
+      const sweep = (elapsed % duration) / duration * (1.7 + (scanLines[scanLines.length - 1]?.delay ?? 0)) - .35;
+      canvas.dataset.phase = 'flow';
+      canvas.dataset.cycle = String(Math.floor(elapsed / duration));
       context.clearRect(0, 0, width, height);
-      const elapsed = now - startedAt;
-      const progress = Number(heroRef.current?.style.getPropertyValue('--hero-scene-progress') || 0);
-      if (progress < 0.04 && Math.abs(window.scrollY - layoutScrollY) > 4) layoutGlyphs();
-      const scrollFade = 1 - smoothstep(0.18, 0.36, progress);
-      container.dataset.scrollFade = scrollFade.toFixed(3);
-      const scannerX = ((elapsed * 0.15) % (width + 440)) - 220;
-      const pointerRadius = adaptiveLow ? 0 : 180;
-
-      if (!reducedMotion && scannerX > textBounds.left - 60 && scannerX < textBounds.right + 60) {
-        const scanGradient = context.createLinearGradient(scannerX - 44, 0, scannerX + 44, 0);
-        scanGradient.addColorStop(0, 'rgba(98, 237, 247, 0)');
-        scanGradient.addColorStop(0.5, `rgba(98, 237, 247, ${0.055 * scrollFade})`);
-        scanGradient.addColorStop(1, 'rgba(98, 237, 247, 0)');
-        context.fillStyle = scanGradient;
-        context.fillRect(scannerX - 44, textBounds.top - 18, 88, textBounds.bottom - textBounds.top + 36);
-        context.fillStyle = `rgba(207, 253, 255, ${0.18 * scrollFade})`;
-        context.fillRect(scannerX, textBounds.top - 12, 0.7, textBounds.bottom - textBounds.top + 24);
-      }
-
-      for (let index = 0; index < glyphs.length; index += 1) {
-        const glyph = glyphs[index];
-        const introDelay = glyph.hero ? index * 9 : 500 + index * 4;
-        const intro = reducedMotion ? 1 : easeOutExpo(clamp((elapsed - introDelay) / (glyph.hero ? 1250 : 900)));
-        const dx = glyph.homeX - pointerX;
-        const dy = glyph.homeY - pointerY;
-        const pointerDistance = Math.hypot(dx, dy);
-        const pointerForce = pointerRadius ? smoothstep(pointerRadius, 0, pointerDistance) : 0;
-        const scanForce = Math.max(0, 1 - Math.abs(glyph.homeX - scannerX) / 145);
-        const assemblyPulse = glyph.hero
-          ? Math.max(0, 1 - Math.abs(elapsed - introDelay - 620) / 620)
-          : Math.max(0, 1 - Math.abs(elapsed - introDelay - 420) / 420) * 0.2;
-        const drift = reducedMotion ? 0 : Math.sin(elapsed * 0.0011 + glyph.phase) * (glyph.hero ? 2.2 : 1.1);
-        const safeDistance = Math.max(1, pointerDistance);
-        const repelX = (dx / safeDistance) * pointerForce * 22;
-        const repelY = (dy / safeDistance) * pointerForce * 18;
-        const x = glyph.startX + (glyph.homeX - glyph.startX) * intro + repelX;
-        const y = glyph.startY + (glyph.homeY - glyph.startY) * intro + repelY + drift;
-        const baseAlpha = glyph.hero ? 0.9 : 0.48;
-        const activeAlpha = glyph.hero ? 0.09 : 0.28;
-        const alpha = Math.min(0.98, baseAlpha + Math.max(scanForce, pointerForce) * activeAlpha + assemblyPulse * 0.18)
-          * intro * scrollFade;
-        if (alpha < 0.006) continue;
-
+      title.dataset.pretextActive = 'true';
+      context.textBaseline = 'alphabetic';
+      context.textAlign = 'left';
+      context.letterSpacing = '0px';
+      for (const glyph of glyphs) {
+        const distance = Math.abs(glyph.progress - sweep) / .28;
+        const wave = distance < 1 ? (1 + Math.cos(distance * Math.PI)) / 2 : 0;
+        const subtitle = variant === 'subtitle';
+        const y = glyph.y - wave * (subtitle ? 3 : 7);
         context.font = glyph.font;
-        context.textAlign = 'center';
-        context.shadowBlur = glyph.hero
-          ? 12 * Math.max(scanForce, assemblyPulse)
-          : 8 * Math.max(scanForce, pointerForce, assemblyPulse);
-        const accentRed = Math.round(143 + (183 - 143) * glyph.colorMix);
-        const accentGreen = Math.round(244 + (243 - 244) * glyph.colorMix);
-        const accentBlue = Math.round(251 + (74 - 251) * glyph.colorMix);
-        const isAccent = glyph.tone === 'headline-accent';
-        context.shadowColor = isAccent ? '#85e9f7' : '#d8fffc';
-        context.fillStyle = glyph.tone === 'headline-primary'
-          ? `rgba(244, 249, 247, ${alpha})`
-          : isAccent
-            ? `rgba(${accentRed}, ${accentGreen}, ${accentBlue}, ${alpha})`
-            : `rgba(181, 196, 193, ${alpha})`;
-        if (glyph.hero) {
-          context.lineWidth = 0.8;
-          context.strokeStyle = isAccent
-            ? `rgba(171, 250, 242, ${alpha * 0.32})`
-            : `rgba(255, 255, 255, ${alpha * 0.42})`;
-          context.strokeText(glyph.char, x, y);
+        // A narrow spectral edge gives the title a glass-like refraction at the crest.
+        if (!subtitle && wave > .1) {
+          context.globalAlpha = wave * .32;
+          context.shadowColor = '#7aece6';
+          context.shadowBlur = wave * 8;
+          context.fillStyle = '#57e7fa';
+          context.fillText(glyph.char, glyph.x - wave * 1.8, y + 1);
+          context.fillStyle = '#b5ffd4';
+          context.fillText(glyph.char, glyph.x + wave * 1.8, y - 1);
         }
-        context.fillText(glyph.char, x, y);
-
-        if (!glyph.hero && pointerForce > 0.3 && index > 0 && !adaptiveLow) {
-          const previous = glyphs[index - 1];
-          context.beginPath();
-          context.moveTo(previous.homeX, previous.homeY);
-          context.lineTo(x, y);
-          context.strokeStyle = `rgba(98, 237, 247, ${pointerForce * 0.16})`;
-          context.lineWidth = 0.65;
-          context.stroke();
-        }
+        context.fillStyle = subtitle
+          ? `rgb(${Math.round(234 - wave * 48)}, ${Math.round(241 + wave * 14)}, ${Math.round(236 + wave * 3)})`
+          : glyph.color;
+        context.globalAlpha = subtitle ? .54 + wave * .46 : .9 + wave * .1;
+        context.shadowColor = '#7aece6';
+        context.shadowBlur = subtitle && wave > .1 ? wave * 2 : 0;
+        context.fillText(glyph.char, glyph.x, y);
       }
+      context.globalAlpha = 1;
       context.shadowBlur = 0;
-
-      const renderMs = performance.now() - renderStartedAt;
-      renderSamples.push(renderMs);
-      if (frameSamples.length >= 90) {
-        const averageFrameMs = frameSamples.reduce((sum, sample) => sum + sample, 0) / frameSamples.length;
-        const averageRenderMs = renderSamples.reduce((sum, sample) => sum + sample, 0) / Math.max(1, renderSamples.length);
-        container.dataset.frameMs = averageFrameMs.toFixed(1);
-        container.dataset.renderMs = averageRenderMs.toFixed(2);
-        if (!adaptiveLow && (averageFrameMs > 25 || averageRenderMs > 5.5)) {
-          adaptiveLow = true;
-          layoutGlyphs();
+      if (variant === 'subtitle') {
+        for (const line of scanLines) {
+          const scanner = inset + (sweep - line.delay) * title.clientWidth;
+          const left = Math.max(line.left, scanner - 46);
+          const right = Math.min(line.right, scanner + 8);
+          if (right <= left) continue;
+          const glow = context.createLinearGradient(scanner - 46, 0, scanner + 8, 0);
+          glow.addColorStop(0, '#8ff4fb00');
+          glow.addColorStop(.8, '#8ff4fba8');
+          glow.addColorStop(1, '#8ff4fb00');
+          context.fillStyle = glow;
+          context.fillRect(left, line.y, right - left, 1);
         }
-        frameSamples = [];
-        renderSamples = [];
       }
     };
-
-    const start = async () => {
-      await document.fonts.ready;
+    const sync = () => {
+      cancelAnimationFrame(frame);
+      frame = 0;
+      lastTime = 0;
+      if (motion.matches) {
+        restore();
+        canvas.dataset.phase = 'static';
+      }
+      if (ready && visible && !document.hidden && !motion.matches) frame = requestAnimationFrame(draw);
+    };
+    const observer = new IntersectionObserver(([entry]) => { visible = entry.isIntersecting; sync(); });
+    observer.observe(title);
+    const resize = new ResizeObserver(() => { if (ready) { layout(); sync(); } });
+    resize.observe(title);
+    motion.addEventListener('change', sync);
+    document.addEventListener('visibilitychange', sync);
+    void document.fonts.ready.then(() => {
       if (disposed) return;
-      layoutGlyphs();
-      draw(startedAt + (reducedMotion ? 2_000 : 16.7));
-      if (glyphs.length) heroRef.current?.setAttribute('data-pretext-ready', 'true');
-      container.dataset.frameMs = reducedMotion ? '0.0' : '16.7';
-      container.dataset.renderMs = (renderSamples[0] ?? 0).toFixed(2);
-      if (reducedMotion) {
-        window.cancelAnimationFrame(animationFrame);
-      }
-    };
-    void start();
-
+      layout();
+      ready = glyphs.length > 0;
+      sync();
+    });
     return () => {
       disposed = true;
-      window.cancelAnimationFrame(animationFrame);
-      resizeObserver.disconnect();
-      intersectionObserver.disconnect();
-      window.removeEventListener('pointermove', handlePointerMove);
-      document.documentElement.removeEventListener('pointerleave', handlePointerLeave);
-      heroRef.current?.removeAttribute('data-pretext-ready');
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      resize.disconnect();
+      motion.removeEventListener('change', sync);
+      document.removeEventListener('visibilitychange', sync);
+      restore();
     };
-  }, [heroDescription, heroRef, heroTitleLines]);
-
-  return (
-    <div ref={containerRef} className="contract-pretext" aria-hidden="true">
-      <canvas ref={canvasRef} className="contract-pretext__canvas" />
-    </div>
-  );
+  }, [text, variant]);
+  return <canvas ref={ref} className={`contract-pretext-text contract-pretext-${variant}`} aria-hidden="true" />;
 }

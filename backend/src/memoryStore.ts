@@ -1,3 +1,5 @@
+import { MemoryCollaborationStore } from './collaborationStore';
+import { MemoryMatchingStore } from './matchingStore';
 import type {
   Agent,
   AgentCallbackUpdate,
@@ -125,6 +127,18 @@ function weekStart(value: string): string {
 }
 
 export class MemoryPlatformStore implements PlatformStore {
+  readonly arbitrationRewardEpochItems = new Set<string>();
+  readonly collaboration = new MemoryCollaborationStore(id => ({requesterId:this.missions.get(id)?.requesterId,stages:this.stages.get(id) ?? []}), (proposalId,userId) => (this.disputeVotes.get(proposalId) ?? []).some(v=>v.voterId===userId), id => [...this.disputes.values()].flat().find(d=>d.id===id)?.missionId);
+  readonly matching = new MemoryMatchingStore((lease) => {
+    const mission = this.missions.get(lease.missionId);
+    const stage = this.stages.get(lease.missionId)?.find((row) => row.id === lease.stageId);
+    return this.agents.get(lease.agentId)?.status==='active' && this.agents.get(lease.agentId)?.version===lease.agentVersion && mission?.status === 'running' && this.escrows.get(lease.missionId)?.status === 'held'
+      && !this.missionControls.get(lease.missionId)?.pausedAt && stage?.agentId === lease.agentId
+      && ['queued','running','failed'].includes(stage.status);
+  }, ()=>[...this.stageOffers.values()].flatMap((offers)=>offers.filter((offer)=>offer.status==='accepted').flatMap((offer)=>{
+    const stage=this.stages.get(offer.missionId)?.find((row)=>row.id===offer.stageId);
+    return stage && ['queued','running'].includes(stage.status) && ['matching','running'].includes(this.missions.get(offer.missionId)?.status??'') ? [{missionId:offer.missionId,stageId:offer.stageId,agentId:offer.agentId}] : [];
+  })), (id)=>this.agents.get(id)?.ownerId??'');
   readonly profiles = new Map<string, UserContext>();
   readonly agents = new Map<string, Agent>();
   readonly missions = new Map<string, Mission>();
@@ -468,6 +482,14 @@ export class MemoryPlatformStore implements PlatformStore {
     return copy(missions.filter((mission) => (this.stages.get(mission.id) ?? []).some((stage) => stage.agentId && owned.has(stage.agentId))).map((mission) => this.missionView(mission)));
   }
 
+  async listMissionsAwaitingOutcome(limit:number):Promise<Mission[]> {
+    return [...this.missions.values()].filter(m=>{
+      const stages=this.stages.get(m.id)??[],tasks=stages.filter(s=>s.nodeType==='task');
+      return this.missionView(m).status==='running' && m.deliveryPolicy==='outcome_v1' && tasks.length>0 && stages.every(s=>s.status==='done')
+        && tasks.every(s=>{const a=this.agents.get(s.agentId??'');return a?.official && a.endpoint.startsWith('agentmesh://builtin/');});
+    }).slice(0,limit).map(m=>copy(this.missionView(m)));
+  }
+
   async getMission(id: string): Promise<Mission | null> {
     const mission = this.missions.get(id);
     return mission ? copy(this.missionView(mission)) : null;
@@ -491,6 +513,19 @@ export class MemoryPlatformStore implements PlatformStore {
       releasedAt: null, createdAt: now, updatedAt: now,
     });
     return copy(this.missionView(mission));
+  }
+
+  async rescheduleMission(id: string, requesterId: string, deadline: string, expectedVersion: number, now: string): Promise<WorkflowDraftSaveResult> {
+    const mission=this.missions.get(id), escrow=this.escrows.get(id);
+    if (!mission) return {state:'missing'};
+    if (mission.requesterId!==requesterId || !['draft','matching'].includes(mission.status) || escrow?.status!=='pending') return {state:'locked'};
+    if (mission.workflowVersion!==expectedVersion) return {state:'version_conflict'};
+    for (const offer of this.stageOffers.get(id) ?? []) this.stageOfferHistory.set(offer.id,copy(offer));
+    this.stageOffers.delete(id);
+    const updated: Mission={...mission,deadline,workflowVersion:expectedVersion+1,team:[],compiledSpec:null,status:'matching',currentStage:'截止时间已更新，请重新确认团队',updatedAt:now};
+    this.missions.set(id,updated); escrow.amount=mission.budget; escrow.updatedAt=now;
+    await this.addEvent({id:`EVT-${crypto.randomUUID()}`,missionId:id,stageId:null,type:'mission.rescheduled',message:'截止时间已更新，旧邀请失效',actorType:'requester',actorId:requesterId,payload:{deadline,previousWorkflowVersion:expectedVersion},createdAt:now});
+    return {state:'saved',mission:copy(updated)};
   }
 
   async saveCompilation(
@@ -1482,8 +1517,13 @@ export class MemoryPlatformStore implements PlatformStore {
     }
     const mission = this.missions.get(dispute.missionId);
     const escrow = this.escrows.get(dispute.missionId);
-    if (!mission || !['running', 'review'].includes(mission.status) || escrow?.status !== 'held') {
+    if (!mission || !['running', 'review', 'paused'].includes(mission.status) || escrow?.status !== 'held') {
       throw new Error('ESCROW_NOT_HELD');
+    }
+    if (dispute.collaborationIssueId) {
+      const issue = this.collaboration.issues.get(dispute.collaborationIssueId);
+      if (!issue || issue.missionId !== dispute.missionId || issue.status !== 'escalated' || issue.disputeId) throw new Error('COLLABORATION_ISSUE_NOT_ESCALATED');
+      issue.disputeId = dispute.id; issue.updatedAt = dispute.createdAt;
     }
     this.disputes.set(dispute.missionId, [...(this.disputes.get(dispute.missionId) ?? []), copy(dispute)]);
     if (escrow) this.escrows.set(dispute.missionId, { ...escrow, status: 'frozen', freezeTxHash: dispute.freezeTxHash });
@@ -1595,7 +1635,7 @@ export class MemoryPlatformStore implements PlatformStore {
     const electorate = this.disputeElectorate.get(proposal.id) ?? [];
     const votes = this.disputeVotes.get(proposal.id) ?? [];
     const currentVote = votes.find((vote) => vote.voterId === userId);
-    const eligible = electorate.some((elector) => elector.userId === userId);
+    const eligible = electorate.some((elector) => elector.userId === userId) && ![...this.collaboration.work.values()].some(w => w.proposalId === proposal.id && w.userId === userId && w.status === 'withdrawn');
     const appealProposal = proposals.find((item) => item.round === 1) ?? null;
     const initialProposal = proposals.find((item) => item.round === 0) ?? null;
     return copy({
@@ -1638,6 +1678,7 @@ export class MemoryPlatformStore implements PlatformStore {
     if (Date.parse(votedAt) >= Date.parse(governance.proposal.votingEndsAt)) return { state: 'expired' };
     if (!governance.currentUser.eligible) return { state: 'not_eligible' };
     if (governance.currentUser.hasVoted) return { state: 'already_voted' };
+    if ([...this.collaboration.work.values()].some(w=>w.proposalId===governance.proposal!.id && w.userId===voterId && w.status==='withdrawn')) return { state:'not_eligible' };
     const elector = governance.electorate.find((item) => item.userId === voterId)!;
     const profile = this.profiles.get(voterId);
     const vote: DisputeVote = {
@@ -1813,6 +1854,7 @@ export class MemoryPlatformStore implements PlatformStore {
         id: `${id}:execution_executed`, disputeId: id, actorId, action: 'execution_executed', note: execution!.payloadHash, createdAt: resolvedAt,
       }]);
       for (const vote of this.disputeVotes.get(proposal!.id) ?? []) {
+        if ((await this.collaboration.listWork(id)).some(work => work.userId === vote.voterId)) continue;
         await this.recordRewardActivity({
           id: `YDACT-${id}-arb-${vote.voterId}`,
           sourceKey: `${id}:arbitration:${vote.voterId}`,
@@ -1902,6 +1944,7 @@ export class MemoryPlatformStore implements PlatformStore {
     dispatch.appliedCallbackIds.add(update.callbackId);
     if (update.status === 'done' || update.status === 'failed') {
       dispatch.completedAt = update.now;
+      const lease=this.matching.leases.get(update.runId); if(lease) this.matching.leases.set(update.runId,{...lease,status:'released',completedAt:update.now});
       const outbox = [...this.dispatchOutbox.values()].find((item) => item.runId === update.runId);
       if (outbox) this.dispatchOutbox.set(outbox.id, { ...outbox, status: 'done', updatedAt: update.now });
     }
@@ -1938,7 +1981,7 @@ export class MemoryPlatformStore implements PlatformStore {
   }
 
   async createNotification(notification: Notification): Promise<Notification> {
-    this.notifications.set(notification.userId, [copy(notification), ...(this.notifications.get(notification.userId) ?? [])]);
+    if (!(this.notifications.get(notification.userId) ?? []).some(n=>n.id===notification.id)) this.notifications.set(notification.userId, [copy(notification), ...(this.notifications.get(notification.userId) ?? [])]);
     return copy(notification);
   }
 
@@ -2345,9 +2388,9 @@ export class MemoryPlatformStore implements PlatformStore {
         totalRewardUnits: BigInt(epoch.totalRewardUnits),
         accountScoreCap: epoch.accountScoreCap,
         activities: [...this.rewardActivities.values()].filter((activity) => (
-          activity.eligible
+          !this.arbitrationRewardEpochItems.has(activity.id) && activity.eligible
           && activity.formulaVersion === epoch.formulaVersion
-          && Date.parse(activity.occurredAt) >= Date.parse(epoch.startsAt)
+          && (Date.parse(activity.occurredAt) >= Date.parse(epoch.startsAt) || activity.detail.source === 'reviewed_arbitration_work')
           && Date.parse(activity.occurredAt) < Date.parse(epoch.endsAt)
         )),
         wallets,
@@ -2371,6 +2414,10 @@ export class MemoryPlatformStore implements PlatformStore {
       createdAt: computedAt,
     }));
     const updated = { ...epoch, status: 'computed' as const, merkleRoot: computed.merkleRoot, manifestHash: computed.manifestHash, computedAt, updatedAt: computedAt };
+    for (const activity of this.rewardActivities.values()) {
+      if (activity.eligible && activity.detail.source === 'reviewed_arbitration_work' && activity.formulaVersion === epoch.formulaVersion
+        && activity.occurredAt < epoch.endsAt) this.arbitrationRewardEpochItems.add(activity.id);
+    }
     this.rewardEpochs.set(id, updated);
     this.rewardAllocations.set(id, allocations);
     return { state: 'computed', epoch: copy(updated), allocations: copy(allocations) };

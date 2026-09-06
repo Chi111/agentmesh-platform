@@ -1,10 +1,11 @@
-import type { Deliverable, WorkflowStage } from './contracts';
+import { hasCurrentOutcomePackage } from '../../shared/outcomePackage';
+import type { Deliverable, Mission, WorkflowStage } from './contracts';
 
 export type ExecutionMode = 'analyze' | 'implement' | 'review';
 
 export interface WorkflowDeliveryReadiness {
   ready: boolean;
-  code: 'READY' | 'WORKFLOW_INCOMPLETE' | 'INVALID_STAGE_OUTPUT' | 'ARTIFACT_REQUIRED';
+  code: 'READY' | 'WORKFLOW_INCOMPLETE' | 'INVALID_STAGE_OUTPUT' | 'ARTIFACT_REQUIRED' | 'OUTCOME_PACKAGE_REQUIRED';
   missingOutputStageIds: string[];
   missingArtifactStageIds: string[];
 }
@@ -77,6 +78,7 @@ export function hasMeaningfulStageOutput(stage: Pick<WorkflowStage, 'nodeType' |
 export function workflowDeliveryReadiness(
   stages: WorkflowStage[],
   deliverables: Deliverable[],
+  mission?: Mission,
 ): WorkflowDeliveryReadiness {
   if (stages.length === 0) {
     return { ready: false, code: 'WORKFLOW_INCOMPLETE', missingOutputStageIds: [], missingArtifactStageIds: [] };
@@ -109,5 +111,8 @@ export function workflowDeliveryReadiness(
     return { ready: false, code: 'ARTIFACT_REQUIRED', missingOutputStageIds: [], missingArtifactStageIds };
   }
 
+  if (mission && !hasCurrentOutcomePackage(mission, stages, deliverables)) {
+    return { ready: false, code: 'OUTCOME_PACKAGE_REQUIRED', missingOutputStageIds: [], missingArtifactStageIds: [] };
+  }
   return { ready: true, code: 'READY', missingOutputStageIds: [], missingArtifactStageIds: [] };
 }

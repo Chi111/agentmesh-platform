@@ -1,3 +1,4 @@
+import { CollaborationPanel } from '../components/CollaborationPanel';
 import { BriefcaseBusiness, Check, Clock3, Download, ExternalLink, LoaderCircle, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { PageHeader } from '../components/ui/PageHeader';
@@ -15,6 +16,7 @@ export function DeveloperJobsPage() {
   const respondStageOffer = useAppStore((state) => state.respondStageOffer);
   const [busyOfferId, setBusyOfferId] = useState('');
   const [error, setError] = useState('');
+  const [feedbackMissionId, setFeedbackMissionId] = useState('');
   const missingMissionIds = missions.filter((mission) => !missionDetails[mission.id]).map((mission) => mission.id);
   const ownedAgentIds = new Set(agents.filter((agent) => agent.ownerId === profile?.id).map((agent) => agent.id));
   const offers = missions.flatMap((mission) => {
@@ -93,6 +95,7 @@ export function DeveloperJobsPage() {
         <div className="overflow-x-auto"><table className="w-full min-w-[880px] text-left text-sm"><thead className="border-b border-line bg-canvas/55 text-[10px] uppercase tracking-[0.1em] text-muted"><tr>{['任务','Agent','状态','预算','进度','时间',''].map((item) => <th className="whitespace-nowrap px-5 py-3 font-semibold" key={item}>{item}</th>)}</tr></thead><tbody className="divide-y divide-line">{rows.map((row) => <tr className="hover:bg-canvas/40" key={row.id}><td className="px-5 py-4"><p className="font-mono text-[10px] text-muted">{row.id}</p><p className="mt-1 font-semibold">{row.title}</p></td><td className="px-5 py-4">{row.agent}</td><td className="whitespace-nowrap px-5 py-4"><StatusBadge tone={row.status.tone}>{row.status.label}</StatusBadge></td><td className="whitespace-nowrap px-5 py-4 font-mono font-semibold">{formatPaymentAmount(row.reward, row.paymentMethod)} {paymentToken(row.paymentMethod)}</td><td className="whitespace-nowrap px-5 py-4 font-mono text-xs">{row.progress}%</td><td className="whitespace-nowrap px-5 py-4 text-xs text-muted">{row.time}</td><td className="px-5 py-4"><a href={`#/missions/${row.id}/execution`} className="inline-flex rounded-lg p-2 text-muted hover:bg-canvas hover:text-ink" aria-label={`查看 ${row.id}`}><ExternalLink size={16} /></a></td></tr>)}</tbody></table></div>
         <div className="flex items-center gap-2 border-t border-line px-5 py-4 text-xs text-muted"><BriefcaseBusiness size={14} />共 {rows.length} 条记录</div>
       </section>
+      {missions.length > 0 && <section className="space-y-4"><label className="block"><span className="field-label">开发者反馈 / 合作评价</span><select className="field" value={feedbackMissionId} onChange={e=>setFeedbackMissionId(e.target.value)}><option value="">选择任务，提交问题或评价任务方</option>{missions.map(m=><option value={m.id} key={m.id}>{m.title}</option>)}</select></label>{feedbackMissionId&&<CollaborationPanel key={feedbackMissionId} missionId={feedbackMissionId}/>}</section>}
     </div>
   );
 }

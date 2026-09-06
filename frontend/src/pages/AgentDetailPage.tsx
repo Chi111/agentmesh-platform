@@ -1,3 +1,4 @@
+import { AgentExecutionSettings } from '../components/AgentExecutionSettings';
 import { ArrowLeft, ArrowRight, BarChart3, CheckCircle2, Clock3, Code2, ExternalLink, Fingerprint, LoaderCircle, Pencil, ShieldCheck, Sparkles, WalletCards } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
@@ -119,10 +120,12 @@ export function AgentDetailPage() {
 
       <section className="panel p-6">
         <div className="flex items-center justify-between"><div><p className="eyebrow">Settled Feedback</p><h2 className="mt-2 text-xl font-semibold">已结算任务反馈</h2></div><span className="mono-chip">{qualityDetail?.feedback.length ?? 0} VERIFIED</span></div>
+        {qualityDetail?.bilateralReviews?.length ? <div className="mt-5 grid gap-3 md:grid-cols-2">{qualityDetail.bilateralReviews.map(r=><article key={r.id} className="rounded-xl border border-line p-4"><p className="text-sm font-semibold">{(r.ratings.reduce((a,b)=>a+b,0)/r.ratings.length).toFixed(1)} / 5 · 双盲互评</p><p className="mt-2 whitespace-pre-wrap text-xs">{r.comment}</p><p className="mt-2 text-xs text-muted">{r.eligible?'正常结算 · 计入信誉':'退款 / 取消 · 仅保留经历记录'}</p>{r.responses?.map((response,index)=><p className="mt-2 border-l-2 border-line pl-3 text-xs" key={index}>{response.role==='developer'?'开发者回应':'任务方补充'}：{response.body}</p>)}</article>)}</div> : null}
         {qualityDetail?.feedback.length ? <div className="mt-5 grid gap-3 md:grid-cols-2">{qualityDetail.feedback.slice(0, 6).map((item) => <article className="rounded-xl border border-line p-4" key={item.id}><div className="flex items-center justify-between"><p className="text-xs font-semibold">交付 {item.deliveryQuality}/5 · 符合度 {item.requirementsFit}/5</p><span className="font-mono text-[9px] text-muted">V{item.version}</span></div><p className="mt-2 text-xs leading-5 text-muted">{item.comment || '任务方未填写公开文字说明。'}</p><p className="mt-3 text-[10px] text-muted">{item.onTime ? '准时交付' : '存在延期'} · {item.reuse ? '愿意再次使用' : '暂不复用'}</p></article>)}</div> : <p className="mt-5 rounded-xl border border-dashed border-line p-8 text-center text-xs text-muted">暂无符合结算与反作弊条件的公开反馈。</p>}
       </section>
 
       <section className="flex flex-col gap-4 rounded-2xl border border-lime/40 bg-lime/10 p-5 md:flex-row md:items-center md:justify-between"><div className="flex gap-3"><WalletCards size={20} /><div><p className="text-sm font-semibold">平台协议调度</p><p className="mt-1 text-xs leading-5 text-muted">Agent 由任务匹配引擎调用，付款、证据和争议均通过统一协议处理。</p></div></div><Link className="btn-primary" to="/missions/new">创建任务</Link></section>
+      {canEditPrice ? <AgentExecutionSettings agent={agent} admin={profile?.role==='admin'} /> : null}
     </div>
   );
 }

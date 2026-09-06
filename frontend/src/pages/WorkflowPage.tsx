@@ -1,3 +1,4 @@
+import { localDeadlineInput, formatMissionDeadline } from '../../../shared/missionDeadline';
 import { ArrowLeft, ArrowRight, CheckCircle2, Database, Library, LoaderCircle, LockKeyhole, RefreshCw, WalletCards } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { flushSync } from 'react-dom';
@@ -29,6 +30,8 @@ export function WorkflowPage() {
   const saveWorkflowDraft = useAppStore((state) => state.saveWorkflowDraft);
   const confirmWorkflow = useAppStore((state) => state.confirmWorkflow);
   const startMission = useAppStore((state) => state.startMission);
+  const [deadlineOpen, setDeadlineOpen] = useState(false);
+  const [newDeadline, setNewDeadline] = useState('');
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [startOpen, setStartOpen] = useState(false);
@@ -170,11 +173,22 @@ export function WorkflowPage() {
             <span className="mono-chip hidden sm:inline-flex">DAG v{mission.workflowVersion}</span>
             {locked ? <StatusBadge tone="info">已锁定</StatusBadge> : null}
           </div>
-          <p className="mt-0.5 truncate text-[11px] text-muted"><span className="font-semibold text-ink">{mission.title}</span><span className="mx-1.5 text-line">/</span>拖拽连接依赖，手动分配 Agent</p>
+          <p className="mt-0.5 truncate text-[11px] text-muted"><span className="font-semibold text-ink">{mission.title}</span><span className="mx-1.5 text-line">/</span>按任务证据自动组队，可锁定人选调整</p>
         </div>
+        {!locked && <button type="button" className="btn-secondary shrink-0 !px-3 !text-xs" disabled={busy} onClick={()=>{setDeadlineOpen(!deadlineOpen);const d=new Date(mission.deadline);if(Number.isFinite(d.getTime()))setNewDeadline(localDeadlineInput(d));}}>修改截止时间</button>}
         <button type="button" className="btn-secondary !min-h-9 shrink-0 !px-3 !py-1.5 !text-xs" onClick={() => void openTemplates()} disabled={locked || busy}><Library size={14} /><span className="hidden sm:inline">模板与循环</span></button>
         <div className="hidden items-center gap-2 lg:flex"><span className="rounded-lg bg-canvas px-3 py-2 text-[10px] text-muted">画布拖动 · 按钮缩放 · 托管后锁图</span></div>
       </header>
+
+      {deadlineOpen && !locked && <form className="panel shrink-0 space-y-3 p-3" onSubmit={event=>{event.preventDefault();if(busy)return;void execute(async()=>{
+        const d=new Date(newDeadline);
+        if(!Number.isFinite(d.getTime()) || d.getTime()<=Date.now() || localDeadlineInput(d)!==newDeadline) throw new Error('请选择有效且晚于当前时间的本地截止时间。');
+        await api.rescheduleMission(mission.id,d.toISOString(),mission.workflowVersion);
+        await loadMissionDetail(mission.id);await loadCandidates(mission.id);setDeadlineOpen(false);
+      }).catch(()=>undefined);}}>
+        <p className="text-xs text-muted">当前：{formatMissionDeadline(mission.deadline)}。改期会使旧邀请和推荐方案失效，需要重新确认团队。仅保存到服务器的画布保留，请先保存未提交的编排修改。</p>
+        <div className="flex flex-wrap items-end gap-3"><label className="min-w-0 flex-1"><span className="field-label">新的截止时间（{Intl.DateTimeFormat().resolvedOptions().timeZone}）</span><input className="field" type="datetime-local" required value={newDeadline} onChange={e=>setNewDeadline(e.target.value)}/></label><button className="btn-primary" disabled={busy}>保存改期并重新组队</button></div>
+      </form>}
 
       {error ? <p className="shrink-0 rounded-xl border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger" role="alert">{error}</p> : null}
 
@@ -188,6 +202,7 @@ export function WorkflowPage() {
           offers={detail.offers}
           locked={locked}
           busy={busy}
+          onMatch={(locks,preference)=>api.getMatchPlan(missionId,useAppStore.getState().missionDetails[missionId]?.mission.workflowVersion??mission.workflowVersion,locks,preference)}
           onCompile={compile}
           onSave={save}
           onConfirm={confirm}

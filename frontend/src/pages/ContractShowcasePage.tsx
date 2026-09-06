@@ -18,6 +18,9 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom';
 import { BrandMark } from '../components/brand/BrandMark';
 import { PretextSignalField } from '../components/landing/PretextSignalField';
+import { TaskFlowDemo } from '../components/landing/TaskFlowDemo';
+import { useLandingInteractions } from '../components/landing/useLandingInteractions';
+import '../components/landing/landingEffects.css';
 import { BRAND } from '../constants/brand';
 import {
   PUBLIC_LOCALE_STORAGE_KEY,
@@ -95,6 +98,8 @@ export function ContractShowcasePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const heroRef = useRef<HTMLElement>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
+  useLandingInteractions(pageRef);
   const snapshotLoadingRef = useRef(false);
   const copy = contractShowcaseCopy[locale];
 
@@ -231,7 +236,7 @@ export function ContractShowcasePage() {
     : null;
 
   return (
-    <div className="contract-home min-h-screen overflow-x-clip bg-[#071016] text-[#eaf1ec]" data-locale={locale}>
+    <div ref={pageRef} className="contract-home min-h-screen overflow-x-clip bg-[#071016] text-[#eaf1ec]" data-locale={locale}>
       <header className="contract-site-header absolute inset-x-0 top-0 z-20 border-b border-white/[0.07]">
         <div className="mx-auto flex h-[72px] max-w-[1400px] items-center justify-between px-5 sm:h-20 sm:px-8 lg:px-12">
           <Link to="/" className="flex shrink-0 items-center gap-3" aria-label={copy.navigation.home}>
@@ -252,7 +257,7 @@ export function ContractShowcasePage() {
                 {publicLocaleOptions.map((option) => <option value={option.value} key={option.value}>{option.shortLabel}</option>)}
               </select>
             </label>
-            <Link className="contract-liquid-glass contract-liquid-glass--pill inline-flex min-h-10 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-white/15 px-3 text-[11px] font-semibold text-white transition hover:border-[#32d4e7]/45 hover:bg-[#32d4e7]/10 sm:gap-2 sm:px-4 sm:text-xs" to="/dashboard"><span className="sm:hidden">{copy.navigation.enterPlatformShort}</span><span className="hidden sm:inline">{copy.navigation.enterPlatform}</span> <ArrowRight size={14} /></Link>
+            <Link data-magnetic className="contract-liquid-glass contract-liquid-glass--pill inline-flex min-h-10 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-white/15 px-3 text-[11px] font-semibold text-white transition hover:border-[#32d4e7]/45 hover:bg-[#32d4e7]/10 sm:gap-2 sm:px-4 sm:text-xs" to="/dashboard"><span className="sm:hidden">{copy.navigation.enterPlatformShort}</span><span className="hidden sm:inline">{copy.navigation.enterPlatform}</span> <ArrowRight size={14} /></Link>
           </nav>
         </div>
       </header>
@@ -261,7 +266,6 @@ export function ContractShowcasePage() {
         <section ref={heroRef} className="contract-hero relative h-[215svh]">
           <div className="contract-hero__sticky sticky top-0 flex h-[100svh] items-center overflow-hidden">
             {babylonEnabled ? <Suspense fallback={null}><BabylonHeroScene heroRef={heroRef} /></Suspense> : null}
-            <PretextSignalField heroRef={heroRef} titleLines={copy.hero.title} description={copy.hero.description} />
             <div className="contract-hero__aurora contract-hero__aurora--cyan" aria-hidden="true" />
             <div className="contract-hero__aurora contract-hero__aurora--lime" aria-hidden="true" />
             <div className="contract-hero__wordmark" aria-hidden="true">MESH</div>
@@ -277,16 +281,18 @@ export function ContractShowcasePage() {
                   <span className={`size-1.5 rounded-full ${live ? 'bg-[#b7f34a]' : loading ? 'animate-pulse bg-[#ffd36a]' : 'bg-[#ef7d7d]'}`} />
                   {loading && !snapshot ? copy.hero.connecting : live ? copy.hero.live : snapshot?.paused ? copy.hero.paused : copy.hero.unavailable}
                 </div>
-                <h1 className="contract-hero__headline-source mt-8 max-w-[780px] text-[clamp(3.25rem,7vw,6.8rem)] font-semibold leading-[.88] tracking-[-0.07em] text-white">
-                  <span className="contract-hero__line"><span>{copy.hero.title[0]}</span></span>
-                  <span className="contract-hero__line contract-hero__line--accent"><span>{copy.hero.title[1]}</span></span>
+                <h1 className="contract-hero__headline-source relative mt-8 max-w-[780px] text-[clamp(3.25rem,7vw,6.8rem)] font-semibold leading-[1.08] tracking-[-0.045em] text-white">
+                  <span className="contract-hero__line"><span data-pretext-source>{copy.hero.title[0]}</span></span>
+                  <span className="contract-hero__line contract-hero__line--accent"><span data-pretext-source>{copy.hero.title[1]}</span></span>
+                  <PretextSignalField text={copy.hero.title} />
                 </h1>
-                <p className="contract-hero__description-source contract-hero__intro contract-hero__intro--two mt-8 max-w-xl text-base leading-8 text-white/50 sm:text-lg">
-                  {copy.hero.description}
+                <p className="contract-hero__description-source relative contract-hero__intro contract-hero__intro--two mt-8 max-w-xl text-base leading-8 text-white/50 sm:text-lg">
+                  <span data-pretext-source className="block">{copy.hero.description}</span>
+                  <PretextSignalField text={copy.hero.description} variant="subtitle" />
                 </p>
                 <div className="contract-hero__intro contract-hero__intro--three mt-10 flex flex-wrap gap-3">
-                  {contractAddress ? <a className="contract-hero__primary inline-flex min-h-12 items-center gap-2 rounded-full bg-[#b7f34a] px-5 text-sm font-semibold text-[#071016] transition" href={explorerUrl('address', contractAddress)} target="_blank" rel="noreferrer">{copy.hero.verify} <ArrowUpRight size={16} /></a> : null}
-                  <a className="contract-hero__secondary contract-liquid-glass contract-liquid-glass--pill inline-flex min-h-12 items-center gap-2 rounded-full border border-white/15 px-5 text-sm font-semibold text-white transition" href="#how-it-works">{copy.hero.viewPath} <GitBranch size={16} /></a>
+                  {contractAddress ? <a data-magnetic className="contract-hero__primary inline-flex min-h-12 items-center gap-2 rounded-full bg-[#b7f34a] px-5 text-sm font-semibold text-[#071016] transition" href={explorerUrl('address', contractAddress)} target="_blank" rel="noreferrer">{copy.hero.verify} <ArrowUpRight size={16} /></a> : null}
+                  <a data-magnetic className="contract-hero__secondary contract-liquid-glass contract-liquid-glass--pill inline-flex min-h-12 items-center gap-2 rounded-full border border-white/15 px-5 text-sm font-semibold text-white transition" href="#how-it-works">{copy.hero.viewPath} <GitBranch size={16} /></a>
                 </div>
                 {contractAddress ? <div className="contract-hero__intro contract-hero__intro--four mt-9 flex max-w-xl min-w-0 items-center gap-3 overflow-hidden border-l border-[#32d4e7]/40 pl-4"><span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.15em] text-white/30">Contract</span><a className="min-w-0 flex-1 truncate font-mono text-xs text-white/60 transition hover:text-[#85e9f7]" href={explorerUrl('address', contractAddress)} target="_blank" rel="noreferrer">{contractAddress}</a></div> : null}
               </div>
@@ -329,12 +335,14 @@ export function ContractShowcasePage() {
             <p className="mt-6 max-w-2xl text-base leading-8 text-white/45">{copy.flow.description}</p>
           </div>
 
-          <div className="mt-20 grid gap-3 lg:grid-cols-[1fr_auto_1fr_auto_1fr] lg:items-stretch">
+          <TaskFlowDemo locale={locale} />
+
+          <div className="mt-12 grid gap-3 lg:grid-cols-[1fr_auto_1fr_auto_1fr] lg:items-stretch">
             {[
               { no: '01', title: 'Deposit', cn: copy.flow.cards[0].label, text: copy.flow.cards[0].description, icon: LockKeyhole },
               { no: '02', title: 'Held / Frozen', cn: copy.flow.cards[1].label, text: copy.flow.cards[1].description, icon: GitBranch },
               { no: '03', title: 'Release / Refund', cn: copy.flow.cards[2].label, text: copy.flow.cards[2].description, icon: ShieldCheck },
-            ].map(({ no, title, cn, text, icon: Icon }, index) => <div className="contract-liquid-card group rounded-[2rem] border border-white/[0.09] bg-white/[0.025] p-7 transition hover:border-[#32d4e7]/25 hover:bg-white/[0.04] sm:p-9" key={title}><div className="flex items-center justify-between"><span className="font-mono text-[10px] text-white/25">{no}</span><Icon size={20} className={index === 1 ? 'text-[#ffd36a]' : 'text-[#32d4e7]'} /></div><p className="mt-16 font-mono text-[10px] uppercase tracking-[0.15em] text-white/30">{title}</p><h3 className="mt-3 text-2xl font-semibold text-white">{cn}</h3><p className="mt-4 text-sm leading-7 text-white/40">{text}</p></div>).flatMap((node, index) => index < 2 ? [node, <div className="hidden items-center text-white/20 lg:flex" key={`arrow-${index}`}><ArrowRight size={20} /></div>] : [node])}
+            ].map(({ no, title, cn, text, icon: Icon }, index) => <div data-holographic className="contract-liquid-card group rounded-[2rem] border border-white/[0.09] bg-white/[0.025] p-7 transition hover:border-[#32d4e7]/25 hover:bg-white/[0.04] sm:p-9" key={title}><div className="flex items-center justify-between"><span className="font-mono text-[10px] text-white/25">{no}</span><Icon size={20} className={index === 1 ? 'text-[#ffd36a]' : 'text-[#32d4e7]'} /></div><p className="mt-16 font-mono text-[10px] uppercase tracking-[0.15em] text-white/30">{title}</p><h3 className="mt-3 text-2xl font-semibold text-white">{cn}</h3><p className="mt-4 text-sm leading-7 text-white/40">{text}</p></div>).flatMap((node, index) => index < 2 ? [node, <div className="hidden items-center text-white/20 lg:flex" key={`arrow-${index}`}><ArrowRight size={20} /></div>] : [node])}
           </div>
         </section>
 
@@ -392,7 +400,7 @@ export function ContractShowcasePage() {
         <section className="contract-reveal-section contract-cta-section border-t border-white/[0.08]" data-contract-reveal>
           <div className="contract-cta-glass mx-auto flex max-w-[1400px] flex-col gap-8 px-5 py-16 sm:px-8 md:flex-row md:items-end md:justify-between lg:px-12">
             <div><p className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/25">{BRAND.platform.name} Protocol</p><p className="mt-4 max-w-xl text-2xl font-semibold leading-snug text-white">{copy.cta.description}</p></div>
-            <div className="flex flex-wrap gap-3"><Link className="contract-liquid-glass contract-liquid-glass--pill inline-flex min-h-11 items-center gap-2 rounded-full border border-white/15 px-5 text-xs font-semibold transition hover:bg-white/[0.05]" to="/agents">{copy.cta.browseNetwork}</Link><Link className="inline-flex min-h-11 items-center gap-2 rounded-full bg-white px-5 text-xs font-semibold text-[#071016] transition hover:bg-[#b7f34a]" to="/missions/new">{copy.cta.createMission} <ArrowRight size={14} /></Link></div>
+            <div className="flex flex-wrap gap-3"><Link data-magnetic className="contract-liquid-glass contract-liquid-glass--pill inline-flex min-h-11 items-center gap-2 rounded-full border border-white/15 px-5 text-xs font-semibold transition hover:bg-white/[0.05]" to="/agents">{copy.cta.browseNetwork}</Link><Link data-magnetic className="inline-flex min-h-11 items-center gap-2 rounded-full bg-white px-5 text-xs font-semibold text-[#071016] transition hover:bg-[#b7f34a]" to="/missions/new">{copy.cta.createMission} <ArrowRight size={14} /></Link></div>
           </div>
         </section>
       </main>

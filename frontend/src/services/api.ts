@@ -1,3 +1,5 @@
+import type { CollaborationView, CollaborationIssue, ArbitrationRewardPool, ArbitrationRewardView } from '../../../shared/collaboration';
+import type { MatchPlan, MatchPreference, ExecutionProfile, CapabilityEvidence, CapacityLease } from '../../../shared/matching';
 import type {
   Agent,
   AgentFeedback,
@@ -155,6 +157,13 @@ async function request<T>(
 }
 
 export const api = {
+  getCollaboration: (missionId: string) => request<CollaborationView>(`/api/missions/${encodeURIComponent(missionId)}/collaboration`, { authenticated: true }),
+  collaborationAction: (missionId: string, action: string, body: unknown) => request<unknown>(`/api/missions/${encodeURIComponent(missionId)}/collaboration/${action}`, { method: 'POST', authenticated: true, idempotencyKey: crypto.randomUUID(), body: JSON.stringify(body) }),
+  listEscalatedIssues: () => request<CollaborationIssue[]>('/api/collaboration/issues', { authenticated: true }),
+  getArbitrationCollaboration: (disputeId: string) => request<ArbitrationRewardView>(`/api/disputes/${encodeURIComponent(disputeId)}/collaboration`, { authenticated: true }),
+  arbitrationCollaborationAction: (disputeId: string, action: string, body: unknown) => request<unknown>(`/api/disputes/${encodeURIComponent(disputeId)}/${action}`, { method: 'POST', authenticated: true, idempotencyKey: crypto.randomUUID(), body: JSON.stringify(body) }),
+  listArbitrationRewardPools: () => request<ArbitrationRewardPool[]>('/api/arbitration/reward-pools', { authenticated: true }),
+  createArbitrationRewardPool: (body: unknown) => request<ArbitrationRewardPool>('/api/arbitration/reward-pools', { method: 'POST', authenticated: true, idempotencyKey: crypto.randomUUID(), body: JSON.stringify(body) }),
   listAgents: () => request<Agent[]>('/api/agents'),
   getAgentQuality: (agentId: string) => request<AgentQualityPublicDetail>(`/api/agents/${encodeURIComponent(agentId)}/quality`),
   register: (input: { email: string; password: string; displayName?: string }) =>
@@ -259,6 +268,7 @@ export const api = {
   setArbitrationMember: (userId: string, active: boolean, power?: number) => request<ArbitrationMember>(`/api/arbitration/members/${encodeURIComponent(userId)}`, {
     method: 'PUT', authenticated: true, body: JSON.stringify({ active, ...(power === undefined ? {} : { power }) }),
   }),
+  rescheduleMission: (missionId: string, deadline: string, workflowVersion: number) => request<Mission>(`/api/missions/${encodeURIComponent(missionId)}/deadline`, { method: 'PATCH', authenticated: true, idempotencyKey: crypto.randomUUID(), body: JSON.stringify({deadline, workflowVersion}) }),
   createMission: (input: NewMissionInput) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[] }>('/api/missions', {
     method: 'POST',
     authenticated: true,
@@ -310,6 +320,11 @@ export const api = {
   }>(`/api/missions/${encodeURIComponent(missionId)}/workflow/expand`, {
     method: 'POST', authenticated: true, idempotencyKey: `workflow-expand-${crypto.randomUUID()}`, body: JSON.stringify(input),
   }),
+  getMatchPlan: (missionId: string, workflowVersion: number, lockedAssignments: Record<string,string> = {}, preference: MatchPreference = 'balanced') => request<MatchPlan>(`/api/missions/${encodeURIComponent(missionId)}/match-plan`, {method:'POST',authenticated:true,body:JSON.stringify({workflowVersion,lockedAssignments,preference})}),
+  getExecutionProfile: (agentId:string) => request<{profile:ExecutionProfile|null;evidence:CapabilityEvidence[];leases:CapacityLease[]}>(`/api/agents/${encodeURIComponent(agentId)}/execution-profile`,{authenticated:true}),
+  saveExecutionProfile: (agentId:string, input:{maxConcurrency:number;pool:string;poolConcurrency:number}) => request(`/api/agents/${encodeURIComponent(agentId)}/execution-profile`,{method:'PUT',authenticated:true,body:JSON.stringify(input)}),
+  attestMatchingEvidence: (agentId:string,input:Record<string,unknown>) => request(`/api/agents/${encodeURIComponent(agentId)}/matching-evidence`,{method:'POST',authenticated:true,body:JSON.stringify(input)}),
+  releaseCapacity: (agentId:string,runId:string) => request(`/api/agents/${encodeURIComponent(agentId)}/capacity-leases`,{method:'POST',authenticated:true,body:JSON.stringify({runId,confirmedStopped:true})}),
   getCandidates: (missionId: string) => request<CandidateMatch[]>(`/api/missions/${encodeURIComponent(missionId)}/candidates`, { authenticated: true }),
   confirmWorkflow: (missionId: string, assignments: Record<string, string>) => request<{ mission: Mission; stages: WorkflowStage[]; edges: WorkflowEdge[]; offers: StageOffer[]; escrow: MissionDetail['escrow'] }>(`/api/missions/${encodeURIComponent(missionId)}/workflow`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ assignments }),
@@ -349,8 +364,8 @@ export const api = {
   acceptMission: (missionId: string, releaseTxHash: string | null = null) => request<MissionDetail>(`/api/missions/${encodeURIComponent(missionId)}/accept`, {
     method: 'POST', authenticated: true, body: JSON.stringify({ releaseTxHash }),
   }),
-  createDispute: (missionId: string, reason: string, freezeTxHash: string | null = null) => request<Dispute>(`/api/missions/${encodeURIComponent(missionId)}/disputes`, {
-    method: 'POST', authenticated: true, body: JSON.stringify({ reason, evidence: [], freezeTxHash }),
+  createDispute: (missionId: string, reason: string, freezeTxHash: string | null = null, issueId?: string) => request<Dispute>(`/api/missions/${encodeURIComponent(missionId)}/disputes`, {
+    method: 'POST', authenticated: true, body: JSON.stringify({ reason, evidence: [], freezeTxHash, issueId }),
   }),
   listDisputes: () => request<Dispute[]>('/api/disputes', { authenticated: true }),
   listDisputeActions: (disputeId: string) => request<DisputeAction[]>(`/api/disputes/${encodeURIComponent(disputeId)}/actions`, { authenticated: true }),

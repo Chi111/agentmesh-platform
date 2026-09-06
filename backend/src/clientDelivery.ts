@@ -1,3 +1,4 @@
+import type { OutcomePackage } from '../../shared/outcomePackage';
 import type { DeliverableManifest } from './contracts';
 import { canonicalJson, sha256Json } from './ipfsEvidence';
 import type { PinmeBundleFile } from './pinmeUpload';
@@ -106,10 +107,11 @@ function documentHtml(input: {
 export async function buildClientDeliveryBundle(input: {
   missionId: string;
   missionTitle: string;
-  stageId: string;
+  outcomePackage?: OutcomePackage;
+  stageId: string | null;
   stageName: string;
-  attemptNo: number;
-  agentId: string;
+  attemptNo: number | null;
+  agentId: string | null;
   agentName: string;
   logicalName: string;
   title: string;
@@ -136,7 +138,7 @@ export async function buildClientDeliveryBundle(input: {
     agentName: input.agentName, createdAt: input.createdAt, markdown, workstreams, artifacts,
   });
   const contentFiles: PinmeBundleFile[] = [{ path: 'deliverable.md', content: markdown }];
-  if (workstreams.length > 0) {
+  if (workstreams.length > 0 || input.outcomePackage) {
     contentFiles.push({
       path: 'acceptance-report.md',
       content: acceptanceReportMarkdown(input.acceptanceCriteria ?? {}, input.acceptanceCriteriaSha256),
@@ -155,6 +157,7 @@ export async function buildClientDeliveryBundle(input: {
   }));
   const manifest: DeliverableManifest = {
     schema: 'agentmesh.deliverable-manifest.v1',
+    ...(input.outcomePackage ? { outcomePackage: input.outcomePackage } : {}),
     missionId: input.missionId,
     stageId: input.stageId,
     attemptNo: input.attemptNo,

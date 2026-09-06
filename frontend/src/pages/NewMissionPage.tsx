@@ -7,6 +7,8 @@ import { useAppStore } from '../store/useAppStore';
 import type { ExpertiseLevel, Mission, PaymentMethod } from '../types/domain';
 import { formatPaymentAmount, paymentInput, paymentOptions, paymentToken } from '../utils/payments';
 
+import { localDeadlineInput } from '../../../shared/missionDeadline';
+
 const categories = ['视频生产', '内容生成', '数据研究', '商业分析', '语言服务', '软件开发'];
 const suggestedTags = ['品牌叙事', '短视频', '市场分析', '图像生成', '数据核验', '本地化'];
 
@@ -27,7 +29,7 @@ export function NewMissionPage() {
   const [deadline, setDeadline] = useState(() => {
     const date = new Date();
     date.setDate(date.getDate() + 14);
-    return date.toISOString().slice(0, 10);
+    return localDeadlineInput(date);
   });
   const [priority, setPriority] = useState<Mission['priority']>('normal');
   const [expertise, setExpertise] = useState<ExpertiseLevel>('expert');
@@ -38,14 +40,24 @@ export function NewMissionPage() {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (submitting) return;
     if (title.trim().length < 8 || description.trim().length < 30) {
       setError('请提供至少 8 个字的目标标题和 30 个字的任务描述。');
+      return;
+    }
+    const deadlineDate = new Date(deadline);
+    if (!Number.isFinite(deadlineDate.getTime()) || deadlineDate.getTime() <= Date.now()) {
+      setError('请选择晚于当前时间的截止时间。');
+      return;
+    }
+    if (localDeadlineInput(deadlineDate) !== deadline) {
+      setError('该本地时间因时区切换不存在，请重新选择截止时间。');
       return;
     }
     setError('');
     setSubmitting(true);
     try {
-      const id = await createMission({ title: title.trim(), description: description.trim(), category, tags, budget, paymentMethod, deadline, priority, expertise, yieldEnabled: false });
+      const id = await createMission({ title: title.trim(), description: description.trim(), category, tags, budget, paymentMethod, deadline: deadlineDate.toISOString(), priority, expertise, yieldEnabled: false });
       navigate(`/missions/${id}/workflow`);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : '任务创建失败，请稍后重试。');
@@ -68,12 +80,12 @@ export function NewMissionPage() {
             <div className="mt-5 space-y-5">
               <label>
                 <span className="field-label">目标标题</span>
-                <input className="field" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：生成一条 60 秒的产品宣传短片" />
+                <input className="field" maxLength={160} required value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：生成一条 60 秒的产品宣传短片" />
               </label>
               <label>
                 <span className="field-label">结果描述</span>
-                <textarea className="field min-h-36 resize-y" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明业务背景、受众、交付物、质量标准和必须遵守的限制…" />
-                <span className="mt-2 block text-right font-mono text-[10px] text-muted">{description.length} / 2,000</span>
+                <textarea className="field min-h-36 resize-y" maxLength={5000} required value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明业务背景、受众、交付物、质量标准和必须遵守的限制…" />
+                <span className="mt-2 block text-right font-mono text-[10px] text-muted">{description.length} / 5,000</span>
               </label>
             </div>
           </section>
@@ -81,7 +93,7 @@ export function NewMissionPage() {
           <section className="panel p-5 md:p-6">
             <div className="flex items-center gap-3 border-b border-line pb-4">
               <span className="flex size-10 items-center justify-center rounded-xl bg-lime/20"><Tags size={19} /></span>
-              <div><h2 className="font-semibold">分类与语义标签</h2><p className="mt-1 text-xs text-muted">用于 V0 硬匹配和 V1 语义召回。</p></div>
+              <div><h2 className="font-semibold">分类与语义标签</h2><p className="mt-1 text-xs text-muted">帮助识别需求；推荐还会核验能力证据、容量和预算。</p></div>
             </div>
             <div className="mt-5 grid gap-5 md:grid-cols-2">
               <label><span className="field-label">任务分类</span><select className="field" value={category} onChange={(event) => setCategory(event.target.value)}>{categories.map((item) => <option key={item}>{item}</option>)}</select></label>
@@ -117,7 +129,7 @@ export function NewMissionPage() {
             </div>
             <div className="mt-5 grid gap-5 md:grid-cols-3">
               <label><span className="field-label">预算上限（{paymentToken(paymentMethod)}）</span><input className="field" type="number" min={paymentInput(paymentMethod).min} step={paymentInput(paymentMethod).step} value={budget} onChange={(event) => setBudget(readNumber(event.currentTarget, paymentInput(paymentMethod).min))} /></label>
-              <label><span className="field-label">截止日期</span><input className="field" type="date" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label>
+              <label><span className="field-label">截止时间</span><input className="field" type="datetime-local" required value={deadline} onChange={(event) => setDeadline(event.target.value)} /><span className="mt-2 block text-xs text-muted">按当前设备时区（{Intl.DateTimeFormat().resolvedOptions().timeZone}）填写，用于组队工期校验；接单及人工审批等待另计。</span></label>
               <label><span className="field-label">优先级</span><select className="field" value={priority} onChange={(event) => setPriority(event.target.value as Mission['priority'])}><option value="normal">普通</option><option value="high">高</option><option value="urgent">紧急</option></select></label>
             </div>
           </section>
@@ -128,7 +140,7 @@ export function NewMissionPage() {
             <div className="flex items-center gap-2 text-cyan"><BrainCircuit size={19} /><span className="font-mono text-[10px] uppercase tracking-[0.16em]">Intent Compiler</span></div>
             <h2 className="mt-4 text-lg font-semibold">提交后将自动完成</h2>
             <ol className="mt-5 space-y-4">
-              {['识别任务类型与风险', '拆解为可执行阶段', '召回并洗牌候选 Agent', '生成预算与验收标准'].map((item, index) => <li className="flex gap-3 text-sm text-white/65" key={item}><span className="flex size-6 shrink-0 items-center justify-center rounded-full border border-cyan/30 bg-cyan/10 font-mono text-[9px] text-cyan">0{index + 1}</span>{item}</li>)}
+              {['识别任务类型与风险', '拆解为可执行阶段', '核验能力并推荐可行团队', '生成预算与验收标准'].map((item, index) => <li className="flex gap-3 text-sm text-white/65" key={item}><span className="flex size-6 shrink-0 items-center justify-center rounded-full border border-cyan/30 bg-cyan/10 font-mono text-[9px] text-cyan">0{index + 1}</span>{item}</li>)}
             </ol>
             <div className="mt-6 border-t border-white/10 pt-4">
               <div className="flex justify-between text-xs text-white/45"><span>最高预算</span><span className="font-mono text-white">{formatPaymentAmount(budget, paymentMethod)}</span></div>

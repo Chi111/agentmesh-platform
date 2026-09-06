@@ -1,3 +1,5 @@
+import { D1CollaborationStore } from './collaborationStore';
+import { D1MatchingStore } from './matchingStore';
 import type {
   Agent,
   AgentCallbackUpdate,
@@ -515,6 +517,7 @@ function mapMission(row: Row): Mission {
     budget: number(row.budget_usdc),
     paymentMethod: (text(row.payment_method) || 'web2_balance') as Mission['paymentMethod'],
     deadline: text(row.deadline),
+    deliveryPolicy: text(row.delivery_policy) === 'outcome_v1' ? 'outcome_v1' : 'legacy',
     reviewDueAt: text(row.review_due_at) || null,
     priority: text(row.priority) as Mission['priority'],
     expertise: text(row.expertise) as Mission['expertise'],
@@ -537,6 +540,7 @@ function mapMission(row: Row): Mission {
 }
 
 const missionRuntimeColumns = `
+  (SELECT policy FROM mission_delivery_policies WHERE mission_id = m.id) AS delivery_policy,
   c.paused_at AS runtime_paused_at,
   c.paused_by AS runtime_paused_by,
   c.pause_reason AS runtime_pause_reason,
@@ -1090,7 +1094,9 @@ function refreshAgentPerformance(
 }
 
 export class D1PlatformStore implements PlatformStore {
-  constructor(private readonly db: D1Database) {}
+  readonly collaboration: D1CollaborationStore;
+  readonly matching: D1MatchingStore;
+  constructor(private readonly db: D1Database) { this.matching = new D1MatchingStore(db); this.collaboration = new D1CollaborationStore(db); }
 
   async ensureIdentityProfile(identity: AuthIdentityInput): Promise<UserContext> {
     const normalizedEmail = identity.email?.trim().toLocaleLowerCase() || null;
@@ -1507,6 +1513,18 @@ export class D1PlatformStore implements PlatformStore {
     return results.map(mapMission);
   }
 
+  async listMissionsAwaitingOutcome(limit:number):Promise<Mission[]> {
+    const {results}=await this.db.prepare(`SELECT m.*, ${missionRuntimeColumns} FROM missions m
+      LEFT JOIN mission_runtime_controls c ON c.mission_id=m.id
+      WHERE m.status='running' AND m.cancelled_at IS NULL AND c.paused_at IS NULL
+      AND EXISTS (SELECT 1 FROM mission_delivery_policies p WHERE p.mission_id=m.id AND p.policy='outcome_v1')
+      AND EXISTS (SELECT 1 FROM workflow_stages s WHERE s.mission_id=m.id AND s.node_type='task')
+      AND NOT EXISTS (SELECT 1 FROM workflow_stages s WHERE s.mission_id=m.id AND s.status<>'done')
+      AND NOT EXISTS (SELECT 1 FROM workflow_stages s LEFT JOIN agents a ON a.id=s.agent_id WHERE s.mission_id=m.id AND s.node_type='task'
+        AND (a.id IS NULL OR a.official<>1 OR a.endpoint_url NOT LIKE 'agentmesh://builtin/%'))
+      ORDER BY m.updated_at,m.id LIMIT ?`).bind(limit).all<Row>();return results.map(mapMission);
+  }
+
   async getMission(id: string): Promise<Mission | null> {
     const row = await this.db.prepare(`SELECT m.*, ${missionRuntimeColumns} FROM missions m LEFT JOIN mission_runtime_controls c ON c.mission_id = m.id WHERE m.id = ?`).bind(id).first<Row>();
     return row ? mapMission(row) : null;
@@ -1529,6 +1547,7 @@ export class D1PlatformStore implements PlatformStore {
         mission.workflowVersion, JSON.stringify(mission.workflowViewport),
         mission.createdAt, mission.updatedAt,
       ),
+      this.db.prepare('INSERT INTO mission_delivery_policies (mission_id, policy) VALUES (?, ?)').bind(mission.id, mission.deliveryPolicy ?? 'legacy'),
       ...stages.map((stage) => stageInsert(this.db, stage)),
       ...edges.map((edge) => edgeInsert(this.db, edge)),
       ...edges.map((edge) => edgeRuleInsert(this.db, edge)),
@@ -1546,6 +1565,34 @@ export class D1PlatformStore implements PlatformStore {
     ];
     await this.db.batch(statements);
     return mission;
+  }
+
+  async rescheduleMission(id: string, requesterId: string, deadline: string, expectedVersion: number, now: string): Promise<WorkflowDraftSaveResult> {
+    const token = crypto.randomUUID();
+    const results = await this.db.batch([
+      this.db.prepare(`UPDATE missions SET deadline=?, workflow_version=workflow_version+1, workflow_save_token=?,
+        team_json='[]', compiled_spec_json=NULL, status='matching', current_stage='截止时间已更新，请重新确认团队', updated_at=?
+        WHERE id=? AND requester_id=? AND workflow_version=? AND status IN ('draft','matching')
+        AND EXISTS (SELECT 1 FROM escrows WHERE mission_id=missions.id AND status='pending')`)
+        .bind(deadline,token,now,id,requesterId,expectedVersion),
+      this.db.prepare(`INSERT OR IGNORE INTO stage_offer_quote_history
+        (id,mission_id,stage_id,agent_id,status,amount,snapshot_json,expires_at,responded_at,created_at,archived_at)
+        SELECT o.id,o.mission_id,o.stage_id,o.agent_id,o.status,COALESCE(q.amount,s.budget_usdc),COALESCE(q.snapshot_json,'{}'),o.expires_at,o.responded_at,o.created_at,?
+        FROM stage_offers o LEFT JOIN stage_offer_quotes q ON q.offer_id=o.id LEFT JOIN workflow_stages s ON s.id=o.stage_id
+        WHERE o.mission_id=? AND EXISTS (SELECT 1 FROM missions WHERE id=? AND workflow_save_token=?)`).bind(now,id,id,token),
+      this.db.prepare(`DELETE FROM stage_offers WHERE mission_id=? AND EXISTS (SELECT 1 FROM missions WHERE id=? AND workflow_save_token=?)`).bind(id,id,token),
+      this.db.prepare(`UPDATE escrows SET amount=(SELECT budget_usdc FROM missions WHERE id=?),updated_at=?
+        WHERE mission_id=? AND status='pending' AND EXISTS (SELECT 1 FROM missions WHERE id=? AND workflow_save_token=?)`).bind(id,now,id,id,token),
+      this.db.prepare(`INSERT INTO execution_events (id,mission_id,stage_id,event_type,message,actor_type,actor_id,payload_json,created_at)
+        SELECT ?,?,NULL,'mission.rescheduled','截止时间已更新，旧邀请失效','requester',?,?,?
+        WHERE EXISTS (SELECT 1 FROM missions WHERE id=? AND workflow_save_token=?)`)
+        .bind(`EVT-${token}`,id,requesterId,JSON.stringify({deadline,previousWorkflowVersion:expectedVersion}),now,id,token),
+    ]);
+    const mission = await this.getMission(id);
+    if (!mission) return {state:'missing'};
+    if (Number(results[0]?.meta?.changes ?? 0)) return {state:'saved',mission};
+    if (!['draft','matching'].includes(mission.status) || (await this.getEscrow(id))?.status!=='pending') return {state:'locked'};
+    return {state:'version_conflict'};
   }
 
   async saveCompilation(
@@ -3130,6 +3177,10 @@ export class D1PlatformStore implements PlatformStore {
       `).bind(dispute.id, dispute.missionId, dispute.openedBy, dispute.reason, JSON.stringify(dispute.evidence), dispute.status, dispute.freezeTxHash, dispute.createdAt),
       this.db.prepare("UPDATE escrows SET status = 'frozen', freeze_tx_hash = ?, updated_at = datetime('now') WHERE mission_id = ? AND status = 'held'").bind(dispute.freezeTxHash, dispute.missionId),
     ];
+    if (dispute.collaborationIssueId) {
+      statements.push(this.db.prepare('UPDATE collaboration_issues SET dispute_id=?,updated_at=? WHERE id=? AND mission_id=?')
+        .bind(dispute.id,dispute.createdAt,dispute.collaborationIssueId,dispute.missionId));
+    }
     if (dispute.evidenceSnapshot) {
       const snapshot = dispute.evidenceSnapshot;
       statements.push(this.db.prepare(`
@@ -3264,7 +3315,7 @@ export class D1PlatformStore implements PlatformStore {
     }));
     const currentRound = rounds.at(-1)!;
     const { proposal, electorate, votes } = currentRound;
-    const eligible = electorate.some((item) => item.userId === userId);
+    const eligible = electorate.some((item) => item.userId === userId) && !(await this.collaboration.listWork(id)).some(w=>w.proposalId===proposal.id && w.userId===userId && w.status==='withdrawn');
     const currentVote = votes.find((item) => item.voterId === userId);
     const initial = rounds[0]?.proposal ?? null;
     const appealProposal = rounds.find((round) => round.proposal.round === 1)?.proposal ?? null;
@@ -3325,10 +3376,11 @@ export class D1PlatformStore implements PlatformStore {
             SELECT 1 FROM dispute_round_electorate WHERE proposal_id = ? AND user_id = ?
           ) AND NOT EXISTS (
             SELECT 1 FROM dispute_round_votes WHERE proposal_id = ? AND voter_id = ?
-          )
+          ) AND NOT EXISTS (SELECT 1 FROM arbitration_work WHERE proposal_id=? AND user_id=? AND status='withdrawn')
         `).bind(
           voteId, governance.proposal.id, voterId, choice, reason, elector.voteWeight, votedAt,
           governance.proposal.id, votedAt, votedAt,
+          governance.proposal.id, voterId,
           governance.proposal.id, voterId,
           governance.proposal.id, voterId,
         ),
@@ -3606,6 +3658,7 @@ export class D1PlatformStore implements PlatformStore {
         JOIN dispute_proposal_rounds p ON p.dispute_id = d.id AND p.status = 'executed'
         JOIN dispute_round_votes v ON v.proposal_id = p.id
         WHERE d.id = ? AND d.status = ? AND d.resolved_at = ?
+          AND NOT EXISTS (SELECT 1 FROM arbitration_work w WHERE w.dispute_id=d.id AND w.user_id=v.voter_id)
       `).bind(REWARD_FORMULA_VERSION, rewardScoreMicros(1, 'arbitrator'), resolvedAt, resolvedAt, id, status, resolvedAt),
     ];
     if (status === 'resolved' && mission && escrow?.paymentMethod === 'web2_balance') {
@@ -3958,7 +4011,7 @@ export class D1PlatformStore implements PlatformStore {
 
   async createNotification(notification: Notification): Promise<Notification> {
     await this.db.prepare(`
-      INSERT INTO notifications (id, user_id, title, detail, tone, is_read, created_at)
+      INSERT OR IGNORE INTO notifications (id, user_id, title, detail, tone, is_read, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).bind(
       notification.id,
@@ -4566,7 +4619,8 @@ export class D1PlatformStore implements PlatformStore {
       this.db.prepare(`
         SELECT * FROM reward_activities
         WHERE eligible = 1 AND formula_version = ?
-          AND julianday(occurred_at) >= julianday(?) AND julianday(occurred_at) < julianday(?)
+          AND NOT EXISTS (SELECT 1 FROM arbitration_reward_epoch_items used WHERE used.activity_id=reward_activities.id)
+          AND (julianday(occurred_at) >= julianday(?) OR json_extract(detail_json,'$.source')='reviewed_arbitration_work') AND julianday(occurred_at) < julianday(?)
         ORDER BY occurred_at ASC, id ASC
       `).bind(epoch.formulaVersion, epoch.startsAt, epoch.endsAt).all<Row>(),
       this.db.prepare("SELECT id, wallet_address FROM profiles WHERE wallet_address IS NOT NULL AND wallet_address <> ''").all<Row>(),
@@ -4609,6 +4663,11 @@ export class D1PlatformStore implements PlatformStore {
       UPDATE reward_epochs SET status = 'computed', merkle_root = ?, manifest_hash = ?, computed_at = ?, updated_at = ?
       WHERE id = ? AND status = 'draft'
     `).bind(computed.merkleRoot, computed.manifestHash, computedAt, computedAt, id)];
+    for (const activity of activityRows.map(mapRewardActivity).filter(a => a.detail.source === 'reviewed_arbitration_work')) {
+      statements.push(this.db.prepare(`INSERT INTO arbitration_reward_epoch_items (activity_id,epoch_id)
+        SELECT ?,? WHERE EXISTS (SELECT 1 FROM reward_epochs WHERE id=? AND status='computed' AND computed_at=?)`)
+        .bind(activity.id,id,id,computedAt));
+    }
     for (const allocation of allocations) {
       statements.push(this.db.prepare(`
         INSERT INTO reward_allocations

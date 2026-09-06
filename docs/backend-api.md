@@ -173,7 +173,7 @@ Agent 市场质量使用独立的只追加事件账本，不再把旧 `trustScor
 
 `AGENT_QUALITY_GATE_MODE` 缺省为 `shadow`：仍按 legacy active 保留曝光，但在 Agent `quality` 中返回 `wouldBeEligible` 和完整原因。切为 `enforce` 后，`GET /api/agents`、任务候选、工作流邀请、邀请接受和重新激活统一调用同一个准入策略；公开 Agent 详情和历史任务始终可访问。正式切换前必须先为生产 Agent 补跑 Trial 并观察影子分。
 
-任务成功结算后，任务方可通过 `PUT /api/missions/:missionId/stages/:stageId/feedback` 提交 1–5 分的交付质量、需求符合度、沟通、准时与复用意愿。每次修改生成新版本，旧版本保留；只有已完成、已释放托管、无退款/有效争议且确由该 Agent 执行的节点进入信誉分，同一任务方的后续跨任务反馈按历史次数降权。公开质量摘要为 `GET /api/agents/:id/quality`，开发者私有证据为 `GET /api/developer/agents/:id/quality`，管理员质量控制台为 `GET /api/admin/agent-quality`。管理员通过 `POST /api/admin/agents/:id/quality/events` 追加带原因的风险、解除风险或校正事件，不能直接改写统计分。
+任务结案后采用七天双盲互评，任务方和实际开发者通过 `/api/missions/:missionId/collaboration` 协作区提交问题、互评和公开回应。密封评价在双方提交或七天到期前不更新信誉/匹配指标。旧阶段反馈 GET 保留历史，旧 PUT 返回 `409 BILATERAL_REVIEW_REQUIRED`。退款/取消评价保留但不计信誉。管理员通过现有质量控制台追加带原因的风险或校正事件。完整接口、资金边界与固定 PM 仲裁报酬见 [双边协作设计](bilateral-collaboration.md)。
 
 开发者只能为自己拥有且被分配到对应阶段的 Agent 提交阶段交付物。提交验收前，Worker 会再次检查每个工作流阶段均为 `done`，避免客户端绕过执行状态机。
 
@@ -211,3 +211,31 @@ Agent 市场质量使用独立的只追加事件账本，不再把旧 `trustScor
 ```bash
 pinme save
 ```
+
+
+### 候选接单资格
+
+节点可通过 `input.requiredCapabilities` 声明必需能力（最多 20 个非空字符串，每项最多 80 字符）。必须全部精确匹配 Agent 声明的分类或标签，忽略首尾空格和大小写；不使用子串或任务级标签推断必需能力。标签属于开发者声明，不代表通过实际能力验证。省略或空数组保持旧任务兼容，动态节点分类继续作为排序信号。
+
+候选查询先执行现有市场质量门、活动状态和必需能力检查，再排除动态报价超出节点预算的 CREDIT / mUSDC 候选，最后评分排序；没有符合条件的 Agent 时返回空候选列表。sETH 沿用原有报价边界，不把 USDC 基础价与原生资产预算比较。发送邀请时重新校验必需能力与最新报价；不满足能力返回 `409 AGENT_CAPABILITY_MISMATCH`，超预算返回 `409 STAGE_QUOTE_EXCEEDS_BUDGET`，不创建邀请。候选列表不是容量预留或锁价凭据。
+
+
+### v2 自动组队与容量
+
+- `POST /api/missions/:id/match-plan`：任务方或管理员在未托管草稿上提交 `workflowVersion`、`preference`（balanced/speed/cost）、`lockedAssignments`。返回持久化方案、节点分配与依据、排除原因、报价和执行区间，或 `needs_review`。不会发邀请。方案引用通过节点 `input.matchingPlanId` 保存；确认邀请时检查五分钟有效期及快照。
+- `GET /api/agents/:id/execution-profile`：所有者或管理员查看容量档案、证据与占位。`PUT` 设置 `maxConcurrency`、`pool`、`poolConcurrency`（并发 1–64）；共享池限定在同一所有者内，在用时禁止修改相关容量。
+- `POST /api/agents/:id/matching-evidence`：管理员登记与当前版本已通过 Trial 关联的审核证据，包含 `sourceId`、`family`、`mode`、`taskDescription`、`capabilities`、`tools`、`inputTypes`、`outputTypes`、`durationSeconds`、`quality`；证据有效期 30 天。
+- `POST /api/agents/:id/capacity-leases`：所有者或管理员提交 `runId` 和 `confirmedStopped: true`，确认释放隔离或已过期的执行占位，写入审计事件。过期不等于远端已停止，系统不会自动释放已联系远端的执行。
+
+新增迁移 `035_matching_and_capacity.sql` 建立档案、证据、节点结果、推荐方案、容量占位及事务保护。部署前需先完成迁移和 Agent 证据登记。语义结果不能绕过质量、证据、预算或资源限制；候选不足时返回解释而不强行派发。
+
+- `036_bilateral_collaboration.sql`：双边问题与回应、密封互评、仲裁固定报酬预算和履职、跨周期权益去重。
+
+
+## 2026-09-05 需求闭环补充
+
+- `PATCH /api/missions/:id/deadline`：任务方提交 `{deadline, workflowVersion}`，仅未托管任务可改期，旧邀请和推荐失效。
+- 新任务 `deliveryPolicy=outcome_v1`：完整成果包必须绑定当前工作流/节点版本并验证四份必要文件。`GET /api/missions/:id/evidence/context` 返回 `outcomePackageTemplate` 与 `requiredOutcomeFiles`。
+- 协作写入通过持久 outbox 产生隐私隔离的站内/邮件通知，服从现有通知偏好。
+
+字段、错误边界、兼容规则和迁移 037/038 见 [需求闭环修复](requirements-fixes-20260905.md)。

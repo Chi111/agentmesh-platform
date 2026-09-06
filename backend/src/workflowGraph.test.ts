@@ -198,3 +198,11 @@ describe('workflow layout validation', () => {
       .toThrow('overlapping mappedInput pointers');
   });
 });
+
+
+describe('mandatory capability validation', () => {
+  it.each(['react', [null], [''], Array(21).fill('react'), ['x'.repeat(81)]].map((value) => [value]))('rejects malformed requirements: %j', (requiredCapabilities) => {
+    const node = stage({ id: 'required', position: 1, budget: 300, status: 'queued', input: { requiredCapabilities } });
+    expect(() => validateWorkflowGraph({ mission, stages: [node], edges: [], agents: [] })).toThrow('Required capabilities');
+  });
+});

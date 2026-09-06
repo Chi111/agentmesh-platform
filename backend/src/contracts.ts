@@ -1,3 +1,6 @@
+import type { OutcomePackage } from '../../shared/outcomePackage';
+import type { CollaborationStore } from './collaborationStore';
+import type { MatchingStore } from './matchingStore';
 import type { WorkflowCondition, WorkflowFieldMapping } from './workflowDsl';
 
 export type UserRole = 'requester' | 'developer' | 'admin';
@@ -228,6 +231,7 @@ export interface AgentMetricRecordResult {
 }
 
 export interface Mission {
+  deliveryPolicy?: 'legacy' | 'outcome_v1';
   id: string;
   requesterId: string;
   title: string;
@@ -428,6 +432,7 @@ export interface DeliverableManifestFile {
 
 export interface DeliverableManifest {
   schema: 'agentmesh.deliverable-manifest.v1';
+  outcomePackage?: OutcomePackage;
   missionId: string;
   stageId: string | null;
   attemptNo: number | null;
@@ -554,6 +559,7 @@ export interface WalletAccount {
 }
 
 export interface Dispute {
+  collaborationIssueId?: string;
   id: string;
   missionId: string;
   openedBy: string;
@@ -1117,6 +1123,8 @@ export type AgentCallbackApplyResult =
   | { state: 'invalid' };
 
 export interface PlatformStore {
+  readonly collaboration: CollaborationStore;
+  readonly matching: MatchingStore;
   ensureIdentityProfile(identity: AuthIdentityInput): Promise<UserContext>;
   getProfile(id: string): Promise<UserContext | null>;
   updateRole(id: string, role: Exclude<UserRole, 'admin'>): Promise<UserContext>;
@@ -1144,8 +1152,10 @@ export interface PlatformStore {
   listAgentFeedback(agentId: string, limit?: number): Promise<AgentFeedback[]>;
 
   listMissions(user: UserContext): Promise<Mission[]>;
+  listMissionsAwaitingOutcome(limit: number): Promise<Mission[]>;
   getMission(id: string): Promise<Mission | null>;
   createMission(mission: Mission, stages: WorkflowStage[], edges?: WorkflowEdge[]): Promise<Mission>;
+  rescheduleMission(id: string, requesterId: string, deadline: string, expectedVersion: number, now: string): Promise<WorkflowDraftSaveResult>;
   saveCompilation(id: string, spec: Record<string, unknown>, stages: WorkflowStage[], edges: WorkflowEdge[], expectedVersion: number): Promise<WorkflowDraftSaveResult>;
   saveWorkflowDraft(id: string, stages: WorkflowStage[], edges: WorkflowEdge[], viewport: WorkflowViewport, expectedVersion: number): Promise<WorkflowDraftSaveResult>;
   confirmWorkflow(id: string, stages: WorkflowStage[], team: string[], offers: StageOffer[], expectedVersion?: number): Promise<Mission | null>;

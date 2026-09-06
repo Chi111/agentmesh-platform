@@ -8,8 +8,12 @@ import type { MissionStatus } from '../types/domain';
 import { missionStatusMeta, routeForMission } from '../utils/missionState';
 import { formatPaymentAmount, paymentToken } from '../utils/payments';
 
+import { formatMissionDeadline } from '../../../shared/missionDeadline';
+
 const statusOptions: Array<{ value: 'all' | MissionStatus; label: string }> = [
   { value: 'all', label: '全部' },
+  { value: 'draft', label: '草稿' },
+  { value: 'matching', label: '匹配 / 待接单' },
   { value: 'running', label: '执行中' },
   { value: 'paused', label: '已暂停' },
   { value: 'review', label: '待验收' },
@@ -23,7 +27,7 @@ export function MissionsPage() {
   const [status, setStatus] = useState<'all' | MissionStatus>('all');
 
   const filtered = useMemo(() => missions.filter((mission) => {
-    const matchesQuery = `${mission.title} ${mission.id} ${mission.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase());
+    const matchesQuery = `${mission.title} ${mission.id} ${mission.tags.join(' ')}`.toLowerCase().includes(query.trim().toLowerCase());
     return matchesQuery && (status === 'all' || mission.status === status);
   }), [missions, query, status]);
 
@@ -74,7 +78,7 @@ export function MissionsPage() {
                 <div className="mt-2 h-2 overflow-hidden rounded-full bg-canvas">
                   <span className="block h-full rounded-full bg-cyan" style={{ width: `${mission.progress}%` }} />
                 </div>
-                <div className="mt-3 flex items-center gap-2 text-xs text-muted"><CalendarClock size={14} />{mission.deadline}</div>
+                <div className="mt-3 flex items-center gap-2 text-xs text-muted"><CalendarClock size={14} />{formatMissionDeadline(mission.deadline)}</div>
               </div>
 
               <div className="flex items-center justify-between gap-5 lg:justify-end">

@@ -49,14 +49,10 @@ test('public homepage remains useful without authentication or RPC availability'
     return Number.isFinite(renderMs) && renderMs > 0;
   }).toBe(true);
   await expect.poll(async () => Number(await babylonScene.getAttribute('data-scene-opacity'))).toBeCloseTo(0.24, 2);
-  const pretextField = page.locator('.contract-pretext');
-  await expect(pretextField).toHaveAttribute('data-ready', 'true');
-  await expect(pretextField).toHaveAttribute('data-quality', /^(high|economy)$/);
-  await expect(page.locator('.contract-hero')).toHaveAttribute('data-pretext-ready', 'true');
-  await expect(pretextField.locator('canvas')).toBeVisible();
-  expect(Number(await pretextField.getAttribute('data-glyphs'))).toBeGreaterThan(60);
-  await expect(page.locator('.contract-hero__headline-source')).toHaveCSS('opacity', '0');
-  await expect(page.locator('.contract-hero__description-source')).toHaveCSS('opacity', '0');
+  await expect(page.locator('.contract-pretext-title')).toHaveAttribute('data-ready', 'true');
+  await expect(page.locator('.contract-hero__headline-source')).toHaveCSS('opacity', '1');
+  await expect(page.locator('.contract-hero__description-source')).toHaveCSS('opacity', '1');
+  await expect(page.locator('.contract-pretext-title')).toBeVisible();
   await expect(page.locator('.protocol-stage__node, .babylon-stage-ui__status')).toHaveCount(0);
   await expect(page.locator('.contract-liquid-glass')).toHaveCount(5);
   const languagePicker = page.locator('.contract-language-picker');
@@ -74,9 +70,6 @@ test('public homepage remains useful without authentication or RPC availability'
   await expect(page.locator('.contract-live-stat')).toHaveCount(4);
   await expect(page.locator('.contract-feature-glass')).toHaveCount(3);
   await expect(page.locator('.contract-cta-glass')).toHaveCSS('backdrop-filter', /blur\(6px\)/);
-  await expect
-    .poll(async () => Number(await pretextField.getAttribute('data-render-ms') ?? Number.POSITIVE_INFINITY))
-    .toBeLessThan(6);
   await expect(page.locator('header img[src="/pinme-mesh-mark.svg"]')).toBeVisible();
   await expect(page.getByRole('link', { name: '在 Etherscan 验证' })).toHaveAttribute(
     'href',
@@ -91,9 +84,6 @@ test('public homepage remains useful without authentication or RPC availability'
   await expect
     .poll(async () => Number(await babylonScene.getAttribute('data-scene-opacity')))
     .toBeGreaterThan(0.85);
-  await expect
-    .poll(async () => Number(await pretextField.getAttribute('data-scroll-fade')))
-    .toBeLessThan(0.1);
   await page.evaluate(() => window.scrollTo(0, window.innerHeight * 1.05));
   await expect
     .poll(async () => Number(await babylonScene.getAttribute('data-scene-opacity')))
@@ -207,7 +197,7 @@ test('public homepage switches between English, Japanese, and Chinese and rememb
   await expect(page.getByRole('heading', { name: '協働に合意を、 資金に経路を。' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Etherscan で検証' })).toBeVisible();
   await expect(page.locator('html')).toHaveAttribute('lang', 'ja-JP');
-  await expect(page.locator('.contract-hero')).toHaveAttribute('data-pretext-ready', 'true');
+  await expect(page.locator('.contract-pretext-title')).toHaveAttribute('data-ready', 'true');
 
   await page.reload();
   await expect(page.getByRole('heading', { name: '協働に合意を、 資金に経路を。' })).toBeVisible();
@@ -626,7 +616,7 @@ test('DAO arbitration renders a real electorate vote and locks the resulting rul
   await page.getByRole('button', { name: '下载不可变审核档案' }).click();
   await expect(page.getByText(`sha256:${'c'.repeat(64)}`)).toBeVisible();
   const dossierCid = 'bafybeie5nqv6kd3qnfjuprw2scvucpip3oc6zvqrgcxlqdze6dt4bdhmsy';
-  await page.getByPlaceholder('上传后粘贴审核档案根 CID').fill(dossierCid);
+  await page.getByPlaceholder('仅粘贴上传后的审核档案根 CID').fill(dossierCid);
   await page.getByRole('button', { name: '登记档案 CID' }).click();
   await expect(page.getByText(`已登记：ipfs://${dossierCid}`)).toBeVisible();
   await page.getByLabel('投票理由').fill('依据任务规格和交付证据，支持争议方退款并终止任务。');

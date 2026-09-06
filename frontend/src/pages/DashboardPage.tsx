@@ -1,3 +1,4 @@
+import { formatMissionDeadline } from '../../../shared/missionDeadline';
 import { Activity, ArrowRight, Bot, CircleDollarSign, Clock3, Coins, Gift, GitBranch, LockKeyhole, Plus, ShieldCheck, Sparkles, Target, TrendingUp, Vote } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -116,7 +117,7 @@ export function DashboardPage() {
             <h2 className="mt-3 max-w-xl font-display text-2xl font-semibold leading-tight tracking-[-0.035em] md:text-[2rem]">{activeMission.title}</h2>
             <p className="mt-4 max-w-lg text-sm leading-6 text-white/48">{activeMission.currentStage}</p>
             <Link className="mt-7 inline-flex min-h-11 items-center justify-center gap-2 self-start rounded-xl bg-white px-4 text-sm font-semibold text-ink transition hover:-translate-y-0.5 hover:shadow-xl" to={activeRoute}>进入任务控制台 <ArrowRight size={16} /></Link>
-            <div className="mt-auto flex flex-wrap gap-x-5 gap-y-2 pt-8 font-mono text-[9px] text-white/35"><span>ESCROW · {formatPaymentAmount(activeMission.budget, activeMission.paymentMethod)}</span><span>DEADLINE · {activeMission.deadline}</span></div>
+            <div className="mt-auto flex flex-wrap gap-x-5 gap-y-2 pt-8 font-mono text-[9px] text-white/35"><span>ESCROW · {formatPaymentAmount(activeMission.budget, activeMission.paymentMethod)}</span><span>DEADLINE · {formatMissionDeadline(activeMission.deadline)}</span></div>
           </div>
 
           <div className="rounded-[22px] border border-white/10 bg-white/[0.035] p-4 backdrop-blur-sm md:p-5">
